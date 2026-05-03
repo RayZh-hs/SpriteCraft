@@ -1,0 +1,12 @@
+# IDE
+.idea/
+.vscode/
+
+# Data Directories
+/data
+
+# Python Stuff
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

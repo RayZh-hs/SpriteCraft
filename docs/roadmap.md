@@ -40,11 +40,12 @@ SpriteCraft/
 
 ## Stage 1: Data Collection
 
-- Get 4 packs: Vanilla (16×), Programmer Art (16×), Faithful 32×, and one different 32× pack.
+- Get 5 packs: Vanilla (16×), Programmer Art, Faithful, Patrix, Bare Bones. The first two need to be manually extracted from 1.21.10 client JARs. Raw materials are available in `data/raw_packs/`, to be unzipped and preprocessed.
 - Only extract `assets/minecraft/textures/block/`.
 - Do not use `item/`, `entity/`, `gui/`, or any JSON model files.
+- Extract Bare Bones but leave it for future LoRA experiments. It has a unique style that may be useful for testing style transfer later.
 
-**Pitfall:** Do not collect more than 4 packs. Extra packs add little value but increase preprocessing bugs and imbalance.
+**Pitfall:** Do not collect more than 5 packs. Extra packs add little value but increase preprocessing bugs and imbalance.
 
 ---
 
