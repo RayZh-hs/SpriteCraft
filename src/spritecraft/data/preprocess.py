@@ -6,6 +6,7 @@ import tempfile
 import zipfile
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image
@@ -113,7 +114,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
     # Resize 16x to 32x
     if w == 16:
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.NEAREST)
+        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
 
     return img
 
@@ -208,7 +209,8 @@ def run(packs_dir: str | Path = RAW_PACKS_DIR):
             pack_arrays[pack_id][filename] = indices
 
     # Flatten into a single dataset array per pack
-    flat_arrays: dict[str, np.ndarray] = {}
+    # Typed as `Any` to bypass Pylance's strict dictionary unpacking check against numpy stubs
+    flat_arrays: dict[str, Any] = {}
     filenames_per_pack: dict[str, list[str]] = {}
     for pack_id, arr_dict in pack_arrays.items():
         filenames = sorted(arr_dict.keys())
