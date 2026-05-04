@@ -1,7 +1,6 @@
 """Preprocessing pipeline."""
 
 import json
-import shutil
 import tempfile
 import zipfile
 from collections import defaultdict
@@ -15,36 +14,183 @@ from sklearn.cluster import MiniBatchKMeans
 from spritecraft.config import (
     DATASET_PATH,
     IMAGE_SIZE,
-    MASK_TOKEN,
     PAIR_INDEX_PATH,
     PALETTE_PATH,
     PALETTE_SIZE,
     PROCESSED_DIR,
     RAW_PACKS_DIR,
+    VALIDATION_FILENAMES,
 )
 
-VALIDATION_BLOCKS = frozenset([
-    "stone.png",
-    "dirt.png",
-    "cobblestone.png",
-    "oak_planks.png",
-    "spruce_planks.png",
-    "sand.png",
-    "gravel.png",
-    "gold_ore.png",
-    "iron_ore.png",
-    "coal_ore.png",
-    "oak_log.png",
-    "oak_leaves.png",
-    "glass.png",
-    "diamond_ore.png",
-    "farmland.png",
-    "bricks.png",
-    "tnt_side.png",
-    "bookshelf.png",
-    "mossy_cobblestone.png",
-    "obsidian.png",
-])
+FULL_CUBE_FACES = frozenset({"down", "up", "north", "south", "west", "east"})
+
+
+def detect_base_pack_id(pack_ids: list[str]) -> str:
+    """Pick the pack that should act as the vanilla/original anchor."""
+    prioritized_matches = [
+        pack_id
+        for pack_id in pack_ids
+        if "vanilla" in pack_id.lower()
+    ]
+    if len(prioritized_matches) == 1:
+        return prioritized_matches[0]
+    if len(prioritized_matches) > 1:
+        raise ValueError(
+            f"Found multiple vanilla-like packs {prioritized_matches}; cannot infer a unique base pack."
+        )
+
+    raise ValueError(
+        f"Could not infer a base pack from {pack_ids}. Include exactly one pack name containing 'vanilla'."
+    )
+
+
+def _normalize_asset_reference(ref: str, asset_kind: str, suffix: str) -> tuple[str, Path]:
+    """Normalize Minecraft-style asset refs like `minecraft:block/stone`."""
+    namespace, relative_path = ref.split(":", 1) if ":" in ref else ("minecraft", ref)
+    normalized_suffix = suffix if relative_path.endswith(suffix) else f"{relative_path}{suffix}"
+    return namespace, Path("assets") / namespace / asset_kind / normalized_suffix
+
+
+def _iter_model_references(entry: Any):
+    """Yield model references from blockstate `variants` / `multipart` entries."""
+    if isinstance(entry, dict):
+        model_name = entry.get("model")
+        if isinstance(model_name, str):
+            yield model_name
+
+        apply_entry = entry.get("apply")
+        if apply_entry is not None:
+            yield from _iter_model_references(apply_entry)
+    elif isinstance(entry, list):
+        for item in entry:
+            yield from _iter_model_references(item)
+
+
+def _resolve_model(
+    pack_dir: Path,
+    model_ref: str,
+    cache: dict[str, dict[str, Any]],
+    active_stack: set[str] | None = None,
+) -> dict[str, Any]:
+    """Resolve a block model through its parent chain."""
+    if model_ref in cache:
+        return cache[model_ref]
+
+    if active_stack is None:
+        active_stack = set()
+    if model_ref in active_stack:
+        raise ValueError(f"Detected cyclic model inheritance at {model_ref}")
+
+    active_stack.add(model_ref)
+    _namespace, model_path = _normalize_asset_reference(model_ref, "models", ".json")
+    model_file = pack_dir / model_path
+    with open(model_file, encoding="utf-8") as file_obj:
+        model_data = json.load(file_obj)
+
+    parent_ref = model_data.get("parent")
+    parent_model: dict[str, Any] | None = None
+    if isinstance(parent_ref, str):
+        parent_model = _resolve_model(pack_dir, parent_ref, cache, active_stack)
+
+    textures = dict(parent_model["textures"]) if parent_model is not None else {}
+    textures.update(model_data.get("textures", {}))
+
+    elements = model_data.get("elements")
+    if elements is None and parent_model is not None:
+        elements = parent_model["elements"]
+
+    resolved_model = {
+        "textures": textures,
+        "elements": elements or [],
+    }
+    cache[model_ref] = resolved_model
+    active_stack.remove(model_ref)
+    return resolved_model
+
+
+def _is_full_cube_model(model_data: dict[str, Any]) -> bool:
+    """Return True when the resolved model includes a full 16x16x16 cube shell."""
+    for element in model_data.get("elements", []):
+        if element.get("from") != [0, 0, 0] or element.get("to") != [16, 16, 16]:
+            continue
+
+        faces = element.get("faces", {})
+        if FULL_CUBE_FACES.issubset(faces):
+            return True
+
+    return False
+
+
+def _resolve_texture_reference(texture_ref: str, textures: dict[str, str]) -> str | None:
+    """Resolve `#aliases` in a model texture reference."""
+    visited: set[str] = set()
+    resolved_ref = texture_ref
+    while resolved_ref.startswith("#"):
+        if resolved_ref in visited:
+            return None
+        visited.add(resolved_ref)
+
+        alias = resolved_ref[1:]
+        next_ref = textures.get(alias)
+        if not isinstance(next_ref, str):
+            return None
+        resolved_ref = next_ref
+
+    return resolved_ref
+
+
+def _collect_model_face_textures(model_data: dict[str, Any]) -> set[str]:
+    """Collect block texture filenames used by model faces."""
+    allowed_filenames: set[str] = set()
+    textures = model_data.get("textures", {})
+
+    for element in model_data.get("elements", []):
+        for face in element.get("faces", {}).values():
+            texture_ref = face.get("texture")
+            if not isinstance(texture_ref, str):
+                continue
+
+            resolved_ref = _resolve_texture_reference(texture_ref, textures)
+            if resolved_ref is None:
+                continue
+
+            namespace, texture_path = _normalize_asset_reference(resolved_ref, "textures", ".png")
+            if namespace != "minecraft" or texture_path.parent.name != "block":
+                continue
+
+            allowed_filenames.add(texture_path.name)
+
+    return allowed_filenames
+
+
+def collect_allowed_block_texture_filenames(pack_dir: Path) -> set[str]:
+    """Collect texture filenames used by full-cube Minecraft block models."""
+    blockstates_dir = pack_dir / "assets" / "minecraft" / "blockstates"
+    if not blockstates_dir.exists():
+        raise FileNotFoundError(f"Missing blockstates directory in base pack: {blockstates_dir}")
+
+    model_cache: dict[str, dict[str, Any]] = {}
+    allowed_filenames: set[str] = set()
+    for blockstate_path in sorted(blockstates_dir.glob("*.json")):
+        with open(blockstate_path, encoding="utf-8") as file_obj:
+            blockstate_data = json.load(file_obj)
+
+        model_refs = set()
+        variants = blockstate_data.get("variants")
+        if variants is not None:
+            model_refs.update(model_ref for entry in variants.values() for model_ref in _iter_model_references(entry))
+
+        multipart = blockstate_data.get("multipart")
+        if multipart is not None:
+            model_refs.update(model_ref for entry in multipart for model_ref in _iter_model_references(entry))
+
+        for model_ref in model_refs:
+            resolved_model = _resolve_model(pack_dir, model_ref, model_cache)
+            if not _is_full_cube_model(resolved_model):
+                continue
+            allowed_filenames.update(_collect_model_face_textures(resolved_model))
+
+    return allowed_filenames
 
 
 def extract_pack(pack_path: Path, extract_dir: Path) -> Path:
@@ -119,7 +265,7 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 
-def collect_images(pack_dir: Path) -> dict[str, Image.Image]:
+def collect_images(pack_dir: Path, allowed_filenames: set[str] | None = None) -> dict[str, Image.Image]:
     """Collect all valid block textures from an extracted pack."""
     block_dir = pack_dir / "assets" / "minecraft" / "textures" / "block"
     if not block_dir.exists():
@@ -135,6 +281,8 @@ def collect_images(pack_dir: Path) -> dict[str, Image.Image]:
             continue
 
         if not should_keep_image(img_path, img):
+            continue
+        if allowed_filenames is not None and img_path.name not in allowed_filenames:
             continue
 
         img = preprocess_image(img)
@@ -175,6 +323,22 @@ def run(packs_dir: str | Path = RAW_PACKS_DIR):
         raise FileNotFoundError(f"No .zip or .jar packs found in {packs_dir}")
 
     print(f"Found {len(pack_files)} pack(s): {[p.name for p in pack_files]}")
+    base_pack_id = detect_base_pack_id([get_pack_id(pack_path) for pack_path in pack_files])
+
+    allowed_texture_filenames: set[str] | None = None
+    for pack_path in pack_files:
+        if get_pack_id(pack_path) != base_pack_id:
+            continue
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            extract_dir = Path(tmpdir) / "pack"
+            extract_pack(pack_path, extract_dir)
+            allowed_texture_filenames = collect_allowed_block_texture_filenames(extract_dir)
+        break
+
+    if not allowed_texture_filenames:
+        raise ValueError(f"Could not derive any allowed block textures from base pack {base_pack_id}")
+    print(f"Allowed full-cube block textures: {len(allowed_texture_filenames)}")
 
     # Extract and collect images per pack
     all_pack_images: dict[str, dict[str, Image.Image]] = {}
@@ -183,7 +347,7 @@ def run(packs_dir: str | Path = RAW_PACKS_DIR):
         with tempfile.TemporaryDirectory() as tmpdir:
             extract_dir = Path(tmpdir) / "pack"
             extract_pack(pack_path, extract_dir)
-            images = collect_images(extract_dir)
+            images = collect_images(extract_dir, allowed_texture_filenames)
             print(f"  {pack_id}: {len(images)} images")
             all_pack_images[pack_id] = images
 
@@ -240,12 +404,12 @@ def run(packs_dir: str | Path = RAW_PACKS_DIR):
     train_pair_index = {
         filename: pairs
         for filename, pairs in pair_index.items()
-        if filename not in VALIDATION_BLOCKS
+        if filename not in VALIDATION_FILENAMES
     }
     val_pair_index = {
         filename: pairs
         for filename, pairs in pair_index.items()
-        if filename in VALIDATION_BLOCKS
+        if filename in VALIDATION_FILENAMES
     }
 
     # Save pair index
@@ -253,6 +417,8 @@ def run(packs_dir: str | Path = RAW_PACKS_DIR):
         "train": train_pair_index,
         "val": val_pair_index,
         "filenames_per_pack": filenames_per_pack,
+        "base_pack_id": base_pack_id,
+        "validation_filenames": sorted(VALIDATION_FILENAMES),
     }
     with open(PAIR_INDEX_PATH, "w") as f:
         json.dump(pair_data, f, indent=2)

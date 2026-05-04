@@ -9,10 +9,10 @@ from spritecraft.inference.sampler import load_model, sample_tokens, save_predic
 
 def _resolve_index(dataset: TextureDataset, index: int, filename: str | None) -> int:
     if filename is not None:
-        try:
-            return dataset.filenames.index(filename)
-        except ValueError as exc:
-            raise ValueError(f"{filename!r} is not present in the {dataset.split} split") from exc
+        for episode_idx, episode in enumerate(dataset.episodes):
+            if episode["filename"] == filename:
+                return episode_idx
+        raise ValueError(f"{filename!r} is not present in the {dataset.split} split")
 
     if index < 0 or index >= len(dataset):
         raise IndexError(f"index {index} is out of range for split {dataset.split!r} (size={len(dataset)})")
@@ -38,20 +38,24 @@ def run(
     prediction = sample_tokens(
         model,
         sample["content_ref"].unsqueeze(0),
-        sample["style_ref"].unsqueeze(0),
+        sample["support_content_refs"].unsqueeze(0),
+        sample["support_style_refs"].unsqueeze(0),
     ).squeeze(0)
 
     bundle_name = (
         f"{split}_{dataset_index:03d}_{Path(sample['filename']).stem}"
-        f"_styled_like_{Path(sample['style_filename']).stem}"
+        f"_in_{sample['target_pack']}"
+        f"_{len(sample['support_style_filenames'])}shot"
     )
     result = save_prediction_bundle(
         output_dir=output_dir,
         bundle_name=bundle_name,
         content_tokens=sample["content_ref"],
         content_size=IMAGE_SIZE,
-        style_tokens=sample["style_ref"],
-        style_size=IMAGE_SIZE,
+        support_content_tokens=list(sample["support_content_refs"]),
+        support_content_sizes=[IMAGE_SIZE] * len(sample["support_content_filenames"]),
+        support_style_tokens=list(sample["support_style_refs"]),
+        support_style_sizes=[IMAGE_SIZE] * len(sample["support_style_filenames"]),
         prediction_tokens=prediction,
         prediction_size=IMAGE_SIZE,
         truth_tokens=sample["target"],
@@ -61,7 +65,8 @@ def run(
             "index": dataset_index,
             "filename": sample["filename"],
             "content_filename": sample["content_filename"],
-            "style_filename": sample["style_filename"],
+            "support_content_filenames": sample["support_content_filenames"],
+            "support_style_filenames": sample["support_style_filenames"],
             "target_filename": sample["target_filename"],
             "content_pack": sample["content_pack"],
             "style_pack": sample["style_pack"],
@@ -71,9 +76,9 @@ def run(
     )
 
     print(f"Evaluated split={split} index={dataset_index} filename={sample['filename']}")
-    print(f"Style reference: {sample['style_filename']} from pack {sample['style_pack']}")
+    print(f"Support pack: {sample['style_pack']} using {sample['support_style_filenames']}")
     print(f"Saved original texture to {result['original_path']}")
-    print(f"Saved style reference to {result['style_path']}")
+    print(f"Saved support pairs to {result['support_path']}")
     print(f"Saved generated texture to {result['produced_path']}")
     print(f"Saved source of truth to {result['truth_path']}")
     print(f"Saved side-by-side comparison to {result['comparison_path']}")

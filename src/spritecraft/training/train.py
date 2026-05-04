@@ -3,7 +3,6 @@
 from contextlib import nullcontext
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -11,7 +10,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from spritecraft.config import CHECKPOINTS_DIR, IMAGE_SIZE, NUM_TIMESTEPS, VOCAB_SIZE
+from spritecraft.config import CHECKPOINTS_DIR, NUM_TIMESTEPS, VOCAB_SIZE
 from spritecraft.data.dataset import TextureDataset
 from spritecraft.inference.export import indices_to_image
 from spritecraft.inference.sampler import sample_tokens
@@ -70,7 +69,13 @@ def _maybe_load_checkpoint(
         return 0
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is incompatible with the current support-pair model. "
+            "Use a fresh checkpoint directory after re-running preprocessing."
+        ) from exc
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     _move_optimizer_state(optimizer, device)
     if checkpoint.get("target_steps") == target_steps:
@@ -78,15 +83,21 @@ def _maybe_load_checkpoint(
     return int(checkpoint.get("step", 0))
 
 
-def _apply_cfg_dropout(content_ref: torch.Tensor, style_ref: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _apply_cfg_dropout(
+    content_ref: torch.Tensor,
+    support_content_refs: torch.Tensor,
+    support_style_refs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     content_ref = content_ref.clone()
-    style_ref = style_ref.clone()
+    support_content_refs = support_content_refs.clone()
+    support_style_refs = support_style_refs.clone()
 
     content_mask = torch.rand(content_ref.shape[0], device=content_ref.device) < 0.1
-    style_mask = torch.rand(style_ref.shape[0], device=style_ref.device) < 0.1
+    support_mask = torch.rand(support_content_refs.shape[0], device=support_content_refs.device) < 0.1
     content_ref[content_mask] = 0
-    style_ref[style_mask] = 0
-    return content_ref, style_ref
+    support_content_refs[support_mask] = 0
+    support_style_refs[support_mask] = 0
+    return content_ref, support_content_refs, support_style_refs
 
 
 def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda.amp.GradScaler:
@@ -94,6 +105,36 @@ def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _comparison_canvas(images: list[Image.Image]) -> Image.Image:
+    width = sum(image.width for image in images)
+    height = max(image.height for image in images)
+    canvas = Image.new("RGB", (width, height))
+
+    x_offset = 0
+    for image in images:
+        canvas.paste(image, (x_offset, 0))
+        x_offset += image.width
+
+    return canvas
+
+
+def _support_pairs_canvas(
+    support_content_refs: torch.Tensor,
+    support_style_refs: torch.Tensor,
+) -> Image.Image:
+    support_pair_images = []
+    for support_content_ref, support_style_ref in zip(support_content_refs, support_style_refs):
+        support_pair_images.append(
+            _comparison_canvas(
+                [
+                    indices_to_image(support_content_ref.cpu().numpy()),
+                    indices_to_image(support_style_ref.cpu().numpy()),
+                ]
+            )
+        )
+    return _comparison_canvas(support_pair_images)
 
 
 @torch.no_grad()
@@ -109,12 +150,13 @@ def _write_validation_preview(
 
     sample = dataset[step % len(dataset)]
     content_ref = sample["content_ref"].unsqueeze(0).to(device)
-    style_ref = sample["style_ref"].unsqueeze(0).to(device)
+    support_content_refs = sample["support_content_refs"].unsqueeze(0).to(device)
+    support_style_refs = sample["support_style_refs"].unsqueeze(0).to(device)
     target = sample["target"].unsqueeze(0).to(device)
 
     was_training = model.training
     model.eval()
-    prediction = sample_tokens(model, content_ref, style_ref)
+    prediction = sample_tokens(model, content_ref, support_content_refs, support_style_refs)
     if was_training:
         model.train()
 
@@ -122,16 +164,16 @@ def _write_validation_preview(
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     content_image = indices_to_image(content_ref.squeeze(0).cpu().numpy())
-    masked_image = Image.fromarray(np.full((IMAGE_SIZE, IMAGE_SIZE, 3), (255, 0, 255), dtype=np.uint8))
+    support_pairs_image = _support_pairs_canvas(
+        sample["support_content_refs"],
+        sample["support_style_refs"],
+    )
     prediction_image = indices_to_image(prediction.squeeze(0).cpu().numpy())
     target_image = indices_to_image(target.squeeze(0).cpu().numpy())
 
-    canvas = Image.new("RGB", (content_image.width * 4, content_image.height))
-    for tile_idx, tile in enumerate([content_image, masked_image, prediction_image, target_image]):
-        canvas.paste(tile, (tile_idx * tile.width, 0))
-
+    canvas = _comparison_canvas([content_image, support_pairs_image, prediction_image, target_image])
     safe_filename = sample["filename"].replace(".png", "")
-    preview_path = preview_dir / f"step_{step:06d}_{safe_filename}.png"
+    preview_path = preview_dir / f"step_{step:06d}_{safe_filename}_in_{sample['target_pack']}.png"
     canvas.save(preview_path)
 
 
@@ -189,15 +231,20 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 batch = next(train_iter)
 
             content_ref = batch["content_ref"].to(device)
-            style_ref = batch["style_ref"].to(device)
+            support_content_refs = batch["support_content_refs"].to(device)
+            support_style_refs = batch["support_style_refs"].to(device)
             target = batch["target"].to(device)
 
-            content_ref, style_ref = _apply_cfg_dropout(content_ref, style_ref)
+            content_ref, support_content_refs, support_style_refs = _apply_cfg_dropout(
+                content_ref,
+                support_content_refs,
+                support_style_refs,
+            )
             t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
             noisy_target = apply_mask(target, t)
 
             with autocast_context():
-                logits = model(noisy_target, content_ref, style_ref, t)
+                logits = model(noisy_target, content_ref, support_content_refs, support_style_refs, t)
                 loss = F.cross_entropy(logits, target) / grad_accum_steps
 
             if scaler.is_enabled():

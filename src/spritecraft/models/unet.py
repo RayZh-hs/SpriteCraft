@@ -120,6 +120,7 @@ class UNet(nn.Module):
             nn.SiLU(),
             nn.Linear(embed_dim * 4, embed_dim)
         )
+        self.support_pair_proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
         self.in_proj = nn.Conv2d(embed_dim * 3, 96, kernel_size=3, padding=1)
         self.enc32 = ResBlock(96, cond_dim=embed_dim)
         self.down32_16 = self.Downsample(96, 192)
@@ -150,6 +151,29 @@ class UNet(nn.Module):
         """Embed input tokens and reshape to [B, C, H, W]."""
         x = self.token_embedding(x.long())
         return x.permute(0, 3, 1, 2)  # [B, C, H, W]
+
+    def _embed_support_pairs(
+        self,
+        support_content_ref: torch.Tensor,
+        support_style_ref: torch.Tensor,
+    ) -> torch.Tensor:
+        """Embed support exemplars and average them into one conditioning map."""
+        if support_content_ref.dim() == 3:
+            support_content_ref = support_content_ref.unsqueeze(1)
+            support_style_ref = support_style_ref.unsqueeze(1)
+
+        support_content = self.token_embedding(support_content_ref.long()).permute(0, 1, 4, 2, 3)
+        support_style = self.token_embedding(support_style_ref.long()).permute(0, 1, 4, 2, 3)
+
+        batch_size, num_supports, _channels, height, width = support_content.shape
+        support_pairs = torch.cat([support_content, support_style], dim=2).reshape(
+            batch_size * num_supports,
+            self.embed_dim * 2,
+            height,
+            width,
+        )
+        support_pairs = self.support_pair_proj(support_pairs)
+        return support_pairs.reshape(batch_size, num_supports, self.embed_dim, height, width).mean(dim=1)
     
     def _time_embedding(self, t: torch.Tensor):
         """Embed time step t into a vector."""
@@ -162,17 +186,24 @@ class UNet(nn.Module):
         emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)[:, : self.token_embedding.embedding_dim]
         return self.time_mlp(emb)
     
-    def forward(self, noisy_target: torch.Tensor, content_ref: torch.Tensor, style_ref: torch.Tensor, t: torch.Tensor):
+    def forward(
+        self,
+        noisy_target: torch.Tensor,
+        content_ref: torch.Tensor,
+        support_content_ref: torch.Tensor,
+        support_style_ref: torch.Tensor,
+        t: torch.Tensor,
+    ):
         # Preprocess image batches
         target = self._embed_tokens(noisy_target)
         content = self._embed_tokens(content_ref)
-        style = self._embed_tokens(style_ref)
+        support = self._embed_support_pairs(support_content_ref, support_style_ref)
 
         # Calculate cond tensor
         cond = self._time_embedding(t)
 
         # Build forwarding network
-        x = torch.cat([target, content, style], dim=1)  # [B, C*3, H, W]
+        x = torch.cat([target, content, support], dim=1)  # [B, C*3, H, W]
         x = self.in_proj(x)
         
         # Encoding sequence

@@ -9,7 +9,15 @@ import numpy as np
 import torch
 from PIL import Image
 
-from spritecraft.config import CHECKPOINTS_DIR, IMAGE_SIZE, MASK_TOKEN, NUM_TIMESTEPS, OUTPUT_DIR, PALETTE_PATH, VOCAB_SIZE
+from spritecraft.config import (
+    CHECKPOINTS_DIR,
+    IMAGE_SIZE,
+    MASK_TOKEN,
+    NUM_TIMESTEPS,
+    OUTPUT_DIR,
+    PALETTE_PATH,
+    VOCAB_SIZE,
+)
 from spritecraft.data.preprocess import preprocess_image, quantize_image
 from spritecraft.inference.export import indices_to_image
 from spritecraft.models.unet import UNet
@@ -64,17 +72,25 @@ def _guided_logits(
     model: UNet,
     noisy_target: torch.Tensor,
     content_ref: torch.Tensor,
-    style_ref: torch.Tensor,
+    support_content_refs: torch.Tensor,
+    support_style_refs: torch.Tensor,
     t: torch.Tensor,
     guidance_scale: float,
 ) -> torch.Tensor:
-    conditional_logits = model(noisy_target, content_ref, style_ref, t)
+    conditional_logits = model(noisy_target, content_ref, support_content_refs, support_style_refs, t)
     if guidance_scale == 1.0:
         return conditional_logits
 
     null_content = torch.zeros_like(content_ref)
-    null_style = torch.zeros_like(style_ref)
-    unconditional_logits = model(noisy_target, null_content, null_style, t)
+    null_support_content = torch.zeros_like(support_content_refs)
+    null_support_style = torch.zeros_like(support_style_refs)
+    unconditional_logits = model(
+        noisy_target,
+        null_content,
+        null_support_content,
+        null_support_style,
+        t,
+    )
     return unconditional_logits + guidance_scale * (conditional_logits - unconditional_logits)
 
 
@@ -86,7 +102,13 @@ def load_model(checkpoint_dir: str | Path = CHECKPOINTS_DIR) -> tuple[UNet, Path
 
     device = _select_device()
     model = UNet(vocab_size=VOCAB_SIZE).to(device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {checkpoint_path} is incompatible with the current support-pair model. "
+            "Train into a fresh checkpoint directory after re-running preprocessing."
+        ) from exc
     model.eval()
     return model, checkpoint_path
 
@@ -95,12 +117,21 @@ def load_model(checkpoint_dir: str | Path = CHECKPOINTS_DIR) -> tuple[UNet, Path
 def sample_tokens(
     model: UNet,
     content_ref: torch.Tensor,
-    style_ref: torch.Tensor,
+    support_content_refs: torch.Tensor,
+    support_style_refs: torch.Tensor,
     guidance_scale: float = 2.0,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
+    if content_ref.dim() == 2:
+        content_ref = content_ref.unsqueeze(0)
+    if support_content_refs.dim() == 3:
+        support_content_refs = support_content_refs.unsqueeze(0)
+    if support_style_refs.dim() == 3:
+        support_style_refs = support_style_refs.unsqueeze(0)
+
     content_ref = content_ref.to(device)
-    style_ref = style_ref.to(device)
+    support_content_refs = support_content_refs.to(device)
+    support_style_refs = support_style_refs.to(device)
     noisy_target = torch.full_like(content_ref, fill_value=MASK_TOKEN, device=device)
 
     autocast_context = (
@@ -115,7 +146,15 @@ def sample_tokens(
 
         t = torch.full((noisy_target.shape[0],), timestep, dtype=torch.long, device=device)
         with autocast_context():
-            logits = _guided_logits(model, noisy_target, content_ref, style_ref, t, guidance_scale)
+            logits = _guided_logits(
+                model,
+                noisy_target,
+                content_ref,
+                support_content_refs,
+                support_style_refs,
+                t,
+                guidance_scale,
+            )
 
         probabilities = torch.softmax(logits.float(), dim=1)
         confidence, prediction = probabilities.max(dim=1)
@@ -179,35 +218,59 @@ def _comparison_canvas(images: list[Image.Image]) -> Image.Image:
     return canvas
 
 
+def _support_pairs_canvas(
+    support_original_images: list[Image.Image],
+    support_styled_images: list[Image.Image],
+) -> Image.Image:
+    if len(support_original_images) != len(support_styled_images):
+        raise ValueError("Support original/styled image counts must match")
+
+    paired_canvases = [
+        _comparison_canvas([original_image, styled_image])
+        for original_image, styled_image in zip(support_original_images, support_styled_images)
+    ]
+    return _comparison_canvas(paired_canvases)
+
+
 def save_prediction_bundle(
     output_dir: str | Path,
     bundle_name: str,
     content_tokens: torch.Tensor,
     content_size: int,
-    style_tokens: torch.Tensor,
-    style_size: int,
+    support_content_tokens: list[torch.Tensor],
+    support_content_sizes: list[int],
+    support_style_tokens: list[torch.Tensor],
+    support_style_sizes: list[int],
     prediction_tokens: torch.Tensor,
     prediction_size: int,
     truth_tokens: torch.Tensor | None = None,
     truth_size: int | None = None,
-    metadata: dict[str, str | int | float | bool] | None = None,
+    metadata: dict[str, str | int | float | bool | list[str]] | None = None,
 ) -> dict[str, Path | dict[str, float | int | bool] | None]:
     """Write a full sample/evaluation bundle to disk."""
     bundle_dir = Path(output_dir) / bundle_name
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     content_image = indices_to_image(content_tokens.cpu().numpy(), target_size=content_size)
-    style_image = indices_to_image(style_tokens.cpu().numpy(), target_size=style_size)
+    support_original_images = [
+        indices_to_image(tokens.cpu().numpy(), target_size=size)
+        for tokens, size in zip(support_content_tokens, support_content_sizes)
+    ]
+    support_styled_images = [
+        indices_to_image(tokens.cpu().numpy(), target_size=size)
+        for tokens, size in zip(support_style_tokens, support_style_sizes)
+    ]
+    support_pairs_image = _support_pairs_canvas(support_original_images, support_styled_images)
     prediction_image = indices_to_image(prediction_tokens.cpu().numpy(), target_size=prediction_size)
 
     original_path = bundle_dir / "original_tex.png"
-    style_path = bundle_dir / "style_reference.png"
+    support_path = bundle_dir / "support_pairs.png"
     produced_path = bundle_dir / "produced_tex.png"
     content_image.save(original_path)
-    style_image.save(style_path)
+    support_pairs_image.save(support_path)
     prediction_image.save(produced_path)
 
-    comparison_images = [content_image, style_image, prediction_image]
+    comparison_images = [content_image, support_pairs_image, prediction_image]
     truth_path: Path | None = None
     metrics: dict[str, float | int | bool] | None = None
 
@@ -231,7 +294,7 @@ def save_prediction_bundle(
     return {
         "bundle_dir": bundle_dir,
         "original_path": original_path,
-        "style_path": style_path,
+        "support_path": support_path,
         "produced_path": produced_path,
         "truth_path": truth_path,
         "comparison_path": comparison_path,
@@ -241,28 +304,52 @@ def save_prediction_bundle(
 
 def run(
     content_path: str,
-    style_path: str,
+    support_original_paths: list[str],
+    support_styled_paths: list[str],
     output_dir: str = OUTPUT_DIR,
     checkpoint_dir: str | Path = CHECKPOINTS_DIR,
     truth_path: str | None = None,
 ):
-    """Generate a texture from content and style references."""
+    """Generate a texture from a vanilla target and support exemplar pairs."""
+    if not support_original_paths or not support_styled_paths:
+        raise ValueError("At least one support pair is required")
+    if len(support_original_paths) != len(support_styled_paths):
+        raise ValueError("support_original_paths and support_styled_paths must have the same length")
+
     palette = np.load(PALETTE_PATH)
     content_ref, content_size = _load_reference_tokens(Path(content_path), palette)
-    style_ref, style_size = _load_reference_tokens(Path(style_path), palette)
+
+    support_original_refs: list[torch.Tensor] = []
+    support_original_sizes: list[int] = []
+    support_styled_refs: list[torch.Tensor] = []
+    support_styled_sizes: list[int] = []
+    for support_original_path, support_styled_path in zip(support_original_paths, support_styled_paths):
+        support_original_ref, support_original_size = _load_reference_tokens(Path(support_original_path), palette)
+        support_styled_ref, support_styled_size = _load_reference_tokens(Path(support_styled_path), palette)
+        support_original_refs.append(support_original_ref)
+        support_original_sizes.append(support_original_size)
+        support_styled_refs.append(support_styled_ref)
+        support_styled_sizes.append(support_styled_size)
+
     truth_ref: torch.Tensor | None = None
     truth_size: int | None = None
     if truth_path is not None:
         truth_ref, truth_size = _load_reference_tokens(Path(truth_path), palette)
 
     model, checkpoint_path = load_model(checkpoint_dir)
-    generated = sample_tokens(model, content_ref.unsqueeze(0), style_ref.unsqueeze(0)).squeeze(0)
+    generated = sample_tokens(
+        model,
+        content_ref.unsqueeze(0),
+        torch.stack(support_original_refs, dim=0),
+        torch.stack(support_styled_refs, dim=0),
+    ).squeeze(0)
 
-    bundle_name = f"{Path(content_path).stem}_styled_like_{Path(style_path).stem}"
-    prediction_size = truth_size if truth_size is not None else style_size
-    metadata = {
+    bundle_name = f"{Path(content_path).stem}_from_{len(support_original_paths)}_support_pairs"
+    prediction_size = truth_size if truth_size is not None else content_size
+    metadata: dict[str, str | int | float | bool | list[str]] = {
         "content_path": str(Path(content_path).resolve()),
-        "style_path": str(Path(style_path).resolve()),
+        "support_original_paths": [str(Path(path).resolve()) for path in support_original_paths],
+        "support_styled_paths": [str(Path(path).resolve()) for path in support_styled_paths],
         "checkpoint_path": str(checkpoint_path.resolve()),
     }
     if truth_path is not None:
@@ -273,8 +360,10 @@ def run(
         bundle_name=bundle_name,
         content_tokens=content_ref,
         content_size=content_size,
-        style_tokens=style_ref,
-        style_size=style_size,
+        support_content_tokens=support_original_refs,
+        support_content_sizes=support_original_sizes,
+        support_style_tokens=support_styled_refs,
+        support_style_sizes=support_styled_sizes,
         prediction_tokens=generated,
         prediction_size=prediction_size,
         truth_tokens=truth_ref,
@@ -283,7 +372,7 @@ def run(
     )
 
     print(f"Saved original texture to {result['original_path']}")
-    print(f"Saved style reference to {result['style_path']}")
+    print(f"Saved support pairs to {result['support_path']}")
     print(f"Saved generated texture to {result['produced_path']}")
     if result["truth_path"] is not None:
         print(f"Saved source of truth to {result['truth_path']}")

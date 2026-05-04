@@ -18,3 +18,27 @@ PALETTE_SIZE = 256
 MASK_TOKEN = 256
 VOCAB_SIZE = 257  # 256 palette indices + 1 mask token
 NUM_TIMESTEPS = 50
+NUM_SUPPORT_EXEMPLARS = 3
+
+VALIDATION_FILENAMES = frozenset([
+    "stone.png",
+    "dirt.png",
+    "cobblestone.png",
+    "oak_planks.png",
+    "spruce_planks.png",
+    "sand.png",
+    "gravel.png",
+    "gold_ore.png",
+    "iron_ore.png",
+    "coal_ore.png",
+    "oak_log.png",
+    "oak_leaves.png",
+    "glass.png",
+    "diamond_ore.png",
+    "farmland.png",
+    "bricks.png",
+    "tnt_side.png",
+    "bookshelf.png",
+    "mossy_cobblestone.png",
+    "obsidian.png",
+])

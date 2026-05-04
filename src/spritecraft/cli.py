@@ -16,7 +16,8 @@ def main():
 
     sample_parser = subparsers.add_parser("sample", help="Generate textures")
     sample_parser.add_argument("--content", type=str, required=True)
-    sample_parser.add_argument("--style", type=str, required=True)
+    sample_parser.add_argument("--support-original", action="append", dest="support_originals", required=True)
+    sample_parser.add_argument("--support-styled", action="append", dest="support_styleds", required=True)
     sample_parser.add_argument("--truth", type=str, default=None)
     sample_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     sample_parser.add_argument("--output", type=str, default="output")
@@ -40,7 +41,8 @@ def main():
         from spritecraft.inference import sampler
         sampler.run(
             content_path=args.content,
-            style_path=args.style,
+            support_original_paths=args.support_originals,
+            support_styled_paths=args.support_styleds,
             output_dir=args.output,
             checkpoint_dir=args.checkpoint_dir,
             truth_path=args.truth,
