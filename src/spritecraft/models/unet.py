@@ -1,271 +1,205 @@
 """U-Net model architecture."""
 
-import math
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
-
-from spritecraft.config import IMAGE_SIZE, NUM_TIMESTEPS, PALETTE_SIZE, VOCAB_SIZE
-
-
-def _group_norm_groups(num_channels: int, max_groups: int = 32) -> int:
-    """Choose the largest valid GroupNorm group count up to max_groups."""
-    for groups in range(min(max_groups, num_channels), 0, -1):
-        if num_channels % groups == 0:
-            return groups
-    return 1
-
-
-def _timestep_embedding(
-    timesteps: torch.Tensor,
-    dim: int,
-    max_period: int = 10_000,
-) -> torch.Tensor:
-    """Create sinusoidal timestep embeddings."""
-    half = dim // 2
-    if half == 0:
-        raise ValueError("Embedding dimension must be at least 2")
-
-    exponent = -math.log(max_period) * torch.arange(
-        half,
-        device=timesteps.device,
-        dtype=torch.float32,
-    ) / half
-    freqs = torch.exp(exponent)
-    args = timesteps.float().unsqueeze(1) * freqs.unsqueeze(0)
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
-
-    if dim % 2 == 1:
-        emb = F.pad(emb, (0, 1))
-
-    return emb
-
-
-def _apply_film(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor) -> torch.Tensor:
-    """Apply FiLM modulation to a feature map."""
-    return x * (1.0 + scale[:, :, None, None]) + shift[:, :, None, None]
-
-
-class Downsample(nn.Module):
-    """Strided convolution downsampler."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
-
-
-class Upsample(nn.Module):
-    """Nearest-neighbor upsampler followed by a 3x3 projection."""
-
-    def __init__(self, in_channels: int, out_channels: int):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, scale_factor=2, mode="nearest")
-        return self.conv(x)
-
-
-class AttentionBlock(nn.Module):
-    """Self-attention over spatial tokens."""
-
-    def __init__(self, channels: int, num_heads: int = 4):
-        super().__init__()
-        if channels % num_heads != 0:
-            raise ValueError(f"channels ({channels}) must be divisible by num_heads ({num_heads})")
-
-        self.channels = channels
-        self.num_heads = num_heads
-        self.norm = nn.GroupNorm(_group_norm_groups(channels), channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-        self.proj_out = nn.Conv2d(channels, channels, kernel_size=1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, channels, height, width = x.shape
-        head_dim = channels // self.num_heads
-
-        q, k, v = self.qkv(self.norm(x)).chunk(3, dim=1)
-        q = q.reshape(batch, self.num_heads, head_dim, height * width).transpose(2, 3)
-        k = k.reshape(batch, self.num_heads, head_dim, height * width).transpose(2, 3)
-        v = v.reshape(batch, self.num_heads, head_dim, height * width).transpose(2, 3)
-
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
-        attn = attn.transpose(2, 3).reshape(batch, channels, height, width)
-        return x + self.proj_out(attn)
+import math
 
 
 class ResBlock(nn.Module):
     """Residual block with FiLM conditioning."""
 
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        cond_dim: int = 128,
-        use_checkpoint: bool = False,
-    ):
+    def __init__(self, channels: int, cond_dim: int = 128):
         super().__init__()
-        self.use_checkpoint = use_checkpoint
-        self.norm1 = nn.GroupNorm(_group_norm_groups(in_channels), in_channels)
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.cond_proj = nn.Linear(cond_dim, out_channels * 2)
-        self.norm2 = nn.GroupNorm(_group_norm_groups(out_channels), out_channels, affine=False)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.skip = nn.Identity() if in_channels == out_channels else nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        assert channels % 32 == 0, "Channels must be divisible by 32 for GroupNorm"
+        self.norm1 = nn.GroupNorm(32, channels)
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.norm2 = nn.GroupNorm(32, channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.cond_proj = nn.Linear(cond_dim, channels * 4)
+        self.activation = nn.SiLU()
 
-    def _forward_impl(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        h = self.conv1(F.silu(self.norm1(x)))
+    def _get_film_tr(self, cond: torch.Tensor):
+        """Compute FiLM transformation, generating [batch, channels, 1, 1] tensors"""
+        scale1, shift1, scale2, shift2 = self.cond_proj(cond).chunk(4, dim=-1)
+        scale1 = scale1[:, :, None, None]
+        shift1 = shift1[:, :, None, None]
+        scale2 = scale2[:, :, None, None]
+        shift2 = shift2[:, :, None, None]
+        return scale1, shift1, scale2, shift2
 
-        scale, shift = self.cond_proj(F.silu(cond)).chunk(2, dim=1)
+    def forward(self, x: torch.Tensor, cond: torch.Tensor):
+        residual = x    # To be added back at the end
+        scale1, shift1, scale2, shift2 = self._get_film_tr(cond)
+        
+        # First convolutional layer
+        h = self.norm1(x)
+        h = h * (1 + scale1) + shift1
+        h = self.activation(h)
+        h = self.conv1(h)
+        
+        # Second convolutional layer
         h = self.norm2(h)
-        h = _apply_film(h, scale, shift)
-        h = self.conv2(F.silu(h))
+        h = h * (1 + scale2) + shift2
+        h = self.activation(h)
+        h = self.conv2(h)
 
-        return self.skip(x) + h
+        return h + residual
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        if self.use_checkpoint and self.training:
-            ckpt = checkpoint(self._forward_impl, x, cond, use_reentrant=False)
-            assert isinstance(ckpt, torch.Tensor)
-            return ckpt
-        return self._forward_impl(x, cond)
+
+class SelfAttention(nn.Module):
+    """Spatial self-attention with GroupNorm and residual connection."""
+    
+    def __init__(self, channels: int, num_heads: int = 8):
+        super().__init__()
+        assert channels % num_heads == 0, (
+            f"channels ({channels}) must be divisible by num_heads ({num_heads})"
+        )
+        self.channels = channels
+        self.num_heads = num_heads
+        
+        self.norm = nn.GroupNorm(32, channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
+        
+        # Initialize projection to zero
+        nn.init.zeros_(self.proj.weight)
+        if self.proj.bias is not None:
+            nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        
+        # Quick aliases for readability
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)  # Each: [B, C, H, W]
+        
+        # Reshape to [B, heads, HW, dim_per_head]
+        q = q.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
+        k = k.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
+        v = v.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
+        
+        # Calculate using FlashAttention
+        h = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        h = h.transpose(2, 3).reshape(B, C, H, W)
+        h = self.proj(h)
+        return x + h
 
 
 class UNet(nn.Module):
     """U-Net for masked diffusion on pixel-art textures."""
 
-    def __init__(
-        self,
-        vocab_size: int = VOCAB_SIZE,
-        embed_dim: int = 128,
-        cond_dim: int = 128,
-        base_channels: int = 96,
-        num_timesteps: int = NUM_TIMESTEPS,
-        use_checkpoint: bool = True,
-    ):
+    class Downsample(nn.Module):
+        """Downsampling block"""
+        
+        def __init__(self, in_channels: int, out_channels: int):
+            super().__init__()
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
+
+        def forward(self, x: torch.Tensor):
+            return self.conv(x)
+    
+    class Upsample(nn.Module):
+        """Upsampling block"""
+        
+        def __init__(self, in_channels: int, out_channels: int):
+            super().__init__()
+            self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
+            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        
+        def forward(self, x: torch.Tensor):
+            x = self.upsample(x)
+            return self.conv(x)
+
+    def __init__(self, vocab_size: int = 257, embed_dim: int = 128):
         super().__init__()
-        self.vocab_size = vocab_size
-        self.cond_dim = cond_dim
-        self.num_timesteps = num_timesteps
-
-        ch32 = base_channels
-        ch16 = base_channels * 2
-        ch8 = base_channels * 2
-        ch4 = base_channels * 2
-
-        self.target_embed = nn.Embedding(vocab_size, embed_dim)
-        self.content_embed = nn.Embedding(vocab_size, embed_dim)
-        self.style_embed = nn.Embedding(vocab_size, embed_dim)
-
+        self.embed_dim = embed_dim
+        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
         self.time_mlp = nn.Sequential(
-            nn.Linear(cond_dim, cond_dim * 4),
+            nn.Linear(embed_dim, embed_dim * 4),
             nn.SiLU(),
-            nn.Linear(cond_dim * 4, cond_dim),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        self.in_proj = nn.Conv2d(embed_dim * 3, 96, kernel_size=3, padding=1)
+        self.enc32 = ResBlock(96, cond_dim=embed_dim)
+        self.down32_16 = self.Downsample(96, 192)
+        self.enc16 = ResBlock(192, cond_dim=embed_dim)
+        self.down16_8 = self.Downsample(192, 192)
+        self.enc8 = ResBlock(192, cond_dim=embed_dim)
+        self.attn8 = SelfAttention(192)
+        self.down8_4 = self.Downsample(192, 192)
+        self.enc4 = ResBlock(192, cond_dim=embed_dim)
+        self.attn4 = SelfAttention(192)
+        self.up4_8 = self.Upsample(192, 192)
+        self.merge8 = nn.Conv2d(192 * 2, 192, kernel_size=1)
+        self.dec8 = ResBlock(192, cond_dim=embed_dim)
+        self.up8_16 = self.Upsample(192, 192)
+        self.merge16 = nn.Conv2d(192 * 2, 192, kernel_size=1)
+        self.dec16 = ResBlock(192, cond_dim=embed_dim)
+        self.up16_32 = self.Upsample(192, 96)
+        self.merge32 = nn.Conv2d(96 * 2, 96, kernel_size=1)
+        self.dec32 = ResBlock(96, cond_dim=embed_dim)
+        self.out = nn.Sequential(
+            nn.GroupNorm(32, 96),
+            nn.SiLU(),
+            nn.Conv2d(96, vocab_size - 1, kernel_size=1)
         )
 
-        self.stem = nn.Conv2d(embed_dim * 3, ch32, kernel_size=3, padding=1)
 
-        self.enc32 = ResBlock(ch32, ch32, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.down32_16 = Downsample(ch32, ch16)
+    def _embed_tokens(self, x: torch.Tensor):
+        """Embed input tokens and reshape to [B, C, H, W]."""
+        x = self.token_embedding(x.long())
+        return x.permute(0, 3, 1, 2)  # [B, C, H, W]
+    
+    def _time_embedding(self, t: torch.Tensor):
+        """Embed time step t into a vector."""
+        t = t.view(-1).float()
+        half_dim = (self.token_embedding.embedding_dim + 1) // 2
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half_dim, device=t.device, dtype=torch.float32) / half_dim
+        )
+        angles = t[:, None] * freqs[None, :]
+        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)[:, : self.token_embedding.embedding_dim]
+        return self.time_mlp(emb)
+    
+    def forward(self, noisy_target: torch.Tensor, content_ref: torch.Tensor, style_ref: torch.Tensor, t: torch.Tensor):
+        # Preprocess image batches
+        target = self._embed_tokens(noisy_target)
+        content = self._embed_tokens(content_ref)
+        style = self._embed_tokens(style_ref)
 
-        self.enc16 = ResBlock(ch16, ch16, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.down16_8 = Downsample(ch16, ch8)
+        # Calculate cond tensor
+        cond = self._time_embedding(t)
 
-        self.enc8 = ResBlock(ch8, ch8, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.attn8 = AttentionBlock(ch8)
-        self.down8_4 = Downsample(ch8, ch4)
+        # Build forwarding network
+        x = torch.cat([target, content, style], dim=1)  # [B, C*3, H, W]
+        x = self.in_proj(x)
+        
+        # Encoding sequence
+        skip32 = self.enc32(x, cond)
+        x = self.down32_16(skip32)
+        skip16 = self.enc16(x, cond)
+        x = self.down16_8(skip16)
+        skip8 = self.enc8(x, cond)
+        skip8 = self.attn8(skip8)
+        x = self.down8_4(skip8)
+        center = self.enc4(x, cond)
+        x = self.attn4(center)
 
-        self.enc4 = ResBlock(ch4, ch4, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.attn4 = AttentionBlock(ch4)
-
-        self.mid1 = ResBlock(ch4, ch4, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.mid_attn = AttentionBlock(ch4)
-        self.mid2 = ResBlock(ch4, ch4, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-
-        self.up4_8 = Upsample(ch4, ch8)
-        self.dec8 = ResBlock(ch8 + ch8, ch8, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-        self.dec8_attn = AttentionBlock(ch8)
-
-        self.up8_16 = Upsample(ch8, ch16)
-        self.dec16 = ResBlock(ch16 + ch16, ch16, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-
-        self.up16_32 = Upsample(ch16, ch32)
-        self.dec32 = ResBlock(ch32 + ch32, ch32, cond_dim=cond_dim, use_checkpoint=use_checkpoint)
-
-        self.out_norm = nn.GroupNorm(_group_norm_groups(ch32), ch32)
-        self.out_conv = nn.Conv2d(ch32, PALETTE_SIZE, kernel_size=3, padding=1)
-
-    def _validate_inputs(
-        self,
-        noisy_target: torch.Tensor,
-        content_ref: torch.Tensor,
-        style_ref: torch.Tensor,
-        t: torch.Tensor,
-    ) -> None:
-        if noisy_target.ndim != 3 or content_ref.ndim != 3 or style_ref.ndim != 3:
-            raise ValueError("Expected image tensors with shape (batch, height, width)")
-
-        expected_hw = (IMAGE_SIZE, IMAGE_SIZE)
-        if noisy_target.shape[1:] != expected_hw:
-            raise ValueError(f"Expected noisy_target shape (*, {IMAGE_SIZE}, {IMAGE_SIZE}), got {tuple(noisy_target.shape)}")
-        if content_ref.shape != noisy_target.shape or style_ref.shape != noisy_target.shape:
-            raise ValueError("Target, content reference, and style reference must have matching shapes")
-
-        if t.ndim != 1:
-            raise ValueError(f"Expected timestep tensor with shape (batch,), got {tuple(t.shape)}")
-        if t.shape[0] != noisy_target.shape[0]:
-            raise ValueError("Timestep batch dimension must match image batch dimension")
-
-        if torch.any(t < 0) or torch.any(t > self.num_timesteps):
-            raise ValueError(f"Timesteps must be within [0, {self.num_timesteps}]")
-
-    def forward(
-        self,
-        noisy_target: torch.Tensor,
-        content_ref: torch.Tensor,
-        style_ref: torch.Tensor,
-        t: torch.Tensor,
-    ) -> torch.Tensor:
-        self._validate_inputs(noisy_target, content_ref, style_ref, t)
-
-        noisy_target = noisy_target.long()
-        content_ref = content_ref.long()
-        style_ref = style_ref.long()
-        t = t.to(device=noisy_target.device, dtype=torch.long)
-
-        target_tokens = self.target_embed(noisy_target).permute(0, 3, 1, 2)
-        content_tokens = self.content_embed(content_ref).permute(0, 3, 1, 2)
-        style_tokens = self.style_embed(style_ref).permute(0, 3, 1, 2)
-
-        x = torch.cat([target_tokens, content_tokens, style_tokens], dim=1)
-        cond = self.time_mlp(_timestep_embedding(t, self.cond_dim))
-
-        x32 = self.enc32(self.stem(x), cond)
-        x16 = self.enc16(self.down32_16(x32), cond)
-
-        x8 = self.enc8(self.down16_8(x16), cond)
-        x8 = self.attn8(x8)
-
-        x4 = self.enc4(self.down8_4(x8), cond)
-        x4 = self.attn4(x4)
-
-        h = self.mid1(x4, cond)
-        h = self.mid_attn(h)
-        h = self.mid2(h, cond)
-
-        h = self.up4_8(h)
-        h = self.dec8(torch.cat([h, x8], dim=1), cond)
-        h = self.dec8_attn(h)
-
-        h = self.up8_16(h)
-        h = self.dec16(torch.cat([h, x16], dim=1), cond)
-
-        h = self.up16_32(h)
-        h = self.dec32(torch.cat([h, x32], dim=1), cond)
-
-        return self.out_conv(F.silu(self.out_norm(h)))
+        # Decoding sequence
+        x = self.up4_8(x)
+        x = self.merge8(
+            torch.cat([x, skip8], dim=1)
+        )
+        x = self.dec8(x, cond)
+        x = self.up8_16(x)
+        x = self.merge16(
+            torch.cat([x, skip16], dim=1)
+        )
+        x = self.dec16(x, cond)
+        x = self.up16_32(x)
+        x = self.merge32(
+            torch.cat([x, skip32], dim=1)
+        )
+        x = self.dec32(x, cond)
+        return self.out(x)
