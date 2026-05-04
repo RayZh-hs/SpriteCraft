@@ -74,21 +74,31 @@ def _guided_logits(
     content_ref: torch.Tensor,
     support_content_refs: torch.Tensor,
     support_style_refs: torch.Tensor,
+    support_mask: torch.Tensor,
     t: torch.Tensor,
     guidance_scale: float,
 ) -> torch.Tensor:
-    conditional_logits = model(noisy_target, content_ref, support_content_refs, support_style_refs, t)
+    conditional_logits = model(
+        noisy_target,
+        content_ref,
+        support_content_refs,
+        support_style_refs,
+        support_mask,
+        t,
+    )
     if guidance_scale == 1.0:
         return conditional_logits
 
     null_content = torch.zeros_like(content_ref)
     null_support_content = torch.zeros_like(support_content_refs)
     null_support_style = torch.zeros_like(support_style_refs)
+    null_support_mask = torch.zeros_like(support_mask)
     unconditional_logits = model(
         noisy_target,
         null_content,
         null_support_content,
         null_support_style,
+        null_support_mask,
         t,
     )
     return unconditional_logits + guidance_scale * (conditional_logits - unconditional_logits)
@@ -119,6 +129,7 @@ def sample_tokens(
     content_ref: torch.Tensor,
     support_content_refs: torch.Tensor,
     support_style_refs: torch.Tensor,
+    support_mask: torch.Tensor | None = None,
     guidance_scale: float = 2.0,
 ) -> torch.Tensor:
     device = next(model.parameters()).device
@@ -132,6 +143,11 @@ def sample_tokens(
     content_ref = content_ref.to(device)
     support_content_refs = support_content_refs.to(device)
     support_style_refs = support_style_refs.to(device)
+    if support_mask is None:
+        support_mask = torch.ones(support_content_refs.shape[:2], device=device, dtype=torch.bool)
+    elif support_mask.dim() == 1:
+        support_mask = support_mask.unsqueeze(0)
+    support_mask = support_mask.to(device=device, dtype=torch.bool)
     noisy_target = torch.full_like(content_ref, fill_value=MASK_TOKEN, device=device)
 
     autocast_context = (
@@ -152,6 +168,7 @@ def sample_tokens(
                 content_ref,
                 support_content_refs,
                 support_style_refs,
+                support_mask,
                 t,
                 guidance_scale,
             )

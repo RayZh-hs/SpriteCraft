@@ -1,8 +1,9 @@
 """U-Net model architecture."""
 
+import math
+
 import torch
 import torch.nn as nn
-import math
 
 
 class ResBlock(nn.Module):
@@ -86,6 +87,53 @@ class SelfAttention(nn.Module):
         return x + h
 
 
+class SupportAggregator(nn.Module):
+    """Aggregate per-support style pairs with content-conditioned attention."""
+
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.query_proj = nn.Linear(embed_dim, embed_dim)
+        self.key_proj = nn.Linear(embed_dim, embed_dim)
+        self.value_proj = nn.Linear(embed_dim, embed_dim)
+        self.output_proj = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(
+        self,
+        content_map: torch.Tensor,
+        support_pair_maps: torch.Tensor,
+        support_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_supports, channels, height, width = support_pair_maps.shape
+        content_summary = content_map.mean(dim=(2, 3))
+        support_summary = support_pair_maps.mean(dim=(3, 4))
+
+        query = self.query_proj(self.norm(content_summary)).unsqueeze(1)
+        key = self.key_proj(self.norm(support_summary))
+        value = self.value_proj(support_summary)
+        attn_scores = torch.matmul(query, key.transpose(1, 2)).squeeze(1) / math.sqrt(channels)
+
+        if support_mask.dtype != torch.bool:
+            support_mask = support_mask.to(dtype=torch.bool)
+        attn_scores = attn_scores.masked_fill(~support_mask, float("-inf"))
+
+        empty_rows = ~support_mask.any(dim=1)
+        if empty_rows.any():
+            attn_scores = attn_scores.masked_fill(empty_rows[:, None], 0.0)
+
+        attn_weights = torch.softmax(attn_scores, dim=1)
+        attn_weights = attn_weights * support_mask.to(dtype=attn_weights.dtype)
+        attn_weights = attn_weights / attn_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        attended_summary = torch.sum(attn_weights.unsqueeze(-1) * value, dim=1)
+        attended_summary = self.output_proj(attended_summary)
+        attended_map = torch.sum(
+            support_pair_maps * attn_weights[:, :, None, None, None],
+            dim=1,
+        )
+        return attended_map, attended_summary
+
+
 class UNet(nn.Module):
     """U-Net for masked diffusion on pixel-art textures."""
 
@@ -121,6 +169,8 @@ class UNet(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim)
         )
         self.support_pair_proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
+        self.support_aggregator = SupportAggregator(embed_dim)
+        self.support_cond_proj = nn.Linear(embed_dim, embed_dim)
         self.in_proj = nn.Conv2d(embed_dim * 3, 96, kernel_size=3, padding=1)
         self.enc32 = ResBlock(96, cond_dim=embed_dim)
         self.down32_16 = self.Downsample(96, 192)
@@ -156,11 +206,20 @@ class UNet(nn.Module):
         self,
         support_content_ref: torch.Tensor,
         support_style_ref: torch.Tensor,
-    ) -> torch.Tensor:
-        """Embed support exemplars and average them into one conditioning map."""
+        support_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed and aggregate support exemplars with content-conditioned attention."""
         if support_content_ref.dim() == 3:
             support_content_ref = support_content_ref.unsqueeze(1)
             support_style_ref = support_style_ref.unsqueeze(1)
+        if support_mask is None:
+            support_mask = torch.ones(
+                support_content_ref.shape[:2],
+                device=support_content_ref.device,
+                dtype=torch.bool,
+            )
+        elif support_mask.dim() == 1:
+            support_mask = support_mask.unsqueeze(0)
 
         support_content = self.token_embedding(support_content_ref.long()).permute(0, 1, 4, 2, 3)
         support_style = self.token_embedding(support_style_ref.long()).permute(0, 1, 4, 2, 3)
@@ -173,7 +232,7 @@ class UNet(nn.Module):
             width,
         )
         support_pairs = self.support_pair_proj(support_pairs)
-        return support_pairs.reshape(batch_size, num_supports, self.embed_dim, height, width).mean(dim=1)
+        return support_pairs.reshape(batch_size, num_supports, self.embed_dim, height, width), support_mask
     
     def _time_embedding(self, t: torch.Tensor):
         """Embed time step t into a vector."""
@@ -192,21 +251,22 @@ class UNet(nn.Module):
         content_ref: torch.Tensor,
         support_content_ref: torch.Tensor,
         support_style_ref: torch.Tensor,
+        support_mask: torch.Tensor | None,
         t: torch.Tensor,
     ):
-        # Preprocess image batches
         target = self._embed_tokens(noisy_target)
         content = self._embed_tokens(content_ref)
-        support = self._embed_support_pairs(support_content_ref, support_style_ref)
+        support_pairs, support_mask = self._embed_support_pairs(
+            support_content_ref,
+            support_style_ref,
+            support_mask=support_mask,
+        )
+        support_map, support_summary = self.support_aggregator(content, support_pairs, support_mask)
 
-        # Calculate cond tensor
-        cond = self._time_embedding(t)
-
-        # Build forwarding network
-        x = torch.cat([target, content, support], dim=1)  # [B, C*3, H, W]
+        cond = self._time_embedding(t) + self.support_cond_proj(support_summary)
+        x = torch.cat([target, content, support_map], dim=1)
         x = self.in_proj(x)
-        
-        # Encoding sequence
+
         skip32 = self.enc32(x, cond)
         x = self.down32_16(skip32)
         skip16 = self.enc16(x, cond)
@@ -217,20 +277,13 @@ class UNet(nn.Module):
         center = self.enc4(x, cond)
         x = self.attn4(center)
 
-        # Decoding sequence
         x = self.up4_8(x)
-        x = self.merge8(
-            torch.cat([x, skip8], dim=1)
-        )
+        x = self.merge8(torch.cat([x, skip8], dim=1))
         x = self.dec8(x, cond)
         x = self.up8_16(x)
-        x = self.merge16(
-            torch.cat([x, skip16], dim=1)
-        )
+        x = self.merge16(torch.cat([x, skip16], dim=1))
         x = self.dec16(x, cond)
         x = self.up16_32(x)
-        x = self.merge32(
-            torch.cat([x, skip32], dim=1)
-        )
+        x = self.merge32(torch.cat([x, skip32], dim=1))
         x = self.dec32(x, cond)
         return self.out(x)

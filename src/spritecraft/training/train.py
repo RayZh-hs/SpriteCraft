@@ -12,10 +12,15 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from spritecraft.config import CHECKPOINTS_DIR, NUM_TIMESTEPS, VOCAB_SIZE
+from spritecraft.config import (
+    CHECKPOINTS_DIR,
+    MAX_SUPPORT_EXEMPLARS,
+    MIN_SUPPORT_EXEMPLARS,
+    NUM_TIMESTEPS,
+    VOCAB_SIZE,
+)
 from spritecraft.data.dataset import TextureDataset
-from spritecraft.inference.export import indices_to_image
-from spritecraft.inference.sampler import sample_tokens
+from spritecraft.inference.evaluate import write_validation_matrix
 from spritecraft.models.diffusion import apply_mask
 from spritecraft.models.unet import UNet
 
@@ -291,17 +296,20 @@ def _apply_cfg_dropout(
     content_ref: torch.Tensor,
     support_content_refs: torch.Tensor,
     support_style_refs: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    support_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     content_ref = content_ref.clone()
     support_content_refs = support_content_refs.clone()
     support_style_refs = support_style_refs.clone()
+    support_mask = support_mask.clone()
 
     content_mask = torch.rand(content_ref.shape[0], device=content_ref.device) < 0.1
-    support_mask = torch.rand(support_content_refs.shape[0], device=support_content_refs.device) < 0.1
+    support_dropout_mask = torch.rand(support_content_refs.shape[0], device=support_content_refs.device) < 0.1
     content_ref[content_mask] = 0
-    support_content_refs[support_mask] = 0
-    support_style_refs[support_mask] = 0
-    return content_ref, support_content_refs, support_style_refs
+    support_content_refs[support_dropout_mask] = 0
+    support_style_refs[support_dropout_mask] = 0
+    support_mask[support_dropout_mask] = False
+    return content_ref, support_content_refs, support_style_refs, support_mask
 
 
 def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda.amp.GradScaler:
@@ -309,36 +317,6 @@ def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     return torch.cuda.amp.GradScaler(enabled=enabled)
-
-
-def _comparison_canvas(images: list[Image.Image]) -> Image.Image:
-    width = sum(image.width for image in images)
-    height = max(image.height for image in images)
-    canvas = Image.new("RGB", (width, height))
-
-    x_offset = 0
-    for image in images:
-        canvas.paste(image, (x_offset, 0))
-        x_offset += image.width
-
-    return canvas
-
-
-def _support_pairs_canvas(
-    support_content_refs: torch.Tensor,
-    support_style_refs: torch.Tensor,
-) -> Image.Image:
-    support_pair_images = []
-    for support_content_ref, support_style_ref in zip(support_content_refs, support_style_refs):
-        support_pair_images.append(
-            _comparison_canvas(
-                [
-                    indices_to_image(support_content_ref.cpu().numpy()),
-                    indices_to_image(support_style_ref.cpu().numpy()),
-                ]
-            )
-        )
-    return _comparison_canvas(support_pair_images)
 
 
 @torch.no_grad()
@@ -352,33 +330,17 @@ def _write_validation_preview(
     if len(dataset) == 0:
         return
 
-    sample = dataset[step % len(dataset)]
-    content_ref = sample["content_ref"].unsqueeze(0).to(device)
-    support_content_refs = sample["support_content_refs"].unsqueeze(0).to(device)
-    support_style_refs = sample["support_style_refs"].unsqueeze(0).to(device)
-    target = sample["target"].unsqueeze(0).to(device)
-
     was_training = model.training
     model.eval()
-    prediction = sample_tokens(model, content_ref, support_content_refs, support_style_refs)
+    preview_dir = checkpoint_dir / "validation" / f"step_{step:06d}"
+    write_validation_matrix(
+        model=model,
+        dataset=dataset,
+        output_dir=preview_dir,
+        checkpoint_path=checkpoint_dir / "latest.pt",
+    )
     if was_training:
         model.train()
-
-    preview_dir = checkpoint_dir / "validation"
-    preview_dir.mkdir(parents=True, exist_ok=True)
-
-    content_image = indices_to_image(content_ref.squeeze(0).cpu().numpy())
-    support_pairs_image = _support_pairs_canvas(
-        sample["support_content_refs"],
-        sample["support_style_refs"],
-    )
-    prediction_image = indices_to_image(prediction.squeeze(0).cpu().numpy())
-    target_image = indices_to_image(target.squeeze(0).cpu().numpy())
-
-    canvas = _comparison_canvas([content_image, support_pairs_image, prediction_image, target_image])
-    safe_filename = sample["filename"].replace(".png", "")
-    preview_path = preview_dir / f"step_{step:06d}_{safe_filename}_in_{sample['target_pack']}.png"
-    canvas.save(preview_path)
 
 
 def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
@@ -393,8 +355,16 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    train_dataset = TextureDataset(split="train")
-    val_dataset = TextureDataset(split="val")
+    train_dataset = TextureDataset(
+        split="train",
+        min_support_exemplars=MIN_SUPPORT_EXEMPLARS,
+        max_support_exemplars=MAX_SUPPORT_EXEMPLARS,
+    )
+    val_dataset = TextureDataset(
+        split="val",
+        min_support_exemplars=MIN_SUPPORT_EXEMPLARS,
+        max_support_exemplars=MAX_SUPPORT_EXEMPLARS,
+    )
     if len(train_dataset) == 0:
         raise ValueError("Training split is empty. Run preprocessing first.")
 
@@ -442,18 +412,27 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             content_ref = batch["content_ref"].to(device)
             support_content_refs = batch["support_content_refs"].to(device)
             support_style_refs = batch["support_style_refs"].to(device)
+            support_mask = batch["support_mask"].to(device)
             target = batch["target"].to(device)
 
-            content_ref, support_content_refs, support_style_refs = _apply_cfg_dropout(
+            content_ref, support_content_refs, support_style_refs, support_mask = _apply_cfg_dropout(
                 content_ref,
                 support_content_refs,
                 support_style_refs,
+                support_mask,
             )
             t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
             noisy_target = apply_mask(target, t)
 
             with autocast_context():
-                logits = model(noisy_target, content_ref, support_content_refs, support_style_refs, t)
+                logits = model(
+                    noisy_target,
+                    content_ref,
+                    support_content_refs,
+                    support_style_refs,
+                    support_mask,
+                    t,
+                )
                 loss = F.cross_entropy(logits, target) / grad_accum_steps
 
             if scaler.is_enabled():
