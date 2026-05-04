@@ -88,6 +88,9 @@ class TextureDataset(Dataset):
 
         return {
             "filename": filename,
+            "content_filename": filename,
+            "style_filename": self.filenames_per_pack[target_pack][style_idx],
+            "target_filename": filename,
             "content_pack": content_pack,
             "style_pack": target_pack,
             "target_pack": target_pack,

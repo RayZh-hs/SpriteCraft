@@ -6,6 +6,10 @@
 # Data Directories
 /data
 
+# Trained Models
+/checkpoints
+/output
+
 # Python Stuff
 __pycache__/
 *.pyc

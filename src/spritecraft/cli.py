@@ -17,7 +17,16 @@ def main():
     sample_parser = subparsers.add_parser("sample", help="Generate textures")
     sample_parser.add_argument("--content", type=str, required=True)
     sample_parser.add_argument("--style", type=str, required=True)
+    sample_parser.add_argument("--truth", type=str, default=None)
+    sample_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     sample_parser.add_argument("--output", type=str, default="output")
+
+    evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate one dataset example")
+    evaluate_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    evaluate_parser.add_argument("--output", type=str, default="output")
+    evaluate_parser.add_argument("--split", type=str, choices=("train", "val"), default="val")
+    evaluate_parser.add_argument("--index", type=int, default=0)
+    evaluate_parser.add_argument("--filename", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -29,6 +38,21 @@ def main():
         train.run(args.checkpoint_dir, args.steps)
     elif args.command == "sample":
         from spritecraft.inference import sampler
-        sampler.run(args.content, args.style, args.output)
+        sampler.run(
+            content_path=args.content,
+            style_path=args.style,
+            output_dir=args.output,
+            checkpoint_dir=args.checkpoint_dir,
+            truth_path=args.truth,
+        )
+    elif args.command == "evaluate":
+        from spritecraft.inference import evaluate
+        evaluate.run(
+            checkpoint_dir=args.checkpoint_dir,
+            output_dir=args.output,
+            split=args.split,
+            index=args.index,
+            filename=args.filename,
+        )
     else:
         parser.print_help()
