@@ -489,6 +489,8 @@ def _build_support_rankings(
     support_rankings: dict[str, dict[str, list[str]]] = {}
     for filename, pairs in split_pairs.items():
         for pack_id, _array_idx in pairs:
+            if not isinstance(pack_id, str):
+                continue
             if pack_id == base_pack_id:
                 continue
             candidate_filenames = [
@@ -554,6 +556,8 @@ def _build_validation_matrix(
 
     for filename, pairs in val_pair_index.items():
         for pack_id, _array_idx in pairs:
+            if not isinstance(pack_id, str):
+                continue
             if pack_id == base_pack_id:
                 continue
             support_filenames = deterministic_supports.get(pack_id, {}).get(filename)
@@ -775,8 +779,13 @@ def run(
     print(f"Pair index saved to {PAIR_INDEX_PATH}")
     print(f"  Training filenames: {len(train_pair_index)}")
     print(f"  Validation filenames: {len(val_pair_index)}")
+    target_pack_ids: set[str] = set()
+    for entry in validation_matrix:
+        target_pack = entry.get("target_pack")
+        if isinstance(target_pack, str):
+            target_pack_ids.add(target_pack)
     print(
         "  Validation matrix entries: "
-        f"{len(validation_matrix)} across {len({entry['target_pack'] for entry in validation_matrix})} pack(s)"
+        f"{len(validation_matrix)} across {len(target_pack_ids)} pack(s)"
     )
     print("Preprocessing complete.")

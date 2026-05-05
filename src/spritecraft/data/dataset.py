@@ -102,19 +102,22 @@ class TextureDataset(Dataset):
 
             target_packs = sorted(
                 pack_id
-                for pack_id, _array_idx in split_pairs[filename]
-                if pack_id != self.base_pack_id and pack_id in self.filename_to_index_per_pack
+                for pack_id, _ in split_pairs[filename]
+                if isinstance(pack_id, str)
+                and pack_id != self.base_pack_id
+                and pack_id in self.filename_to_index_per_pack
             )
 
             for target_pack in target_packs:
                 ranked_supports = self.support_rankings.get(target_pack, {}).get(filename, [])
                 if not ranked_supports:
                     continue
+                style = str(self.pack_styles.get(target_pack, "unspecified"))
                 episodes.append(
                     {
                         "filename": filename,
                         "target_pack": target_pack,
-                        "style": self.pack_styles.get(target_pack, "unspecified"),
+                        "style": style,
                     }
                 )
 

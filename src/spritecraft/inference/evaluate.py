@@ -5,13 +5,40 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from pathlib import Path
+from typing import Any, TypedDict, cast
 
 from PIL import Image
+import torch
 
 from spritecraft.config import CHECKPOINTS_DIR, IMAGE_SIZE, OUTPUT_DIR, VALIDATION_MATRIX_EXAMPLES_PER_PACK
 from spritecraft.data.dataset import TextureDataset
-from spritecraft.inference.sampler import load_model, sample_tokens, save_prediction_bundle
+from spritecraft.inference.sampler import PredictionBundleResult, load_model, sample_tokens, save_prediction_bundle
 from spritecraft.models.unet import UNet
+
+
+Sample = dict[str, Any]
+
+
+class SummaryOverall(TypedDict):
+    examples: int
+    mean_pixel_accuracy: float | None
+    mean_rgb_mae: float | None
+    exact_match_count: int
+
+
+class Summary(TypedDict):
+    split: str
+    checkpoint_path: str | None
+    overall: SummaryOverall
+    packs: dict[str, dict[str, object]]
+
+
+class PackResult(TypedDict):
+    filename: str
+    support_filenames: list[str]
+    bundle_dir: str
+    comparison_path: str
+    metrics: dict[str, float | int | bool] | None
 
 
 def _resolve_index(
@@ -34,27 +61,34 @@ def _resolve_index(
     return index
 
 
-def _active_support_count(sample: dict[str, object]) -> int:
-    return int(sample["support_mask"].sum().item())
+def _active_support_count(sample: Sample) -> int:
+    support_mask = cast(torch.Tensor, sample["support_mask"])
+    return int(support_mask.sum().item())
 
 
-def _trimmed_support_data(sample: dict[str, object]) -> tuple[list, list, list, list]:
+def _trimmed_support_data(sample: Sample) -> tuple[list[torch.Tensor], list[int], list[torch.Tensor], list[int]]:
     support_count = _active_support_count(sample)
+    support_content_refs = cast(torch.Tensor, sample["support_content_refs"])
+    support_style_refs = cast(torch.Tensor, sample["support_style_refs"])
     return (
-        list(sample["support_content_refs"][:support_count]),
+        list(support_content_refs[:support_count]),
         [IMAGE_SIZE] * support_count,
-        list(sample["support_style_refs"][:support_count]),
+        list(support_style_refs[:support_count]),
         [IMAGE_SIZE] * support_count,
     )
 
 
-def _evaluate_sample(model: UNet, sample: dict[str, object]):
+def _evaluate_sample(model: UNet, sample: Sample) -> torch.Tensor:
+    content_ref = cast(torch.Tensor, sample["content_ref"])
+    support_content_refs = cast(torch.Tensor, sample["support_content_refs"])
+    support_style_refs = cast(torch.Tensor, sample["support_style_refs"])
+    support_mask = cast(torch.Tensor, sample["support_mask"])
     return sample_tokens(
         model,
-        sample["content_ref"].unsqueeze(0),
-        sample["support_content_refs"].unsqueeze(0),
-        sample["support_style_refs"].unsqueeze(0),
-        support_mask=sample["support_mask"].unsqueeze(0),
+        content_ref.unsqueeze(0),
+        support_content_refs.unsqueeze(0),
+        support_style_refs.unsqueeze(0),
+        support_mask=support_mask.unsqueeze(0),
     ).squeeze(0)
 
 
@@ -100,7 +134,7 @@ def write_validation_matrix(
     dataset: TextureDataset,
     output_dir: str | Path,
     checkpoint_path: Path | None = None,
-) -> dict[str, object]:
+) -> Summary:
     """Render a fixed validation matrix and per-pack summaries for a dataset split."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -109,12 +143,12 @@ def write_validation_matrix(
     if not matrix_entries:
         raise ValueError(f"No validation matrix entries are available for split {dataset.split!r}")
 
-    results_by_pack: dict[str, list[dict[str, object]]] = defaultdict(list)
+    results_by_pack: dict[str, list[PackResult]] = defaultdict(list)
     overall_metrics: list[dict[str, float | int | bool]] = []
 
     for entry in matrix_entries:
         dataset_index = dataset.get_episode_index(entry["filename"], entry["target_pack"])
-        sample = dataset[dataset_index]
+        sample = cast(Sample, dataset[dataset_index])
         prediction = _evaluate_sample(model, sample)
         support_count = _active_support_count(sample)
         support_content_tokens, support_content_sizes, support_style_tokens, support_style_sizes = _trimmed_support_data(sample)
@@ -125,7 +159,23 @@ def write_validation_matrix(
             f"_{support_count}shot"
         )
         bundle_output_dir = output_dir / sample["target_pack"]
-        result = save_prediction_bundle(
+        metadata: dict[str, str | int | float | bool | list[str]] = {
+            "split": dataset.split,
+            "index": dataset_index,
+            "filename": sample["filename"],
+            "content_filename": sample["content_filename"],
+            "support_content_filenames": sample["support_content_filenames"],
+            "support_style_filenames": sample["support_style_filenames"],
+            "target_filename": sample["target_filename"],
+            "content_pack": sample["content_pack"],
+            "style_pack": sample["style_pack"],
+            "target_pack": sample["target_pack"],
+            "style": sample.get("style", "unspecified"),
+        }
+        if checkpoint_path is not None:
+            metadata["checkpoint_path"] = str(checkpoint_path.resolve())
+
+        result: PredictionBundleResult = save_prediction_bundle(
             output_dir=bundle_output_dir,
             bundle_name=bundle_name,
             content_tokens=sample["content_ref"],
@@ -138,36 +188,22 @@ def write_validation_matrix(
             prediction_size=IMAGE_SIZE,
             truth_tokens=sample["target"],
             truth_size=IMAGE_SIZE,
-            metadata={
-                "split": dataset.split,
-                "index": dataset_index,
-                "filename": sample["filename"],
-                "content_filename": sample["content_filename"],
-                "support_content_filenames": sample["support_content_filenames"],
-                "support_style_filenames": sample["support_style_filenames"],
-                "target_filename": sample["target_filename"],
-                "content_pack": sample["content_pack"],
-                "style_pack": sample["style_pack"],
-                "target_pack": sample["target_pack"],
-                "style": sample.get("style", "unspecified"),
-                "checkpoint_path": str(checkpoint_path.resolve()) if checkpoint_path is not None else None,
-            },
+            metadata=metadata,
         )
 
         metrics = result["metrics"]
         if metrics is not None:
             overall_metrics.append(metrics)
-        results_by_pack[sample["target_pack"]].append(
-            {
-                "filename": sample["filename"],
-                "support_filenames": sample["support_style_filenames"],
-                "bundle_dir": str(result["bundle_dir"]),
-                "comparison_path": str(result["comparison_path"]),
-                "metrics": metrics,
-            }
-        )
+        pack_entry: PackResult = {
+            "filename": sample["filename"],
+            "support_filenames": sample["support_style_filenames"],
+            "bundle_dir": str(result["bundle_dir"]),
+            "comparison_path": str(result["comparison_path"]),
+            "metrics": metrics,
+        }
+        results_by_pack[sample["target_pack"]].append(pack_entry)
 
-    summary = {
+    summary: Summary = {
         "split": dataset.split,
         "checkpoint_path": str(checkpoint_path.resolve()) if checkpoint_path is not None else None,
         "overall": {
@@ -192,8 +228,8 @@ def write_validation_matrix(
     for target_pack, pack_results in sorted(results_by_pack.items()):
         pack_output_dir = output_dir / target_pack
         pack_images = []
-        for result in pack_results:
-            with Image.open(result["comparison_path"]) as image:
+        for pack_result in pack_results:
+            with Image.open(pack_result["comparison_path"]) as image:
                 pack_images.append(image.copy())
         _tile_images(pack_images, columns=2).save(pack_output_dir / "summary.png")
 
@@ -236,7 +272,7 @@ def _run_single(
         raise ValueError(f"Dataset split {split!r} is empty. Run preprocessing first.")
 
     dataset_index = _resolve_index(dataset, index=index, filename=filename, target_pack=target_pack)
-    sample = dataset[dataset_index]
+    sample = cast(Sample, dataset[dataset_index])
     model, checkpoint_path = load_model(checkpoint_dir)
     prediction = _evaluate_sample(model, sample)
     support_count = _active_support_count(sample)

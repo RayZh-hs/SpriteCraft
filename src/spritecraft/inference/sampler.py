@@ -4,6 +4,7 @@ from contextlib import nullcontext
 import json
 import math
 from pathlib import Path
+from typing import TypedDict
 
 import numpy as np
 import torch
@@ -21,6 +22,16 @@ from spritecraft.config import (
 from spritecraft.data.preprocess import preprocess_image, quantize_image
 from spritecraft.inference.export import indices_to_image
 from spritecraft.models.unet import UNet
+
+
+class PredictionBundleResult(TypedDict):
+    bundle_dir: Path
+    original_path: Path
+    support_path: Path
+    produced_path: Path
+    truth_path: Path | None
+    comparison_path: Path
+    metrics: dict[str, float | int | bool] | None
 
 
 def _select_device() -> torch.device:
@@ -156,6 +167,7 @@ def sample_tokens(
         else nullcontext()
     )
 
+    prediction: torch.Tensor | None = None
     for timestep in range(NUM_TIMESTEPS, 0, -1):
         if not noisy_target.eq(MASK_TOKEN).any():
             break
@@ -199,6 +211,8 @@ def sample_tokens(
             flat_target[chosen_indices] = flat_prediction[chosen_indices]
 
     if noisy_target.eq(MASK_TOKEN).any():
+        if prediction is None:
+            raise RuntimeError("Sampler exited without a prediction tensor.")
         noisy_target = torch.where(noisy_target.eq(MASK_TOKEN), prediction, noisy_target)
 
     return noisy_target.cpu()
@@ -264,7 +278,7 @@ def save_prediction_bundle(
     truth_size: int | None = None,
     metadata: dict[str, str | int | float | bool | list[str]] | None = None,
     extra_metrics: dict[str, float | int | bool] | None = None,
-) -> dict[str, Path | dict[str, float | int | bool] | None]:
+) -> PredictionBundleResult:
     """Write a full sample/evaluation bundle to disk."""
     bundle_dir = Path(output_dir) / bundle_name
     bundle_dir.mkdir(parents=True, exist_ok=True)
@@ -331,7 +345,7 @@ def run(
     content_path: str,
     support_original_paths: list[str],
     support_styled_paths: list[str],
-    output_dir: str = OUTPUT_DIR,
+    output_dir: str | Path = OUTPUT_DIR,
     checkpoint_dir: str | Path = CHECKPOINTS_DIR,
     truth_path: str | None = None,
 ):

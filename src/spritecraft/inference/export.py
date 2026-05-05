@@ -13,5 +13,5 @@ def indices_to_image(indices: np.ndarray, palette_path: Path = PALETTE_PATH, tar
     rgb = palette[indices]
     img = Image.fromarray(rgb.astype(np.uint8))
     if target_size != IMAGE_SIZE:
-        img = img.resize((target_size, target_size), Image.NEAREST)
+        img = img.resize((target_size, target_size), Image.Resampling.NEAREST)
     return img

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import shutil
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -25,6 +26,21 @@ from spritecraft.inference import evaluate
 from spritecraft.inference.sampler import _latest_checkpoint_path
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_str(value: object, default: str = "") -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    return default
+
+
 def _discover_running_instances(checkpoints_root: str | Path = CHECKPOINTS_DIR) -> list[dict[str, object]]:
     root = Path(checkpoints_root)
     status_paths = sorted(root.glob(f"**/.spritecraft-runtime/{STATUS_PREFIX}*.json"))
@@ -34,21 +50,24 @@ def _discover_running_instances(checkpoints_root: str | Path = CHECKPOINTS_DIR) 
             status = load_json(status_path)
         except (OSError, ValueError):
             continue
-        pid = int(status.get("pid", -1))
+        pid = _coerce_int(status.get("pid", -1), -1)
         if pid <= 0 or not is_pid_alive(pid):
             continue
         status["pid"] = pid
-        status["checkpoint_dir"] = str(Path(status["checkpoint_dir"]).resolve())
+        checkpoint_dir_raw = _coerce_str(status.get("checkpoint_dir"))
+        if not checkpoint_dir_raw:
+            continue
+        status["checkpoint_dir"] = str(Path(checkpoint_dir_raw).resolve())
         status["status_path"] = str(status_path.resolve())
         instances.append(status)
-    return sorted(instances, key=lambda item: int(item.get("pid", 0)))
+    return sorted(instances, key=lambda item: _coerce_int(item.get("pid", 0)))
 
 
 def _known_issues(status: dict[str, object]) -> list[str]:
     issues: list[str] = []
-    step = int(status.get("step", 0))
-    last_saved_step = int(status.get("last_saved_step", 0))
-    last_validation_step = int(status.get("last_validation_step", 0))
+    step = _coerce_int(status.get("step", 0))
+    last_saved_step = _coerce_int(status.get("last_saved_step", 0))
+    last_validation_step = _coerce_int(status.get("last_validation_step", 0))
     updated_at_raw = status.get("updated_at")
     last_preview_dir = status.get("last_preview_dir")
 
@@ -87,14 +106,14 @@ def _select_instance(instances: list[dict[str, object]], pid: int | None) -> dic
         return None
     if pid is not None:
         for instance in instances:
-            if int(instance["pid"]) == pid:
+            if _coerce_int(instance.get("pid", 0)) == pid:
                 return instance
         raise ValueError(f"No running trainer with pid={pid} was found.")
     if len(instances) == 1:
         return instances[0]
 
     _print_instance_table(instances)
-    valid_pids = {int(instance["pid"]) for instance in instances}
+    valid_pids = {_coerce_int(instance.get("pid", 0)) for instance in instances}
     while True:
         chosen = input("Multiple trainers are running. Enter pid to attach: ").strip()
         try:
@@ -104,14 +123,14 @@ def _select_instance(instances: list[dict[str, object]], pid: int | None) -> dic
             continue
         if chosen_pid in valid_pids:
             for instance in instances:
-                if int(instance["pid"]) == chosen_pid:
+                if _coerce_int(instance.get("pid", 0)) == chosen_pid:
                     return instance
         print(f"pid={chosen_pid} is not in the running instance list.")
 
 
 def _request_path(instance: dict[str, object], action: str) -> Path:
     checkpoint_dir = Path(str(instance["checkpoint_dir"]))
-    pid = int(instance["pid"])
+    pid = _coerce_int(instance.get("pid", 0))
     request_id = f"{action}_{int(time.time() * 1000)}"
     request_path = runtime_request_dir(checkpoint_dir, pid) / f"{request_id}.json"
     write_json_atomic(
@@ -223,7 +242,12 @@ def run(
         response = _wait_for_request(request_path, timeout_s=wait_timeout)
         if response.get("status") == "failed":
             raise RuntimeError(str(response.get("error", f"{action} request failed.")))
-        result = response.get("result", {})
+        result: dict[str, Any]
+        result_raw = response.get("result", {})
+        if isinstance(result_raw, dict):
+            result = result_raw
+        else:
+            result = {}
         if action == "snapshot":
             print(f"Saved live snapshot to {result.get('snapshot_path')}")
             print(f"Saved snapshot report to {result.get('report_path')}")
