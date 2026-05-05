@@ -18,22 +18,14 @@ def main():
     train_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     train_parser.add_argument("--steps", type=int, default=100_000)
 
-    sample_parser = subparsers.add_parser("sample", help="Generate textures")
-    sample_parser.add_argument("--content", type=str, required=True)
-    sample_parser.add_argument("--support-original", action="append", dest="support_originals", required=True)
-    sample_parser.add_argument("--support-styled", action="append", dest="support_styleds", required=True)
-    sample_parser.add_argument("--truth", type=str, default=None)
-    sample_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    sample_parser.add_argument("--output", type=str, default="output")
-
-    evaluate_parser = subparsers.add_parser("evaluate", help="Evaluate the validation matrix or one dataset example")
-    evaluate_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    evaluate_parser.add_argument("--output", type=str, default="output")
-    evaluate_parser.add_argument("--split", type=str, choices=("train", "val"), default="val")
-    evaluate_parser.add_argument("--mode", type=str, choices=("matrix", "single"), default="matrix")
-    evaluate_parser.add_argument("--index", type=int, default=0)
-    evaluate_parser.add_argument("--filename", type=str, default=None)
-    evaluate_parser.add_argument("--target-pack", type=str, default=None)
+    generate_parser = subparsers.add_parser("generate", help="Generate textures from a resource pack")
+    generate_parser.add_argument("--pack", type=str, required=True)
+    generate_parser.add_argument("--checkpoint", type=str, default="checkpoints")
+    generate_parser.add_argument("--output", type=str, default="output")
+    select_group = generate_parser.add_mutually_exclusive_group(required=True)
+    select_group.add_argument("--textures", nargs="+", default=None)
+    select_group.add_argument("--random", type=int, dest="random_count")
+    generate_parser.add_argument("--seed", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -47,26 +39,15 @@ def main():
     elif args.command == "train":
         from spritecraft.training import train
         train.run(args.checkpoint_dir, args.steps)
-    elif args.command == "sample":
-        from spritecraft.inference import sampler
-        sampler.run(
-            content_path=args.content,
-            support_original_paths=args.support_originals,
-            support_styled_paths=args.support_styleds,
+    elif args.command == "generate":
+        from spritecraft.inference import generate
+        generate.run(
+            pack_id=args.pack,
+            checkpoint=args.checkpoint,
             output_dir=args.output,
-            checkpoint_dir=args.checkpoint_dir,
-            truth_path=args.truth,
-        )
-    elif args.command == "evaluate":
-        from spritecraft.inference import evaluate
-        evaluate.run(
-            checkpoint_dir=args.checkpoint_dir,
-            output_dir=args.output,
-            split=args.split,
-            mode=args.mode,
-            index=args.index,
-            filename=args.filename,
-            target_pack=args.target_pack,
+            textures=args.textures,
+            random_count=args.random_count,
+            seed=args.seed,
         )
     else:
         parser.print_help()

@@ -105,9 +105,9 @@ def _guided_logits(
 
 
 def load_model(checkpoint_dir: str | Path = CHECKPOINTS_DIR) -> tuple[UNet, Path]:
-    """Load the latest available checkpoint and return an eval-ready model."""
+    """Load the latest checkpoint from a directory or a specific checkpoint path."""
     checkpoint_dir = Path(checkpoint_dir)
-    checkpoint_path = _latest_checkpoint_path(checkpoint_dir)
+    checkpoint_path = checkpoint_dir if checkpoint_dir.is_file() else _latest_checkpoint_path(checkpoint_dir)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     device = _select_device()
@@ -263,6 +263,7 @@ def save_prediction_bundle(
     truth_tokens: torch.Tensor | None = None,
     truth_size: int | None = None,
     metadata: dict[str, str | int | float | bool | list[str]] | None = None,
+    extra_metrics: dict[str, float | int | bool] | None = None,
 ) -> dict[str, Path | dict[str, float | int | bool] | None]:
     """Write a full sample/evaluation bundle to disk."""
     bundle_dir = Path(output_dir) / bundle_name
@@ -298,6 +299,13 @@ def save_prediction_bundle(
         truth_image.save(truth_path)
         comparison_images.append(truth_image)
         metrics = compute_metrics(prediction_tokens, truth_tokens)
+
+    if extra_metrics:
+        if metrics is None:
+            metrics = {}
+        metrics.update(extra_metrics)
+
+    if metrics is not None:
         with open(bundle_dir / "metrics.json", "w", encoding="utf-8") as metrics_file:
             json.dump(metrics, metrics_file, indent=2)
 
