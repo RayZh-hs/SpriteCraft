@@ -641,6 +641,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             request["status"] = "running"
             request["started_at"] = utcnow_iso()
             write_json_atomic(request_path, request)
+            preview_summary_to_log: tuple[Path, dict[str, object]] | None = None
 
             try:
                 action = str(request.get("action"))
@@ -679,10 +680,9 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     summary = _render_validation_preview(model, val_dataset, preview_dir, checkpoint_path=None)
                     if summary is None:
                         raise RuntimeError("Validation split is empty; no preview could be generated.")
-                    _log_validation_summary(writer, preview_dir, summary, current_step)
-                    writer.flush()
                     runtime_state["last_validation_step"] = current_step
                     runtime_state["last_preview_dir"] = str(preview_dir.resolve())
+                    preview_summary_to_log = (preview_dir, summary)
                     result = {
                         "preview_dir": str(preview_dir.resolve()),
                         "summary_path": str((preview_dir / "summary.json").resolve()),
@@ -701,6 +701,12 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 request["result"] = result
                 write_json_atomic(request_path, request)
                 update_runtime_status()
+                if preview_summary_to_log is not None:
+                    preview_dir, summary = preview_summary_to_log
+                    try:
+                        _log_validation_summary(writer, preview_dir, summary, current_step)
+                    except Exception as exc:
+                        print(f"Warning: failed to mirror debug preview to TensorBoard: {exc}")
 
     update_runtime_status()
 
