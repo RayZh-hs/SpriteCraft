@@ -455,13 +455,6 @@ def _log_model_histograms(writer, model: UNet, histogram_tensors: dict[str, torc
 
 
 def _log_validation_summary(writer, preview_dir: Path, summary: dict[str, object], step: int) -> None:
-    overall_summary = summary.get("overall", {})
-    if isinstance(overall_summary, dict):
-        for metric_name in ("mean_pixel_accuracy", "mean_rgb_mae", "exact_match_count"):
-            metric_value = overall_summary.get(metric_name)
-            if metric_value is not None:
-                writer.add_scalar(f"validation/overall/{metric_name}", metric_value, step)
-
     packs = summary.get("packs", {})
     if not isinstance(packs, dict):
         return
@@ -537,9 +530,9 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         raise ValueError("Training split is empty. Run preprocessing first.")
 
     batch_size = 2 if device.type == "cuda" else 1
-    grad_accum_steps = 16 if device.type == "cuda" else 1
-    validation_interval = 2_000
-    save_interval = 500
+    grad_accum_steps = 8 if device.type == "cuda" else 1
+    validation_interval = 5_000
+    save_interval = 1_000
     history_flush_interval = 10
 
     train_loader = DataLoader(
@@ -574,15 +567,12 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         else nullcontext()
     )
     scaler = _make_grad_scaler(device)
-    tensorboard_histogram_interval = validation_interval
 
     try:
         model.train()
         for step in range(start_step, steps):
             optimizer.zero_grad(set_to_none=True)
             total_loss = 0.0
-            batch_scalar_metrics: dict[str, float] = {}
-            histogram_tensors: dict[str, torch.Tensor] = {}
 
             for accum_idx in range(grad_accum_steps):
                 try:
@@ -605,29 +595,16 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 )
                 t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
                 noisy_target = apply_mask(target, t)
-                capture_diagnostics = accum_idx == grad_accum_steps - 1
 
                 with autocast_context():
-                    if capture_diagnostics:
-                        logits, aux = model(
-                            noisy_target,
-                            content_ref,
-                            support_content_refs,
-                            support_style_refs,
-                            support_mask,
-                            t,
-                            return_aux=True,
-                        )
-                    else:
-                        logits = model(
-                            noisy_target,
-                            content_ref,
-                            support_content_refs,
-                            support_style_refs,
-                            support_mask,
-                            t,
-                        )
-                        aux = None
+                    logits = model(
+                        noisy_target,
+                        content_ref,
+                        support_content_refs,
+                        support_style_refs,
+                        support_mask,
+                        t,
+                    )
                     loss = F.cross_entropy(logits, target) / grad_accum_steps
 
                 if scaler.is_enabled():
@@ -636,33 +613,12 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     loss.backward()
                 total_loss += float(loss.detach().item()) * grad_accum_steps
 
-                if capture_diagnostics:
-                    batch_scalar_metrics, histogram_tensors = _collect_batch_diagnostics(
-                        logits=logits,
-                        target=target,
-                        noisy_target=noisy_target,
-                        support_mask=support_mask,
-                        attention_weights=None if aux is None else aux["support_attention_weights"],
-                    )
-
-            if scaler.is_enabled():
-                scaler.unscale_(optimizer)
-            batch_scalar_metrics["model/grad_norm"] = _gradient_norm(model)
-
             if scaler.is_enabled():
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
             scheduler.step()
-
-            batch_scalar_metrics["model/parameter_norm"] = _parameter_norm(model)
-            batch_scalar_metrics["model/output_head_weight_std"] = float(
-                model.out[-1].weight.detach().float().std(unbiased=False).item()
-            )
-            batch_scalar_metrics["model/token_embedding_weight_std"] = float(
-                model.token_embedding.weight.detach().float().std(unbiased=False).item()
-            )
 
             current_step = step + 1
             average_loss = total_loss / grad_accum_steps
@@ -674,7 +630,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             }
             metric_history.append(metric_record)
             pending_metric_history.append(metric_record)
-            _log_training_scalars(writer, current_step, average_loss, lr, batch_scalar_metrics)
+            _log_training_scalars(writer, current_step, average_loss, lr, {})
 
             if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
                 _append_metric_history(metrics_path, pending_metric_history)
@@ -683,9 +639,6 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
             if current_step == 1 or current_step % 10 == 0 or current_step == steps:
                 print(f"step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
-
-            if current_step == 1 or current_step % tensorboard_histogram_interval == 0 or current_step == steps:
-                _log_model_histograms(writer, model, histogram_tensors, current_step)
 
             if current_step % save_interval == 0 or current_step == steps:
                 if pending_metric_history:
