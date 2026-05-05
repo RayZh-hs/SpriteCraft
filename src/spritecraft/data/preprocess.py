@@ -714,6 +714,9 @@ def run(
     filenames_per_pack: dict[str, list[str]] = {}
     for pack_id, arr_dict in pack_arrays.items():
         filenames = sorted(arr_dict)
+        if not filenames:
+            print(f"  {pack_id}: skipped (no valid images)")
+            continue
         filenames_per_pack[pack_id] = filenames
         stack = np.stack([arr_dict[filename] for filename in filenames], axis=0)
         flat_arrays[pack_id] = stack

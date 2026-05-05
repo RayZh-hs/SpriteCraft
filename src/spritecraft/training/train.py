@@ -37,6 +37,7 @@ from spritecraft.inference.evaluate import write_validation_matrix
 from spritecraft.models.diffusion import apply_mask
 from spritecraft.models.unet import UNet
 from spritecraft.training.content_loss import content_preservation_loss
+from spritecraft.training.perceptual_loss import perceptual_loss
 
 MetricRecord = dict[str, float | int]
 METRIC_FIELDNAMES = ("step", "loss", "lr")
@@ -721,6 +722,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
             total_ce_loss = 0.0
             total_content_loss = 0.0
+            total_perceptual_loss = 0.0
             for accum_idx in range(grad_accum_steps):
                 try:
                     batch = next(train_iter)
@@ -756,7 +758,10 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     content_loss = content_preservation_loss(
                         logits, content_ref, palette, alpha=0.05
                     )
-                    loss = (ce_loss + content_loss) / grad_accum_steps
+                    perceptual = perceptual_loss(
+                        logits, target, palette, alpha=0.1
+                    )
+                    loss = (ce_loss + content_loss + perceptual) / grad_accum_steps
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -765,6 +770,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 total_loss += float(loss.detach().item()) * grad_accum_steps
                 total_ce_loss += float(ce_loss.detach().item())
                 total_content_loss += float(content_loss.detach().item())
+                total_perceptual_loss += float(perceptual.detach().item())
 
             if scaler.is_enabled():
                 scaler.step(optimizer)
@@ -777,6 +783,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             average_loss = total_loss / grad_accum_steps
             average_ce_loss = total_ce_loss / grad_accum_steps
             average_content_loss = total_content_loss / grad_accum_steps
+            average_perceptual_loss = total_perceptual_loss / grad_accum_steps
             lr = scheduler.get_last_lr()[0]
             runtime_state["step"] = current_step
             runtime_state["last_loss"] = average_loss
@@ -791,6 +798,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             scalar_metrics = {
                 "train/ce_loss": average_ce_loss,
                 "train/content_loss": average_content_loss,
+                "train/perceptual_loss": average_perceptual_loss,
             }
             _log_training_scalars(writer, current_step, average_loss, lr, scalar_metrics)
 
@@ -803,7 +811,8 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             if current_step == 1 or current_step % 10 == 0 or current_step == steps:
                 print(
                     f"step={current_step}/{steps} loss={average_loss:.4f} "
-                    f"ce={average_ce_loss:.4f} content={average_content_loss:.4f} lr={lr:.6e}"
+                    f"ce={average_ce_loss:.4f} content={average_content_loss:.4f} "
+                    f"perceptual={average_perceptual_loss:.4f} lr={lr:.6e}"
                 )
 
             if current_step % save_interval == 0 or current_step == steps:

@@ -88,10 +88,12 @@ class SelfAttention(nn.Module):
 
 
 class SupportAggregator(nn.Module):
-    """Aggregate per-support style pairs with content-conditioned attention."""
+    """Aggregate per-support style pairs with spatial cross-attention."""
 
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int, num_heads: int = 8):
         super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
         self.query_proj = nn.Linear(embed_dim, embed_dim)
         self.key_proj = nn.Linear(embed_dim, embed_dim)
         self.value_proj = nn.Linear(embed_dim, embed_dim)
@@ -106,32 +108,59 @@ class SupportAggregator(nn.Module):
         return_attention: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_supports, channels, height, width = support_pair_maps.shape
-        content_summary = content_map.mean(dim=(2, 3))
-        support_summary = support_pair_maps.mean(dim=(3, 4))
+        head_dim = channels // self.num_heads
 
-        query = self.query_proj(self.norm(content_summary)).unsqueeze(1)
-        key = self.key_proj(self.norm(support_summary))
-        value = self.value_proj(support_summary)
-        attn_scores = torch.matmul(query, key.transpose(1, 2)).squeeze(1) / math.sqrt(channels)
+        # Flatten spatial dims: [B, N, C, H, W] -> [B, N, HW, C]
+        support_flat = support_pair_maps.reshape(batch_size, num_supports, channels, height * width)
+        support_flat = support_flat.permute(0, 1, 3, 2)  # [B, N, HW, C]
 
+        # Content: [B, C, H, W] -> [B, HW, C]
+        content_flat = content_map.reshape(batch_size, channels, height * width)
+        content_flat = content_flat.permute(0, 2, 1)  # [B, HW, C]
+
+        # Project queries, keys, values
+        query = self.query_proj(self.norm(content_flat))  # [B, HW, C]
+        key = self.key_proj(self.norm(support_flat))      # [B, N, HW, C]
+        value = self.value_proj(support_flat)             # [B, N, HW, C]
+
+        # Reshape for multi-head attention
+        # Query: [B, HW, heads, head_dim] -> [B, heads, HW, head_dim]
+        query = query.view(batch_size, height * width, self.num_heads, head_dim).permute(0, 2, 1, 3)
+
+        # Key/Value: [B, N, HW, heads, head_dim] -> [B, heads, N*HW, head_dim]
+        key = key.view(batch_size, num_supports, height * width, self.num_heads, head_dim)
+        key = key.permute(0, 3, 1, 2, 4).reshape(batch_size, self.num_heads, num_supports * height * width, head_dim)
+
+        value = value.view(batch_size, num_supports, height * width, self.num_heads, head_dim)
+        value = value.permute(0, 3, 1, 2, 4).reshape(batch_size, self.num_heads, num_supports * height * width, head_dim)
+
+        # Compute attention scores: [B, heads, HW, N*HW]
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
+
+        # Apply support mask
         if support_mask.dtype != torch.bool:
             support_mask = support_mask.to(dtype=torch.bool)
-        attn_scores = attn_scores.masked_fill(~support_mask, float("-inf"))
+        flat_mask = support_mask.unsqueeze(-1).expand(-1, -1, height * width).reshape(batch_size, 1, 1, num_supports * height * width)
+        attn_scores = attn_scores.masked_fill(~flat_mask, float("-inf"))
 
+        # Handle empty rows
         empty_rows = ~support_mask.any(dim=1)
         if empty_rows.any():
-            attn_scores = attn_scores.masked_fill(empty_rows[:, None], 0.0)
+            attn_scores = attn_scores.masked_fill(empty_rows.view(batch_size, 1, 1, 1), 0.0)
 
-        attn_weights = torch.softmax(attn_scores, dim=1)
-        attn_weights = attn_weights * support_mask.to(dtype=attn_weights.dtype)
-        attn_weights = attn_weights / attn_weights.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        attn_weights = attn_weights * flat_mask.to(dtype=attn_weights.dtype)
+        attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        attended_summary = torch.sum(attn_weights.unsqueeze(-1) * value, dim=1)
-        attended_summary = self.output_proj(attended_summary)
-        attended_map = torch.sum(
-            support_pair_maps * attn_weights[:, :, None, None, None],
-            dim=1,
-        )
+        # Apply attention to values: [B, heads, HW, head_dim]
+        out = torch.matmul(attn_weights, value)
+        out = out.permute(0, 2, 1, 3).reshape(batch_size, height * width, channels)
+        out = self.output_proj(out)
+
+        # Reshape back to spatial map
+        attended_map = out.permute(0, 2, 1).reshape(batch_size, channels, height, width)
+        attended_summary = attended_map.mean(dim=(2, 3))
+
         if return_attention:
             return attended_map, attended_summary, attn_weights
         return attended_map, attended_summary
@@ -162,7 +191,7 @@ class UNet(nn.Module):
             x = self.upsample(x)
             return self.conv(x)
 
-    def __init__(self, vocab_size: int = 257, embed_dim: int = 128):
+    def __init__(self, vocab_size: int = 257, embed_dim: int = 192):
         super().__init__()
         self.embed_dim = embed_dim
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
@@ -172,31 +201,37 @@ class UNet(nn.Module):
             nn.Linear(embed_dim * 4, embed_dim)
         )
         self.support_pair_proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
-        self.support_aggregator = SupportAggregator(embed_dim)
+        self.support_aggregator = SupportAggregator(embed_dim, num_heads=8)
         self.support_cond_proj = nn.Linear(embed_dim, embed_dim)
-        self.in_proj = nn.Conv2d(embed_dim * 3, 96, kernel_size=3, padding=1)
-        self.enc32 = ResBlock(96, cond_dim=embed_dim)
-        self.down32_16 = self.Downsample(96, 192)
-        self.enc16 = ResBlock(192, cond_dim=embed_dim)
-        self.down16_8 = self.Downsample(192, 192)
-        self.enc8 = ResBlock(192, cond_dim=embed_dim)
-        self.attn8 = SelfAttention(192)
-        self.down8_4 = self.Downsample(192, 192)
-        self.enc4 = ResBlock(192, cond_dim=embed_dim)
-        self.attn4 = SelfAttention(192)
-        self.up4_8 = self.Upsample(192, 192)
-        self.merge8 = nn.Conv2d(192 * 2, 192, kernel_size=1)
-        self.dec8 = ResBlock(192, cond_dim=embed_dim)
-        self.up8_16 = self.Upsample(192, 192)
-        self.merge16 = nn.Conv2d(192 * 2, 192, kernel_size=1)
-        self.dec16 = ResBlock(192, cond_dim=embed_dim)
-        self.up16_32 = self.Upsample(192, 96)
-        self.merge32 = nn.Conv2d(96 * 2, 96, kernel_size=1)
-        self.dec32 = ResBlock(96, cond_dim=embed_dim)
+        self.in_proj = nn.Conv2d(embed_dim * 3, 128, kernel_size=3, padding=1)
+        self.enc32 = ResBlock(128, cond_dim=embed_dim)
+        self.down32_16 = self.Downsample(128, 256)
+        self.enc16 = ResBlock(256, cond_dim=embed_dim)
+        self.down16_8 = self.Downsample(256, 384)
+        self.enc8 = ResBlock(384, cond_dim=embed_dim)
+        self.attn8 = SelfAttention(384)
+        self.down8_4 = self.Downsample(384, 384)
+        self.enc4 = ResBlock(384, cond_dim=embed_dim)
+        self.attn4 = SelfAttention(384)
+        self.down4_2 = self.Downsample(384, 384)
+        self.enc2 = ResBlock(384, cond_dim=embed_dim)
+        self.attn2 = SelfAttention(384)
+        self.up2_4 = self.Upsample(384, 384)
+        self.merge4 = nn.Conv2d(384 * 2, 384, kernel_size=1)
+        self.dec4 = ResBlock(384, cond_dim=embed_dim)
+        self.up4_8 = self.Upsample(384, 384)
+        self.merge8 = nn.Conv2d(384 * 2, 384, kernel_size=1)
+        self.dec8 = ResBlock(384, cond_dim=embed_dim)
+        self.up8_16 = self.Upsample(384, 256)
+        self.merge16 = nn.Conv2d(256 * 2, 256, kernel_size=1)
+        self.dec16 = ResBlock(256, cond_dim=embed_dim)
+        self.up16_32 = self.Upsample(256, 128)
+        self.merge32 = nn.Conv2d(128 * 2, 128, kernel_size=1)
+        self.dec32 = ResBlock(128, cond_dim=embed_dim)
         self.out = nn.Sequential(
-            nn.GroupNorm(32, 96),
+            nn.GroupNorm(32, 128),
             nn.SiLU(),
-            nn.Conv2d(96, vocab_size - 1, kernel_size=1)
+            nn.Conv2d(128, vocab_size - 1, kernel_size=1)
         )
 
 
@@ -286,9 +321,15 @@ class UNet(nn.Module):
         skip8 = self.enc8(x, cond)
         skip8 = self.attn8(skip8)
         x = self.down8_4(skip8)
-        center = self.enc4(x, cond)
-        x = self.attn4(center)
+        skip4 = self.enc4(x, cond)
+        skip4 = self.attn4(skip4)
+        x = self.down4_2(skip4)
+        center = self.enc2(x, cond)
+        center = self.attn2(center)
 
+        x = self.up2_4(center)
+        x = self.merge4(torch.cat([x, skip4], dim=1))
+        x = self.dec4(x, cond)
         x = self.up4_8(x)
         x = self.merge8(torch.cat([x, skip8], dim=1))
         x = self.dec8(x, cond)
