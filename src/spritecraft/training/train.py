@@ -72,6 +72,18 @@ def _make_summary_writer(log_dir: Path, start_step: int):
     return SummaryWriter(**writer_kwargs)
 
 
+def _collate_training_batch(batch: list[dict[str, object]]) -> dict[str, object]:
+    """Stack tensor payloads while preserving variable-length sample metadata."""
+    collated: dict[str, object] = {}
+    for key in batch[0]:
+        values = [sample[key] for sample in batch]
+        if torch.is_tensor(values[0]):
+            collated[key] = torch.stack(values)
+        else:
+            collated[key] = values
+    return collated
+
+
 def _write_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
     with metrics_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
@@ -530,7 +542,13 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
     save_interval = 500
     history_flush_interval = 10
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        collate_fn=_collate_training_batch,
+    )
     train_iter = iter(train_loader)
 
     model = UNet(vocab_size=VOCAB_SIZE).to(device)
