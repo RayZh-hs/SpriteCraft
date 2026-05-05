@@ -334,58 +334,6 @@ def quantize_image(img: Image.Image, palette: np.ndarray) -> np.ndarray:
     return np.argmin(dists, axis=1).astype(np.uint8).reshape(IMAGE_SIZE, IMAGE_SIZE)
 
 
-def _parse_manifest_scalar(raw_value: str) -> str:
-    value = raw_value.strip()
-    if not value:
-        return ""
-    if value[0] == value[-1] and value[0] in {"'", '"'}:
-        return value[1:-1]
-    return value
-
-
-def _parse_manifest_yaml(manifest_path: Path) -> dict[str, Any] | None:
-    text = manifest_path.read_text(encoding="utf-8")
-    if not text.strip():
-        return None
-
-    entries: list[dict[str, str]] = []
-    current_entry: dict[str, str] | None = None
-    in_packs_section = False
-    for raw_line in text.splitlines():
-        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
-            continue
-
-        stripped = raw_line.strip()
-        if stripped == "packs:":
-            in_packs_section = True
-            continue
-
-        if not in_packs_section:
-            raise ValueError(
-                f"Unsupported manifest format in {manifest_path}. Expected a top-level 'packs:' list."
-            )
-
-        if stripped.startswith("- "):
-            if current_entry is not None:
-                entries.append(current_entry)
-            current_entry = {}
-            stripped = stripped[2:].strip()
-            if stripped:
-                key, value = stripped.split(":", 1)
-                current_entry[key.strip()] = _parse_manifest_scalar(value)
-            continue
-
-        if current_entry is None or ":" not in stripped:
-            raise ValueError(f"Malformed manifest entry in {manifest_path}: {raw_line!r}")
-
-        key, value = stripped.split(":", 1)
-        current_entry[key.strip()] = _parse_manifest_scalar(value)
-
-    if current_entry is not None:
-        entries.append(current_entry)
-    return {"packs": entries}
-
-
 def _load_manifest(
     packs_dir: Path,
     manifest_path: Path | None,
@@ -393,16 +341,13 @@ def _load_manifest(
     if manifest_path is not None:
         candidate_paths = [Path(manifest_path)]
     else:
-        candidate_paths = [packs_dir / "manifest.json", packs_dir / "manifest.yaml"]
+        candidate_paths = [packs_dir / "manifest.json"]
 
     for candidate_path in candidate_paths:
         if not candidate_path.exists():
             continue
-        if candidate_path.suffix.lower() == ".json":
-            with candidate_path.open(encoding="utf-8") as file_obj:
-                manifest = json.load(file_obj)
-        else:
-            manifest = _parse_manifest_yaml(candidate_path)
+        with candidate_path.open(encoding="utf-8") as file_obj:
+            manifest = json.load(file_obj)
 
         if manifest is None:
             continue

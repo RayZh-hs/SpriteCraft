@@ -103,7 +103,8 @@ class SupportAggregator(nn.Module):
         content_map: torch.Tensor,
         support_pair_maps: torch.Tensor,
         support_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_attention: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_supports, channels, height, width = support_pair_maps.shape
         content_summary = content_map.mean(dim=(2, 3))
         support_summary = support_pair_maps.mean(dim=(3, 4))
@@ -131,6 +132,8 @@ class SupportAggregator(nn.Module):
             support_pair_maps * attn_weights[:, :, None, None, None],
             dim=1,
         )
+        if return_attention:
+            return attended_map, attended_summary, attn_weights
         return attended_map, attended_summary
 
 
@@ -253,6 +256,7 @@ class UNet(nn.Module):
         support_style_ref: torch.Tensor,
         support_mask: torch.Tensor | None,
         t: torch.Tensor,
+        return_aux: bool = False,
     ):
         target = self._embed_tokens(noisy_target)
         content = self._embed_tokens(content_ref)
@@ -261,7 +265,15 @@ class UNet(nn.Module):
             support_style_ref,
             support_mask=support_mask,
         )
-        support_map, support_summary = self.support_aggregator(content, support_pairs, support_mask)
+        if return_aux:
+            support_map, support_summary, support_attention_weights = self.support_aggregator(
+                content,
+                support_pairs,
+                support_mask,
+                return_attention=True,
+            )
+        else:
+            support_map, support_summary = self.support_aggregator(content, support_pairs, support_mask)
 
         cond = self._time_embedding(t) + self.support_cond_proj(support_summary)
         x = torch.cat([target, content, support_map], dim=1)
@@ -286,4 +298,7 @@ class UNet(nn.Module):
         x = self.up16_32(x)
         x = self.merge32(torch.cat([x, skip32], dim=1))
         x = self.dec32(x, cond)
-        return self.out(x)
+        logits = self.out(x)
+        if return_aux:
+            return logits, {"support_attention_weights": support_attention_weights}
+        return logits

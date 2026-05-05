@@ -14,7 +14,6 @@ DATASET_PATH = PROCESSED_DIR / "dataset.npz"
 PAIR_INDEX_PATH = PROCESSED_DIR / "pair_index.json"
 PACK_REPORT_PATH = PROCESSED_DIR / "pack_report.json"
 MANIFEST_JSON_PATH = RAW_PACKS_DIR / "manifest.json"
-MANIFEST_YAML_PATH = RAW_PACKS_DIR / "manifest.yaml"
 
 IMAGE_SIZE = 32
 PALETTE_SIZE = 256

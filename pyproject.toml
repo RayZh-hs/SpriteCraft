@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "pillow",
     "scikit-learn",
+    "tensorboard",
 ]
 
 [project.scripts]

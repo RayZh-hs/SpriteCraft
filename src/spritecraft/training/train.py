@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import math
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFont
@@ -14,6 +15,7 @@ from torch.utils.data import DataLoader
 
 from spritecraft.config import (
     CHECKPOINTS_DIR,
+    MASK_TOKEN,
     MAX_SUPPORT_EXEMPLARS,
     MIN_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
@@ -26,6 +28,7 @@ from spritecraft.models.unet import UNet
 
 MetricRecord = dict[str, float | int]
 METRIC_FIELDNAMES = ("step", "loss", "lr")
+TENSORBOARD_DIRNAME = "tensorboard"
 
 
 def _select_device() -> torch.device:
@@ -40,8 +43,33 @@ def _latest_checkpoint_path(checkpoint_dir: Path) -> Path:
     return checkpoint_dir / "latest.pt"
 
 
+def _tensorboard_log_dir(checkpoint_dir: Path) -> Path:
+    return checkpoint_dir / TENSORBOARD_DIRNAME
+
+
 def _metrics_history_path(checkpoint_dir: Path) -> Path:
     return checkpoint_dir / "training_metrics.csv"
+
+
+def _validation_preview_dir(checkpoint_dir: Path, step: int) -> Path:
+    return checkpoint_dir / "validation" / f"step_{step:06d}"
+
+
+def _make_summary_writer(log_dir: Path, start_step: int):
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "TensorBoard support requires the 'tensorboard' package. "
+            "Reinstall project dependencies before training."
+        ) from exc
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    purge_step = start_step + 1 if start_step > 0 else None
+    writer_kwargs = {"log_dir": str(log_dir)}
+    if purge_step is not None:
+        writer_kwargs["purge_step"] = purge_step
+    return SummaryWriter(**writer_kwargs)
 
 
 def _write_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
@@ -319,21 +347,148 @@ def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _parameter_norm(model: UNet) -> float:
+    squared_norm = 0.0
+    for parameter in model.parameters():
+        squared_norm += float(parameter.detach().float().pow(2).sum().item())
+    return math.sqrt(squared_norm)
+
+
+def _gradient_norm(model: UNet) -> float:
+    squared_norm = 0.0
+    for parameter in model.parameters():
+        if parameter.grad is None:
+            continue
+        squared_norm += float(parameter.grad.detach().float().pow(2).sum().item())
+    return math.sqrt(squared_norm)
+
+
+def _sanitize_tag_component(value: str) -> str:
+    return "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in value)
+
+
+def _collect_batch_diagnostics(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    noisy_target: torch.Tensor,
+    support_mask: torch.Tensor,
+    attention_weights: torch.Tensor | None,
+) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
+    probabilities = torch.softmax(logits.detach().float(), dim=1)
+    confidence, prediction = probabilities.max(dim=1)
+    flat_prediction = prediction.reshape(prediction.shape[0], -1)
+
+    unique_counts = torch.tensor(
+        [torch.unique(sample).numel() for sample in flat_prediction],
+        device=flat_prediction.device,
+        dtype=torch.float32,
+    )
+    dominant_token_shares = torch.stack(
+        [
+            torch.bincount(sample, minlength=VOCAB_SIZE - 1).max().float() / sample.numel()
+            for sample in flat_prediction
+        ]
+    )
+
+    scalar_metrics = {
+        "train/token_accuracy": float(prediction.eq(target).float().mean().item()),
+        "train/masked_token_ratio": float(noisy_target.eq(MASK_TOKEN).float().mean().item()),
+        "train/logit_entropy": float(
+            -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=1).mean().item()
+        ),
+        "train/logit_std": float(logits.detach().float().std(unbiased=False).item()),
+        "train/top1_confidence": float(confidence.mean().item()),
+        "train/top1_confidence_std": float(confidence.std(unbiased=False).item()),
+        "train/prediction_unique_tokens": float(unique_counts.mean().item()),
+        "train/prediction_dominant_token_share": float(dominant_token_shares.mean().item()),
+        "train/active_supports": float(support_mask.float().sum(dim=1).mean().item()),
+    }
+
+    histogram_tensors = {
+        "confidence": confidence.detach().cpu(),
+    }
+    if attention_weights is None:
+        return scalar_metrics, histogram_tensors
+
+    attention_weights = attention_weights.detach().float()
+    attention_mask = support_mask.to(dtype=torch.bool)
+    valid_counts = attention_mask.sum(dim=1)
+    attention_entropy = -(attention_weights.clamp_min(1e-8).log() * attention_weights).sum(dim=1)
+    normalized_attention_entropy = torch.where(
+        valid_counts > 1,
+        attention_entropy / valid_counts.float().log(),
+        torch.zeros_like(attention_entropy),
+    )
+    masked_attention = attention_weights.masked_fill(~attention_mask, 0.0)
+    scalar_metrics["train/support_attention_max"] = float(masked_attention.max(dim=1).values.mean().item())
+    scalar_metrics["train/support_attention_entropy"] = float(normalized_attention_entropy.mean().item())
+    histogram_tensors["support_attention"] = attention_weights[attention_mask].detach().cpu()
+    return scalar_metrics, histogram_tensors
+
+
+def _log_training_scalars(writer, step: int, loss: float, lr: float, scalar_metrics: dict[str, float]) -> None:
+    writer.add_scalar("train/loss", loss, step)
+    writer.add_scalar("train/learning_rate", lr, step)
+    for metric_name, metric_value in scalar_metrics.items():
+        writer.add_scalar(metric_name, metric_value, step)
+
+
+def _log_model_histograms(writer, model: UNet, histogram_tensors: dict[str, torch.Tensor], step: int) -> None:
+    writer.add_histogram("model/output_head_weights", model.out[-1].weight.detach().float().cpu(), step)
+    writer.add_histogram("model/token_embedding_weights", model.token_embedding.weight.detach().float().cpu(), step)
+    for histogram_name, histogram_values in histogram_tensors.items():
+        if histogram_values.numel() == 0:
+            continue
+        writer.add_histogram(f"train/{histogram_name}_distribution", histogram_values, step)
+
+
+def _log_validation_summary(writer, preview_dir: Path, summary: dict[str, object], step: int) -> None:
+    overall_summary = summary.get("overall", {})
+    if isinstance(overall_summary, dict):
+        for metric_name in ("mean_pixel_accuracy", "mean_rgb_mae", "exact_match_count"):
+            metric_value = overall_summary.get(metric_name)
+            if metric_value is not None:
+                writer.add_scalar(f"validation/overall/{metric_name}", metric_value, step)
+
+    packs = summary.get("packs", {})
+    if not isinstance(packs, dict):
+        return
+
+    for pack_name, pack_summary in packs.items():
+        if not isinstance(pack_summary, dict):
+            continue
+
+        pack_tag = _sanitize_tag_component(str(pack_name))
+        summary_path = preview_dir / str(pack_name) / "summary.png"
+        if summary_path.exists():
+            with Image.open(summary_path) as summary_image:
+                writer.add_image(
+                    f"validation/packs/{pack_tag}/summary",
+                    np.asarray(summary_image),
+                    step,
+                    dataformats="HWC",
+                )
+
+        for metric_name in ("mean_pixel_accuracy", "mean_rgb_mae", "exact_match_count"):
+            metric_value = pack_summary.get(metric_name)
+            if metric_value is not None:
+                writer.add_scalar(f"validation/packs/{pack_tag}/{metric_name}", metric_value, step)
+
+
 @torch.no_grad()
 def _write_validation_preview(
     model: UNet,
     dataset: TextureDataset,
     checkpoint_dir: Path,
     step: int,
-    device: torch.device,
-) -> None:
+) -> tuple[Path, dict[str, object]] | None:
     if len(dataset) == 0:
-        return
+        return None
 
     was_training = model.training
     model.eval()
-    preview_dir = checkpoint_dir / "validation" / f"step_{step:06d}"
-    write_validation_matrix(
+    preview_dir = _validation_preview_dir(checkpoint_dir, step)
+    summary = write_validation_matrix(
         model=model,
         dataset=dataset,
         output_dir=preview_dir,
@@ -341,6 +496,7 @@ def _write_validation_preview(
     )
     if was_training:
         model.train()
+    return preview_dir, summary
 
 
 def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
@@ -390,92 +546,145 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         print(f"Checkpoint already at step {start_step}, target was {steps}; nothing to do.")
         return checkpoint_path
 
+    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir)
+    writer = _make_summary_writer(tensorboard_dir, start_step)
+    print(f"TensorBoard logs: {tensorboard_dir.resolve()}")
+
     autocast_context = (
         lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else nullcontext()
     )
     scaler = _make_grad_scaler(device)
+    tensorboard_histogram_interval = validation_interval
 
-    model.train()
-    for step in range(start_step, steps):
-        optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
+    try:
+        model.train()
+        for step in range(start_step, steps):
+            optimizer.zero_grad(set_to_none=True)
+            total_loss = 0.0
+            batch_scalar_metrics: dict[str, float] = {}
+            histogram_tensors: dict[str, torch.Tensor] = {}
 
-        for _ in range(grad_accum_steps):
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                batch = next(train_iter)
+            for accum_idx in range(grad_accum_steps):
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    batch = next(train_iter)
 
-            content_ref = batch["content_ref"].to(device)
-            support_content_refs = batch["support_content_refs"].to(device)
-            support_style_refs = batch["support_style_refs"].to(device)
-            support_mask = batch["support_mask"].to(device)
-            target = batch["target"].to(device)
+                content_ref = batch["content_ref"].to(device)
+                support_content_refs = batch["support_content_refs"].to(device)
+                support_style_refs = batch["support_style_refs"].to(device)
+                support_mask = batch["support_mask"].to(device)
+                target = batch["target"].to(device)
 
-            content_ref, support_content_refs, support_style_refs, support_mask = _apply_cfg_dropout(
-                content_ref,
-                support_content_refs,
-                support_style_refs,
-                support_mask,
-            )
-            t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
-            noisy_target = apply_mask(target, t)
-
-            with autocast_context():
-                logits = model(
-                    noisy_target,
+                content_ref, support_content_refs, support_style_refs, support_mask = _apply_cfg_dropout(
                     content_ref,
                     support_content_refs,
                     support_style_refs,
                     support_mask,
-                    t,
                 )
-                loss = F.cross_entropy(logits, target) / grad_accum_steps
+                t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
+                noisy_target = apply_mask(target, t)
+                capture_diagnostics = accum_idx == grad_accum_steps - 1
+
+                with autocast_context():
+                    if capture_diagnostics:
+                        logits, aux = model(
+                            noisy_target,
+                            content_ref,
+                            support_content_refs,
+                            support_style_refs,
+                            support_mask,
+                            t,
+                            return_aux=True,
+                        )
+                    else:
+                        logits = model(
+                            noisy_target,
+                            content_ref,
+                            support_content_refs,
+                            support_style_refs,
+                            support_mask,
+                            t,
+                        )
+                        aux = None
+                    loss = F.cross_entropy(logits, target) / grad_accum_steps
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                total_loss += float(loss.detach().item()) * grad_accum_steps
+
+                if capture_diagnostics:
+                    batch_scalar_metrics, histogram_tensors = _collect_batch_diagnostics(
+                        logits=logits,
+                        target=target,
+                        noisy_target=noisy_target,
+                        support_mask=support_mask,
+                        attention_weights=None if aux is None else aux["support_attention_weights"],
+                    )
 
             if scaler.is_enabled():
-                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            batch_scalar_metrics["model/grad_norm"] = _gradient_norm(model)
+
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
-            total_loss += float(loss.detach().item()) * grad_accum_steps
+                optimizer.step()
+            scheduler.step()
 
-        if scaler.is_enabled():
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        scheduler.step()
+            batch_scalar_metrics["model/parameter_norm"] = _parameter_norm(model)
+            batch_scalar_metrics["model/output_head_weight_std"] = float(
+                model.out[-1].weight.detach().float().std(unbiased=False).item()
+            )
+            batch_scalar_metrics["model/token_embedding_weight_std"] = float(
+                model.token_embedding.weight.detach().float().std(unbiased=False).item()
+            )
 
-        current_step = step + 1
-        average_loss = total_loss / grad_accum_steps
-        lr = scheduler.get_last_lr()[0]
-        metric_record: MetricRecord = {
-            "step": current_step,
-            "loss": average_loss,
-            "lr": lr,
-        }
-        metric_history.append(metric_record)
-        pending_metric_history.append(metric_record)
+            current_step = step + 1
+            average_loss = total_loss / grad_accum_steps
+            lr = scheduler.get_last_lr()[0]
+            metric_record: MetricRecord = {
+                "step": current_step,
+                "loss": average_loss,
+                "lr": lr,
+            }
+            metric_history.append(metric_record)
+            pending_metric_history.append(metric_record)
+            _log_training_scalars(writer, current_step, average_loss, lr, batch_scalar_metrics)
 
-        if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
-            _append_metric_history(metrics_path, pending_metric_history)
-            pending_metric_history.clear()
-
-        if current_step == 1 or current_step % 10 == 0 or current_step == steps:
-            print(f"step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
-
-        if current_step % save_interval == 0 or current_step == steps:
-            if pending_metric_history:
+            if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
                 _append_metric_history(metrics_path, pending_metric_history)
                 pending_metric_history.clear()
-            _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
-            step_checkpoint = checkpoint_dir / f"step_{current_step:06d}.pt"
-            _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
-            _write_training_graphs(checkpoint_dir, metric_history)
+                writer.flush()
 
-        if current_step % validation_interval == 0:
-            _write_validation_preview(model, val_dataset, checkpoint_dir, current_step, device)
+            if current_step == 1 or current_step % 10 == 0 or current_step == steps:
+                print(f"step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
 
-    return checkpoint_path
+            if current_step == 1 or current_step % tensorboard_histogram_interval == 0 or current_step == steps:
+                _log_model_histograms(writer, model, histogram_tensors, current_step)
+
+            if current_step % save_interval == 0 or current_step == steps:
+                if pending_metric_history:
+                    _append_metric_history(metrics_path, pending_metric_history)
+                    pending_metric_history.clear()
+                _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
+                step_checkpoint = checkpoint_dir / f"step_{current_step:06d}.pt"
+                _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
+                _write_training_graphs(checkpoint_dir, metric_history)
+
+            if current_step % validation_interval == 0 or current_step == steps:
+                preview_result = _write_validation_preview(model, val_dataset, checkpoint_dir, current_step)
+                if preview_result is not None:
+                    preview_dir, summary = preview_result
+                    _log_validation_summary(writer, preview_dir, summary, current_step)
+                    writer.flush()
+
+        return checkpoint_path
+    finally:
+        writer.close()
