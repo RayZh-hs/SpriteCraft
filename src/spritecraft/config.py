@@ -9,11 +9,11 @@ PROCESSED_DIR = DATA_DIR / "processed"
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+MANIFEST_JSON_PATH = DATA_DIR / "manifest.json"
 PALETTE_PATH = PROCESSED_DIR / "palette.npy"
 DATASET_PATH = PROCESSED_DIR / "dataset.npz"
 PAIR_INDEX_PATH = PROCESSED_DIR / "pair_index.json"
 PACK_REPORT_PATH = PROCESSED_DIR / "pack_report.json"
-MANIFEST_JSON_PATH = RAW_PACKS_DIR / "manifest.json"
 
 IMAGE_SIZE = 32
 PALETTE_SIZE = 256

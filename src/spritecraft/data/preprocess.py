@@ -15,6 +15,7 @@ from PIL import Image
 from sklearn.cluster import MiniBatchKMeans
 
 from spritecraft.config import (
+    MANIFEST_JSON_PATH,
     DATASET_PATH,
     IMAGE_SIZE,
     MAX_SUPPORT_EXEMPLARS,
@@ -593,6 +594,10 @@ def run(
     discovered_packs = _discover_pack_archives(packs_dir)
     if not discovered_packs:
         raise FileNotFoundError(f"No supported pack archives found in {packs_dir}")
+    
+    # If the configured manifest_path has a file, use it as the default
+    if manifest_path is None and MANIFEST_JSON_PATH.exists():
+        manifest_path = MANIFEST_JSON_PATH
 
     manifest, resolved_manifest_path = _load_manifest(
         packs_dir=packs_dir,
