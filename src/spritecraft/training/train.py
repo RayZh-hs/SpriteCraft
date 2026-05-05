@@ -20,6 +20,7 @@ from spritecraft.config import (
     MAX_SUPPORT_EXEMPLARS,
     MIN_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
+    PALETTE_PATH,
     VOCAB_SIZE,
 )
 from spritecraft.data.dataset import TextureDataset
@@ -35,6 +36,7 @@ from spritecraft.debug.utility import (
 from spritecraft.inference.evaluate import write_validation_matrix
 from spritecraft.models.diffusion import apply_mask
 from spritecraft.models.unet import UNet
+from spritecraft.training.content_loss import content_preservation_loss
 
 MetricRecord = dict[str, float | int]
 METRIC_FIELDNAMES = ("step", "loss", "lr")
@@ -541,6 +543,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    palette = torch.from_numpy(np.load(PALETTE_PATH)).float().to(device)
     train_dataset = TextureDataset(
         split="train",
         min_support_exemplars=MIN_SUPPORT_EXEMPLARS,
@@ -716,6 +719,8 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             optimizer.zero_grad(set_to_none=True)
             total_loss = 0.0
 
+            total_ce_loss = 0.0
+            total_content_loss = 0.0
             for accum_idx in range(grad_accum_steps):
                 try:
                     batch = next(train_iter)
@@ -747,13 +752,19 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                         support_mask,
                         t,
                     )
-                    loss = F.cross_entropy(logits, target) / grad_accum_steps
+                    ce_loss = F.cross_entropy(logits, target)
+                    content_loss = content_preservation_loss(
+                        logits, content_ref, palette, alpha=0.05
+                    )
+                    loss = (ce_loss + content_loss) / grad_accum_steps
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 total_loss += float(loss.detach().item()) * grad_accum_steps
+                total_ce_loss += float(ce_loss.detach().item())
+                total_content_loss += float(content_loss.detach().item())
 
             if scaler.is_enabled():
                 scaler.step(optimizer)
@@ -764,6 +775,8 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
             current_step = step + 1
             average_loss = total_loss / grad_accum_steps
+            average_ce_loss = total_ce_loss / grad_accum_steps
+            average_content_loss = total_content_loss / grad_accum_steps
             lr = scheduler.get_last_lr()[0]
             runtime_state["step"] = current_step
             runtime_state["last_loss"] = average_loss
@@ -775,7 +788,11 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             }
             metric_history.append(metric_record)
             pending_metric_history.append(metric_record)
-            _log_training_scalars(writer, current_step, average_loss, lr, {})
+            scalar_metrics = {
+                "train/ce_loss": average_ce_loss,
+                "train/content_loss": average_content_loss,
+            }
+            _log_training_scalars(writer, current_step, average_loss, lr, scalar_metrics)
 
             if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
                 _append_metric_history(metrics_path, pending_metric_history)
@@ -784,7 +801,10 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 update_runtime_status()
 
             if current_step == 1 or current_step % 10 == 0 or current_step == steps:
-                print(f"step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
+                print(
+                    f"step={current_step}/{steps} loss={average_loss:.4f} "
+                    f"ce={average_ce_loss:.4f} content={average_content_loss:.4f} lr={lr:.6e}"
+                )
 
             if current_step % save_interval == 0 or current_step == steps:
                 if pending_metric_history:

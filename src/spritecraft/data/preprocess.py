@@ -252,7 +252,7 @@ def should_keep_image(img_path: Path, img: Image.Image) -> bool:
     width, height = img.size
     if width != height:
         return False
-    if width not in {16, 32}:
+    if width not in {16, 32, 64}:
         return False
     if img_path.with_suffix(".png.mcmeta").exists():
         return False
@@ -284,6 +284,8 @@ def preprocess_image(img: Image.Image) -> Image.Image:
 
     if width == 16:
         img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
+    elif width == 64:
+        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
 
     return img
 
@@ -298,7 +300,9 @@ def collect_images(
         return {}, 0
 
     images: dict[str, Image.Image] = {}
-    block_texture_paths = sorted(block_dir.glob("*.png"))
+    block_texture_paths = sorted(block_dir.rglob("*.png"))
+    total_textures = len(block_texture_paths)
+    
     for img_path in block_texture_paths:
         try:
             img = Image.open(img_path)
@@ -308,12 +312,23 @@ def collect_images(
 
         if not should_keep_image(img_path, img):
             continue
-        if allowed_filenames is not None and img_path.name not in allowed_filenames:
+
+        # Determine the canonical filename for this texture
+        if img_path.parent == block_dir:
+            # Flat structure: block/foo.png -> foo.png
+            canonical_name = img_path.name
+        else:
+            # Nested structure: block/foo/1.png -> foo.png (use parent dir name)
+            canonical_name = img_path.parent.name + ".png"
+        
+        if allowed_filenames is not None and canonical_name not in allowed_filenames:
             continue
 
-        images[img_path.name] = preprocess_image(img)
+        # Only keep the first matching texture for each canonical name
+        if canonical_name not in images:
+            images[canonical_name] = preprocess_image(img)
 
-    return images, len(block_texture_paths)
+    return images, total_textures
 
 
 def build_palette(all_pixels: np.ndarray) -> np.ndarray:
