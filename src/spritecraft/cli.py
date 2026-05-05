@@ -9,6 +9,19 @@ def main():
     parser = argparse.ArgumentParser(description="SpriteCraft")
     subparsers = parser.add_subparsers(dest="command")
 
+    def add_debug_parser(name: str):
+        debug_parser = subparsers.add_parser(name, help="Inspect or control a running trainer")
+        debug_parser.add_argument(
+            "debug_action",
+            nargs="?",
+            choices=("status", "snapshot", "preview"),
+            default="status",
+        )
+        debug_parser.add_argument("--pid", type=int, default=None)
+        debug_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+        debug_parser.add_argument("--wait-timeout", type=float, default=600.0)
+        return debug_parser
+
     preprocess_parser = subparsers.add_parser("preprocess", help="Run data preprocessing")
     preprocess_parser.add_argument("--packs-dir", type=str, default="data/raw_packs")
     preprocess_parser.add_argument("--manifest", type=str, default=None)
@@ -26,6 +39,8 @@ def main():
     select_group.add_argument("--textures", nargs="+", default=None)
     select_group.add_argument("--random", type=int, dest="random_count")
     generate_parser.add_argument("--seed", type=int, default=None)
+
+    add_debug_parser("debug")
 
     args = parser.parse_args()
 
@@ -48,6 +63,14 @@ def main():
             textures=args.textures,
             random_count=args.random_count,
             seed=args.seed,
+        )
+    elif args.command == "debug":
+        from spritecraft.debug import debug
+        debug.run(
+            action=args.debug_action,
+            pid=args.pid,
+            checkpoint_dir=args.checkpoint_dir,
+            wait_timeout=args.wait_timeout,
         )
     else:
         parser.print_help()

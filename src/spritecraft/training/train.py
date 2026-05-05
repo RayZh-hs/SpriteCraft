@@ -3,6 +3,7 @@
 import csv
 from contextlib import nullcontext
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,15 @@ from spritecraft.config import (
     VOCAB_SIZE,
 )
 from spritecraft.data.dataset import TextureDataset
+from spritecraft.debug.utility import (
+    list_request_paths,
+    load_json,
+    previews_dir,
+    runtime_status_path,
+    snapshots_dir,
+    utcnow_iso,
+    write_json_atomic,
+)
 from spritecraft.inference.evaluate import write_validation_matrix
 from spritecraft.models.diffusion import apply_mask
 from spritecraft.models.unet import UNet
@@ -53,6 +63,10 @@ def _metrics_history_path(checkpoint_dir: Path) -> Path:
 
 def _validation_preview_dir(checkpoint_dir: Path, step: int) -> Path:
     return checkpoint_dir / "validation" / f"step_{step:06d}"
+
+
+def _debug_preview_dir(checkpoint_dir: Path, step: int, request_id: str) -> Path:
+    return previews_dir(checkpoint_dir) / f"{request_id}_step_{step:06d}"
 
 
 def _make_summary_writer(log_dir: Path, start_step: int):
@@ -474,10 +488,28 @@ def _log_validation_summary(writer, preview_dir: Path, summary: dict[str, object
                     dataformats="HWC",
                 )
 
-        for metric_name in ("mean_pixel_accuracy", "mean_rgb_mae", "exact_match_count"):
-            metric_value = pack_summary.get(metric_name)
-            if metric_value is not None:
-                writer.add_scalar(f"validation/packs/{pack_tag}/{metric_name}", metric_value, step)
+
+@torch.no_grad()
+def _render_validation_preview(
+    model: UNet,
+    dataset: TextureDataset,
+    output_dir: Path,
+    checkpoint_path: Path | None,
+) -> dict[str, object] | None:
+    if len(dataset) == 0:
+        return None
+
+    was_training = model.training
+    model.eval()
+    summary = write_validation_matrix(
+        model=model,
+        dataset=dataset,
+        output_dir=output_dir,
+        checkpoint_path=checkpoint_path,
+    )
+    if was_training:
+        model.train()
+    return summary
 
 
 @torch.no_grad()
@@ -490,17 +522,10 @@ def _write_validation_preview(
     if len(dataset) == 0:
         return None
 
-    was_training = model.training
-    model.eval()
     preview_dir = _validation_preview_dir(checkpoint_dir, step)
-    summary = write_validation_matrix(
-        model=model,
-        dataset=dataset,
-        output_dir=preview_dir,
-        checkpoint_path=checkpoint_dir / "latest.pt",
-    )
-    if was_training:
-        model.train()
+    summary = _render_validation_preview(model, dataset, preview_dir, checkpoint_dir / "latest.pt")
+    if summary is None:
+        return None
     return preview_dir, summary
 
 
@@ -531,8 +556,8 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
     batch_size = 2 if device.type == "cuda" else 1
     grad_accum_steps = 8 if device.type == "cuda" else 1
-    validation_interval = 5_000
-    save_interval = 1_000
+    validation_interval = 500
+    save_interval = 500
     history_flush_interval = 10
 
     train_loader = DataLoader(
@@ -567,6 +592,117 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         else nullcontext()
     )
     scaler = _make_grad_scaler(device)
+    pid = os.getpid()
+    status_path = runtime_status_path(checkpoint_dir, pid)
+    runtime_state: dict[str, object] = {
+        "pid": pid,
+        "status": "running",
+        "checkpoint_dir": str(checkpoint_dir.resolve()),
+        "device": device.type,
+        "step": start_step,
+        "target_steps": steps,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "validation_interval": validation_interval,
+        "save_interval": save_interval,
+        "last_loss": None,
+        "last_lr": None,
+        "last_saved_step": start_step,
+        "last_validation_step": 0,
+        "last_preview_dir": None,
+        "started_at": utcnow_iso(),
+        "updated_at": utcnow_iso(),
+    }
+
+    def update_runtime_status() -> None:
+        runtime_state["updated_at"] = utcnow_iso()
+        write_json_atomic(status_path, runtime_state)
+
+    def known_issues() -> list[str]:
+        issues: list[str] = []
+        current_step = int(runtime_state.get("step", 0))
+        last_saved_step = int(runtime_state.get("last_saved_step", 0))
+        last_validation_step = int(runtime_state.get("last_validation_step", 0))
+        if current_step > last_saved_step:
+            issues.append(f"Latest checkpoint lags live model by {current_step - last_saved_step} step(s).")
+        if current_step > last_validation_step:
+            issues.append(f"Preview images lag live model by {current_step - last_validation_step} step(s).")
+        if runtime_state.get("last_preview_dir") is None:
+            issues.append("No preview images have been generated yet.")
+        return issues
+
+    def process_debug_requests(current_step: int) -> None:
+        request_paths = list_request_paths(checkpoint_dir, pid)
+        for request_path in request_paths:
+            request = load_json(request_path)
+            if request.get("status") != "pending":
+                continue
+
+            request["status"] = "running"
+            request["started_at"] = utcnow_iso()
+            write_json_atomic(request_path, request)
+
+            try:
+                action = str(request.get("action"))
+                if action == "snapshot":
+                    if pending_metric_history:
+                        _append_metric_history(metrics_path, pending_metric_history)
+                        pending_metric_history.clear()
+
+                    snapshot_root = snapshots_dir(checkpoint_dir)
+                    snapshot_root.mkdir(parents=True, exist_ok=True)
+                    request_id = str(request.get("id", "snapshot"))
+                    snapshot_path = snapshot_root / f"{request_id}_step_{current_step:06d}.pt"
+                    _save_checkpoint(snapshot_path, model, optimizer, scheduler, current_step, steps)
+                    report_path = snapshot_root / f"{request_id}_step_{current_step:06d}.json"
+                    write_json_atomic(
+                        report_path,
+                        {
+                            "pid": pid,
+                            "checkpoint_dir": str(checkpoint_dir.resolve()),
+                            "snapshot_path": str(snapshot_path.resolve()),
+                            "step": current_step,
+                            "target_steps": steps,
+                            "loss": runtime_state.get("last_loss"),
+                            "learning_rate": runtime_state.get("last_lr"),
+                            "created_at": utcnow_iso(),
+                            "known_issues": known_issues(),
+                        },
+                    )
+                    result = {
+                        "snapshot_path": str(snapshot_path.resolve()),
+                        "report_path": str(report_path.resolve()),
+                    }
+                elif action == "preview":
+                    request_id = str(request.get("id", "preview"))
+                    preview_dir = _debug_preview_dir(checkpoint_dir, current_step, request_id)
+                    summary = _render_validation_preview(model, val_dataset, preview_dir, checkpoint_path=None)
+                    if summary is None:
+                        raise RuntimeError("Validation split is empty; no preview could be generated.")
+                    _log_validation_summary(writer, preview_dir, summary, current_step)
+                    writer.flush()
+                    runtime_state["last_validation_step"] = current_step
+                    runtime_state["last_preview_dir"] = str(preview_dir.resolve())
+                    result = {
+                        "preview_dir": str(preview_dir.resolve()),
+                        "summary_path": str((preview_dir / "summary.json").resolve()),
+                    }
+                else:
+                    raise ValueError(f"Unsupported debug action {action!r}")
+            except Exception as exc:
+                request["status"] = "failed"
+                request["completed_at"] = utcnow_iso()
+                request["error"] = str(exc)
+                write_json_atomic(request_path, request)
+                update_runtime_status()
+            else:
+                request["status"] = "completed"
+                request["completed_at"] = utcnow_iso()
+                request["result"] = result
+                write_json_atomic(request_path, request)
+                update_runtime_status()
+
+    update_runtime_status()
 
     try:
         model.train()
@@ -623,6 +759,9 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             current_step = step + 1
             average_loss = total_loss / grad_accum_steps
             lr = scheduler.get_last_lr()[0]
+            runtime_state["step"] = current_step
+            runtime_state["last_loss"] = average_loss
+            runtime_state["last_lr"] = lr
             metric_record: MetricRecord = {
                 "step": current_step,
                 "loss": average_loss,
@@ -636,6 +775,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 _append_metric_history(metrics_path, pending_metric_history)
                 pending_metric_history.clear()
                 writer.flush()
+                update_runtime_status()
 
             if current_step == 1 or current_step % 10 == 0 or current_step == steps:
                 print(f"step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
@@ -648,6 +788,8 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                 step_checkpoint = checkpoint_dir / f"step_{current_step:06d}.pt"
                 _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
                 _write_training_graphs(checkpoint_dir, metric_history)
+                runtime_state["last_saved_step"] = current_step
+                update_runtime_status()
 
             if current_step % validation_interval == 0 or current_step == steps:
                 preview_result = _write_validation_preview(model, val_dataset, checkpoint_dir, current_step)
@@ -655,7 +797,16 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     preview_dir, summary = preview_result
                     _log_validation_summary(writer, preview_dir, summary, current_step)
                     writer.flush()
+                    runtime_state["last_validation_step"] = current_step
+                    runtime_state["last_preview_dir"] = str(preview_dir.resolve())
+                    update_runtime_status()
+
+            process_debug_requests(current_step)
 
         return checkpoint_path
     finally:
+        runtime_state["status"] = "stopped"
+        runtime_state["updated_at"] = utcnow_iso()
+        runtime_state["stopped_at"] = utcnow_iso()
+        write_json_atomic(status_path, runtime_state)
         writer.close()
