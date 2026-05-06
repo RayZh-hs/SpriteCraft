@@ -10,7 +10,7 @@ from typing import Any, TypedDict, cast
 from PIL import Image
 import torch
 
-from spritecraft.config import CHECKPOINTS_DIR, IMAGE_SIZE, OUTPUT_DIR, VALIDATION_MATRIX_EXAMPLES_PER_PACK
+from spritecraft.config import CHECKPOINTS_DIR, IMAGE_SIZE, OUTPUT_DIR
 from spritecraft.data.dataset import TextureDataset
 from spritecraft.inference.sampler import PredictionBundleResult, load_model, sample_tokens, save_prediction_bundle
 from spritecraft.models.unet import UNet
@@ -35,7 +35,6 @@ class Summary(TypedDict):
 
 class PackResult(TypedDict):
     filename: str
-    support_filenames: list[str]
     bundle_dir: str
     comparison_path: str
     metrics: dict[str, float | int | bool] | None
@@ -61,34 +60,13 @@ def _resolve_index(
     return index
 
 
-def _active_support_count(sample: Sample) -> int:
-    support_mask = cast(torch.Tensor, sample["support_mask"])
-    return int(support_mask.sum().item())
-
-
-def _trimmed_support_data(sample: Sample) -> tuple[list[torch.Tensor], list[int], list[torch.Tensor], list[int]]:
-    support_count = _active_support_count(sample)
-    support_content_refs = cast(torch.Tensor, sample["support_content_refs"])
-    support_style_refs = cast(torch.Tensor, sample["support_style_refs"])
-    return (
-        list(support_content_refs[:support_count]),
-        [IMAGE_SIZE] * support_count,
-        list(support_style_refs[:support_count]),
-        [IMAGE_SIZE] * support_count,
-    )
-
-
 def _evaluate_sample(model: UNet, sample: Sample) -> torch.Tensor:
-    content_ref = cast(torch.Tensor, sample["content_ref"])
-    support_content_refs = cast(torch.Tensor, sample["support_content_refs"])
-    support_style_refs = cast(torch.Tensor, sample["support_style_refs"])
-    support_mask = cast(torch.Tensor, sample["support_mask"])
+    source = cast(torch.Tensor, sample["source"])
+    pack_id = cast(torch.Tensor, sample["pack_id"])
     return sample_tokens(
         model,
-        content_ref.unsqueeze(0),
-        support_content_refs.unsqueeze(0),
-        support_style_refs.unsqueeze(0),
-        support_mask=support_mask.unsqueeze(0),
+        source.unsqueeze(0),
+        torch.tensor([pack_id.item()], dtype=torch.long),
     ).squeeze(0)
 
 
@@ -112,20 +90,21 @@ def _tile_images(images: list[Image.Image], columns: int = 2) -> Image.Image:
     return canvas
 
 
-def _fallback_matrix_entries(dataset: TextureDataset) -> list[dict[str, str]]:
-    entries_by_pack: dict[str, list[dict[str, str]]] = defaultdict(list)
+def _fallback_matrix_entries(dataset: TextureDataset) -> list[dict[str, str | int]]:
+    entries_by_pack: dict[str, list[dict[str, str | int]]] = defaultdict(list)
     for episode in dataset.episodes:
-        entries_by_pack[episode["target_pack"]].append(
+        entries_by_pack[str(episode["target_pack"])].append(
             {
                 "split": dataset.split,
                 "filename": episode["filename"],
                 "target_pack": episode["target_pack"],
+                "target_pack_idx": episode["target_pack_idx"],
             }
         )
 
-    entries: list[dict[str, str]] = []
+    entries: list[dict[str, str | int]] = []
     for target_pack in sorted(entries_by_pack):
-        entries.extend(entries_by_pack[target_pack][:VALIDATION_MATRIX_EXAMPLES_PER_PACK])
+        entries.extend(entries_by_pack[target_pack][:4])
     return entries
 
 
@@ -147,29 +126,23 @@ def write_validation_matrix(
     overall_metrics: list[dict[str, float | int | bool]] = []
 
     for entry in matrix_entries:
-        dataset_index = dataset.get_episode_index(entry["filename"], entry["target_pack"])
+        dataset_index = dataset.get_episode_index(
+            str(entry["filename"]), str(entry["target_pack"])
+        )
         sample = cast(Sample, dataset[dataset_index])
         prediction = _evaluate_sample(model, sample)
-        support_count = _active_support_count(sample)
-        support_content_tokens, support_content_sizes, support_style_tokens, support_style_sizes = _trimmed_support_data(sample)
 
         bundle_name = (
             f"{dataset.split}_{dataset_index:03d}_{Path(sample['filename']).stem}"
             f"_in_{sample['target_pack']}"
-            f"_{support_count}shot"
         )
         bundle_output_dir = output_dir / sample["target_pack"]
         metadata: dict[str, str | int | float | bool | list[str]] = {
             "split": dataset.split,
             "index": dataset_index,
             "filename": sample["filename"],
-            "content_filename": sample["content_filename"],
-            "support_content_filenames": sample["support_content_filenames"],
-            "support_style_filenames": sample["support_style_filenames"],
-            "target_filename": sample["target_filename"],
-            "content_pack": sample["content_pack"],
-            "style_pack": sample["style_pack"],
             "target_pack": sample["target_pack"],
+            "pack_id": sample["pack_id"],
             "style": sample.get("style", "unspecified"),
         }
         if checkpoint_path is not None:
@@ -178,14 +151,11 @@ def write_validation_matrix(
         result: PredictionBundleResult = save_prediction_bundle(
             output_dir=bundle_output_dir,
             bundle_name=bundle_name,
-            content_tokens=sample["content_ref"],
-            content_size=IMAGE_SIZE,
-            support_content_tokens=support_content_tokens,
-            support_content_sizes=support_content_sizes,
-            support_style_tokens=support_style_tokens,
-            support_style_sizes=support_style_sizes,
+            source_tokens=sample["source"],
+            source_size=IMAGE_SIZE,
             prediction_tokens=prediction,
             prediction_size=IMAGE_SIZE,
+            pack_id=sample["pack_id"],
             truth_tokens=sample["target"],
             truth_size=IMAGE_SIZE,
             metadata=metadata,
@@ -196,7 +166,6 @@ def write_validation_matrix(
             overall_metrics.append(metrics)
         pack_entry: PackResult = {
             "filename": sample["filename"],
-            "support_filenames": sample["support_style_filenames"],
             "bundle_dir": str(result["bundle_dir"]),
             "comparison_path": str(result["comparison_path"]),
             "metrics": metrics,
@@ -275,47 +244,34 @@ def _run_single(
     sample = cast(Sample, dataset[dataset_index])
     model, checkpoint_path = load_model(checkpoint_dir)
     prediction = _evaluate_sample(model, sample)
-    support_count = _active_support_count(sample)
-    support_content_tokens, support_content_sizes, support_style_tokens, support_style_sizes = _trimmed_support_data(sample)
 
     bundle_name = (
         f"{split}_{dataset_index:03d}_{Path(sample['filename']).stem}"
         f"_in_{sample['target_pack']}"
-        f"_{support_count}shot"
     )
     result = save_prediction_bundle(
         output_dir=output_dir,
         bundle_name=bundle_name,
-        content_tokens=sample["content_ref"],
-        content_size=IMAGE_SIZE,
-        support_content_tokens=support_content_tokens,
-        support_content_sizes=support_content_sizes,
-        support_style_tokens=support_style_tokens,
-        support_style_sizes=support_style_sizes,
+        source_tokens=sample["source"],
+        source_size=IMAGE_SIZE,
         prediction_tokens=prediction,
         prediction_size=IMAGE_SIZE,
+        pack_id=sample["pack_id"],
         truth_tokens=sample["target"],
         truth_size=IMAGE_SIZE,
         metadata={
             "split": split,
             "index": dataset_index,
             "filename": sample["filename"],
-            "content_filename": sample["content_filename"],
-            "support_content_filenames": sample["support_content_filenames"],
-            "support_style_filenames": sample["support_style_filenames"],
-            "target_filename": sample["target_filename"],
-            "content_pack": sample["content_pack"],
-            "style_pack": sample["style_pack"],
             "target_pack": sample["target_pack"],
+            "pack_id": sample["pack_id"],
             "style": sample.get("style", "unspecified"),
             "checkpoint_path": str(checkpoint_path.resolve()),
         },
     )
 
     print(f"Evaluated split={split} index={dataset_index} filename={sample['filename']} pack={sample['target_pack']}")
-    print(f"Support pack: {sample['style_pack']} using {sample['support_style_filenames']}")
-    print(f"Saved original texture to {result['original_path']}")
-    print(f"Saved support pairs to {result['support_path']}")
+    print(f"Saved source texture to {result['source_path']}")
     print(f"Saved generated texture to {result['produced_path']}")
     print(f"Saved source of truth to {result['truth_path']}")
     print(f"Saved side-by-side comparison to {result['comparison_path']}")

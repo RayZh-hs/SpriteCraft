@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import math
 import os
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -17,8 +18,6 @@ from torch.utils.data import DataLoader
 from spritecraft.config import (
     CHECKPOINTS_DIR,
     MASK_TOKEN,
-    MAX_SUPPORT_EXEMPLARS,
-    MIN_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
     PALETTE_PATH,
     VOCAB_SIZE,
@@ -33,13 +32,11 @@ from spritecraft.debug.utility import (
     utcnow_iso,
     write_json_atomic,
 )
-from spritecraft.inference.evaluate import write_validation_matrix
+from spritecraft.inference.evaluate import Summary, write_validation_matrix
 from spritecraft.models.diffusion import apply_mask
 from spritecraft.models.unet import UNet
-from spritecraft.training.content_loss import content_preservation_loss
-from spritecraft.training.perceptual_loss import perceptual_loss
 
-MetricRecord = dict[str, float | int]
+MetricRecord = dict[str, float | int | torch.Tensor]
 METRIC_FIELDNAMES = ("step", "loss", "lr")
 TENSORBOARD_DIRNAME = "tensorboard"
 
@@ -83,10 +80,9 @@ def _make_summary_writer(log_dir: Path, start_step: int):
 
     log_dir.mkdir(parents=True, exist_ok=True)
     purge_step = start_step + 1 if start_step > 0 else None
-    writer_kwargs = {"log_dir": str(log_dir)}
     if purge_step is not None:
-        writer_kwargs["purge_step"] = purge_step
-    return SummaryWriter(**writer_kwargs)
+        return SummaryWriter(log_dir=str(log_dir), purge_step=purge_step)
+    return SummaryWriter(log_dir=str(log_dir))
 
 
 def _collate_training_batch(batch: list[dict[str, object]]) -> dict[str, object]:
@@ -95,7 +91,7 @@ def _collate_training_batch(batch: list[dict[str, object]]) -> dict[str, object]
     for key in batch[0]:
         values = [sample[key] for sample in batch]
         if torch.is_tensor(values[0]):
-            collated[key] = torch.stack(values)
+            collated[key] = torch.stack(cast(list[torch.Tensor], values))
         else:
             collated[key] = values
     return collated
@@ -105,7 +101,7 @@ def _write_metric_history(metrics_path: Path, metric_history: list[MetricRecord]
     with metrics_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
         writer.writeheader()
-        writer.writerows(metric_history)
+        writer.writerows(metric_history)  # type: ignore[arg-type]
 
 
 def _append_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
@@ -117,7 +113,7 @@ def _append_metric_history(metrics_path: Path, metric_history: list[MetricRecord
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
         if not file_exists:
             writer.writeheader()
-        writer.writerows(metric_history)
+        writer.writerows(metric_history)  # type: ignore[arg-type]
 
 
 def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord]:
@@ -303,11 +299,13 @@ def _save_checkpoint(
     scheduler: CosineAnnealingLR,
     step: int,
     target_steps: int,
+    num_packs: int,
 ) -> None:
     torch.save(
         {
             "step": step,
             "target_steps": target_steps,
+            "num_packs": num_packs,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -339,7 +337,7 @@ def _maybe_load_checkpoint(
         model.load_state_dict(checkpoint["model_state_dict"])
     except RuntimeError as exc:
         raise RuntimeError(
-            f"Checkpoint {checkpoint_path} is incompatible with the current support-pair model. "
+            f"Checkpoint {checkpoint_path} is incompatible with the current pack-embedding model. "
             "Use a fresh checkpoint directory after re-running preprocessing."
         ) from exc
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -347,26 +345,6 @@ def _maybe_load_checkpoint(
     if checkpoint.get("target_steps") == target_steps:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     return int(checkpoint.get("step", 0))
-
-
-def _apply_cfg_dropout(
-    content_ref: torch.Tensor,
-    support_content_refs: torch.Tensor,
-    support_style_refs: torch.Tensor,
-    support_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    content_ref = content_ref.clone()
-    support_content_refs = support_content_refs.clone()
-    support_style_refs = support_style_refs.clone()
-    support_mask = support_mask.clone()
-
-    content_mask = torch.rand(content_ref.shape[0], device=content_ref.device) < 0.1
-    support_dropout_mask = torch.rand(support_content_refs.shape[0], device=support_content_refs.device) < 0.1
-    content_ref[content_mask] = 0
-    support_content_refs[support_dropout_mask] = 0
-    support_style_refs[support_dropout_mask] = 0
-    support_mask[support_dropout_mask] = False
-    return content_ref, support_content_refs, support_style_refs, support_mask
 
 
 def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda.amp.GradScaler:
@@ -400,8 +378,6 @@ def _collect_batch_diagnostics(
     logits: torch.Tensor,
     target: torch.Tensor,
     noisy_target: torch.Tensor,
-    support_mask: torch.Tensor,
-    attention_weights: torch.Tensor | None,
 ) -> tuple[dict[str, float], dict[str, torch.Tensor]]:
     probabilities = torch.softmax(logits.detach().float(), dim=1)
     confidence, prediction = probabilities.max(dim=1)
@@ -430,28 +406,11 @@ def _collect_batch_diagnostics(
         "train/top1_confidence_std": float(confidence.std(unbiased=False).item()),
         "train/prediction_unique_tokens": float(unique_counts.mean().item()),
         "train/prediction_dominant_token_share": float(dominant_token_shares.mean().item()),
-        "train/active_supports": float(support_mask.float().sum(dim=1).mean().item()),
     }
 
     histogram_tensors = {
         "confidence": confidence.detach().cpu(),
     }
-    if attention_weights is None:
-        return scalar_metrics, histogram_tensors
-
-    attention_weights = attention_weights.detach().float()
-    attention_mask = support_mask.to(dtype=torch.bool)
-    valid_counts = attention_mask.sum(dim=1)
-    attention_entropy = -(attention_weights.clamp_min(1e-8).log() * attention_weights).sum(dim=1)
-    normalized_attention_entropy = torch.where(
-        valid_counts > 1,
-        attention_entropy / valid_counts.float().log(),
-        torch.zeros_like(attention_entropy),
-    )
-    masked_attention = attention_weights.masked_fill(~attention_mask, 0.0)
-    scalar_metrics["train/support_attention_max"] = float(masked_attention.max(dim=1).values.mean().item())
-    scalar_metrics["train/support_attention_entropy"] = float(normalized_attention_entropy.mean().item())
-    histogram_tensors["support_attention"] = attention_weights[attention_mask].detach().cpu()
     return scalar_metrics, histogram_tensors
 
 
@@ -463,15 +422,16 @@ def _log_training_scalars(writer, step: int, loss: float, lr: float, scalar_metr
 
 
 def _log_model_histograms(writer, model: UNet, histogram_tensors: dict[str, torch.Tensor], step: int) -> None:
-    writer.add_histogram("model/output_head_weights", model.out[-1].weight.detach().float().cpu(), step)
+    writer.add_histogram("model/output_head_weights", cast(torch.nn.Conv2d, model.out[-1]).weight.detach().float().cpu(), step)
     writer.add_histogram("model/token_embedding_weights", model.token_embedding.weight.detach().float().cpu(), step)
+    writer.add_histogram("model/pack_embedding_weights", model.pack_embedding.weight.detach().float().cpu(), step)
     for histogram_name, histogram_values in histogram_tensors.items():
         if histogram_values.numel() == 0:
             continue
         writer.add_histogram(f"train/{histogram_name}_distribution", histogram_values, step)
 
 
-def _log_validation_summary(writer, preview_dir: Path, summary: dict[str, object], step: int) -> None:
+def _log_validation_summary(writer, preview_dir: Path, summary: Summary, step: int) -> None:
     packs = summary.get("packs", {})
     if not isinstance(packs, dict):
         return
@@ -498,7 +458,7 @@ def _render_validation_preview(
     dataset: TextureDataset,
     output_dir: Path,
     checkpoint_path: Path | None,
-) -> dict[str, object] | None:
+) -> Summary | None:
     if len(dataset) == 0:
         return None
 
@@ -521,7 +481,7 @@ def _write_validation_preview(
     dataset: TextureDataset,
     checkpoint_dir: Path,
     step: int,
-) -> tuple[Path, dict[str, object]] | None:
+) -> tuple[Path, Summary] | None:
     if len(dataset) == 0:
         return None
 
@@ -544,20 +504,12 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-    palette = torch.from_numpy(np.load(PALETTE_PATH)).float().to(device)
-    train_dataset = TextureDataset(
-        split="train",
-        min_support_exemplars=MIN_SUPPORT_EXEMPLARS,
-        max_support_exemplars=MAX_SUPPORT_EXEMPLARS,
-    )
-    val_dataset = TextureDataset(
-        split="val",
-        min_support_exemplars=MIN_SUPPORT_EXEMPLARS,
-        max_support_exemplars=MAX_SUPPORT_EXEMPLARS,
-    )
+    train_dataset = TextureDataset(split="train")
+    val_dataset = TextureDataset(split="val")
     if len(train_dataset) == 0:
         raise ValueError("Training split is empty. Run preprocessing first.")
 
+    num_packs = len(train_dataset.pack_ids)
     batch_size = 2 if device.type == "cuda" else 1
     grad_accum_steps = 8 if device.type == "cuda" else 1
     validation_interval = 500
@@ -573,7 +525,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
     )
     train_iter = iter(train_loader)
 
-    model = UNet(vocab_size=VOCAB_SIZE).to(device)
+    model = UNet(num_packs=num_packs, vocab_size=VOCAB_SIZE).to(device)
     optimizer = AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(steps, 1), eta_min=1e-6)
     checkpoint_path = _latest_checkpoint_path(checkpoint_dir)
@@ -624,9 +576,9 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
     def known_issues() -> list[str]:
         issues: list[str] = []
-        current_step = int(runtime_state.get("step", 0))
-        last_saved_step = int(runtime_state.get("last_saved_step", 0))
-        last_validation_step = int(runtime_state.get("last_validation_step", 0))
+        current_step = int(cast(int, runtime_state.get("step", 0)))
+        last_saved_step = int(cast(int, runtime_state.get("last_saved_step", 0)))
+        last_validation_step = int(cast(int, runtime_state.get("last_validation_step", 0)))
         if current_step > last_saved_step:
             issues.append(f"Latest checkpoint lags live model by {current_step - last_saved_step} step(s).")
         if current_step > last_validation_step:
@@ -645,7 +597,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             request["status"] = "running"
             request["started_at"] = utcnow_iso()
             write_json_atomic(request_path, request)
-            preview_summary_to_log: tuple[Path, dict[str, object]] | None = None
+            preview_summary_to_log: tuple[Path, Summary] | None = None
 
             try:
                 action = str(request.get("action"))
@@ -658,7 +610,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     snapshot_root.mkdir(parents=True, exist_ok=True)
                     request_id = str(request.get("id", "snapshot"))
                     snapshot_path = snapshot_root / f"{request_id}_step_{current_step:06d}.pt"
-                    _save_checkpoint(snapshot_path, model, optimizer, scheduler, current_step, steps)
+                    _save_checkpoint(snapshot_path, model, optimizer, scheduler, current_step, steps, num_packs)
                     report_path = snapshot_root / f"{request_id}_step_{current_step:06d}.json"
                     write_json_atomic(
                         report_path,
@@ -720,9 +672,6 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             optimizer.zero_grad(set_to_none=True)
             total_loss = 0.0
 
-            total_ce_loss = 0.0
-            total_content_loss = 0.0
-            total_perceptual_loss = 0.0
             for accum_idx in range(grad_accum_steps):
                 try:
                     batch = next(train_iter)
@@ -730,47 +679,23 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
                     train_iter = iter(train_loader)
                     batch = next(train_iter)
 
-                content_ref = batch["content_ref"].to(device)
-                support_content_refs = batch["support_content_refs"].to(device)
-                support_style_refs = batch["support_style_refs"].to(device)
-                support_mask = batch["support_mask"].to(device)
+                source = batch["source"].to(device)
+                pack_id = batch["pack_id"].to(device)
                 target = batch["target"].to(device)
 
-                content_ref, support_content_refs, support_style_refs, support_mask = _apply_cfg_dropout(
-                    content_ref,
-                    support_content_refs,
-                    support_style_refs,
-                    support_mask,
-                )
                 t = torch.randint(1, NUM_TIMESTEPS + 1, (target.shape[0],), device=device)
                 noisy_target = apply_mask(target, t)
 
                 with autocast_context():
-                    logits = model(
-                        noisy_target,
-                        content_ref,
-                        support_content_refs,
-                        support_style_refs,
-                        support_mask,
-                        t,
-                    )
+                    logits = model(noisy_target, source, pack_id, t)
                     ce_loss = F.cross_entropy(logits, target)
-                    content_loss = content_preservation_loss(
-                        logits, content_ref, palette, alpha=0.05
-                    )
-                    perceptual = perceptual_loss(
-                        logits, target, palette, alpha=0.1
-                    )
-                    loss = (ce_loss + content_loss + perceptual) / grad_accum_steps
+                    loss = ce_loss / grad_accum_steps
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                 else:
                     loss.backward()
                 total_loss += float(loss.detach().item()) * grad_accum_steps
-                total_ce_loss += float(ce_loss.detach().item())
-                total_content_loss += float(content_loss.detach().item())
-                total_perceptual_loss += float(perceptual.detach().item())
 
             if scaler.is_enabled():
                 scaler.step(optimizer)
@@ -781,10 +706,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
 
             current_step = step + 1
             average_loss = total_loss / grad_accum_steps
-            average_ce_loss = total_ce_loss / grad_accum_steps
-            average_content_loss = total_content_loss / grad_accum_steps
-            average_perceptual_loss = total_perceptual_loss / grad_accum_steps
-            lr = scheduler.get_last_lr()[0]
+            lr = float(scheduler.get_last_lr()[0])
             runtime_state["step"] = current_step
             runtime_state["last_loss"] = average_loss
             runtime_state["last_lr"] = lr
@@ -796,9 +718,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             metric_history.append(metric_record)
             pending_metric_history.append(metric_record)
             scalar_metrics = {
-                "train/ce_loss": average_ce_loss,
-                "train/content_loss": average_content_loss,
-                "train/perceptual_loss": average_perceptual_loss,
+                "train/ce_loss": average_loss,
             }
             _log_training_scalars(writer, current_step, average_loss, lr, scalar_metrics)
 
@@ -811,17 +731,16 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 100_000):
             if current_step == 1 or current_step % 10 == 0 or current_step == steps:
                 print(
                     f"step={current_step}/{steps} loss={average_loss:.4f} "
-                    f"ce={average_ce_loss:.4f} content={average_content_loss:.4f} "
-                    f"perceptual={average_perceptual_loss:.4f} lr={lr:.6e}"
+                    f"lr={lr:.6e}"
                 )
 
             if current_step % save_interval == 0 or current_step == steps:
                 if pending_metric_history:
                     _append_metric_history(metrics_path, pending_metric_history)
                     pending_metric_history.clear()
-                _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
+                _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps, num_packs)
                 step_checkpoint = checkpoint_dir / f"step_{current_step:06d}.pt"
-                _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
+                _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps, num_packs)
                 _write_training_graphs(checkpoint_dir, metric_history)
                 runtime_state["last_saved_step"] = current_step
                 update_runtime_status()

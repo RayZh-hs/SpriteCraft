@@ -8,7 +8,7 @@ import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from PIL import Image
@@ -18,9 +18,7 @@ from spritecraft.config import (
     MANIFEST_JSON_PATH,
     DATASET_PATH,
     IMAGE_SIZE,
-    MAX_SUPPORT_EXEMPLARS,
     MIN_SHARED_PACKS,
-    MIN_SUPPORT_EXEMPLARS,
     PACK_REPORT_PATH,
     PAIR_INDEX_PATH,
     PALETTE_PATH,
@@ -28,12 +26,6 @@ from spritecraft.config import (
     PROCESSED_DIR,
     RAW_PACKS_DIR,
     VALIDATION_FILENAMES,
-    VALIDATION_MATRIX_EXAMPLES_PER_PACK,
-)
-from spritecraft.data.support_index import (
-    compute_texture_descriptor,
-    infer_texture_family,
-    rank_support_candidates,
 )
 
 FULL_CUBE_FACES = frozenset({"down", "up", "north", "south", "west", "east"})
@@ -290,20 +282,20 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return img
 
 
-def collect_images(
+def collect_textures_from_dir(
     pack_dir: Path,
+    texture_dir: Path,
     allowed_filenames: set[str] | None = None,
 ) -> tuple[dict[str, Image.Image], int]:
-    """Collect all valid block textures from an extracted pack."""
-    block_dir = pack_dir / "assets" / "minecraft" / "textures" / "block"
-    if not block_dir.exists():
+    """Collect all valid textures from a specific texture directory."""
+    if not texture_dir.exists():
         return {}, 0
 
     images: dict[str, Image.Image] = {}
-    block_texture_paths = sorted(block_dir.rglob("*.png"))
-    total_textures = len(block_texture_paths)
-    
-    for img_path in block_texture_paths:
+    texture_paths = sorted(texture_dir.rglob("*.png"))
+    total_textures = len(texture_paths)
+
+    for img_path in texture_paths:
         try:
             img = Image.open(img_path)
             img.load()
@@ -314,13 +306,13 @@ def collect_images(
             continue
 
         # Determine the canonical filename for this texture
-        if img_path.parent == block_dir:
+        if img_path.parent == texture_dir:
             # Flat structure: block/foo.png -> foo.png
             canonical_name = img_path.name
         else:
             # Nested structure: block/foo/1.png -> foo.png (use parent dir name)
             canonical_name = img_path.parent.name + ".png"
-        
+
         if allowed_filenames is not None and canonical_name not in allowed_filenames:
             continue
 
@@ -331,16 +323,37 @@ def collect_images(
     return images, total_textures
 
 
+def collect_images(
+    pack_dir: Path,
+    allowed_filenames: set[str] | None = None,
+) -> tuple[dict[str, Image.Image], int]:
+    """Collect all valid block and item textures from an extracted pack."""
+    block_dir = pack_dir / "assets" / "minecraft" / "textures" / "block"
+    item_dir = pack_dir / "assets" / "minecraft" / "textures" / "item"
+
+    block_images, block_total = collect_textures_from_dir(pack_dir, block_dir, allowed_filenames)
+    # Items/sprites have no blockstate filtering - collect all valid ones
+    item_images, item_total = collect_textures_from_dir(pack_dir, item_dir, None)
+
+    # Merge: block textures take precedence over items on name collision
+    images = dict(block_images)
+    for name, img in item_images.items():
+        if name not in images:
+            images[name] = img
+
+    return images, block_total + item_total
+
+
 def build_palette(all_pixels: np.ndarray) -> np.ndarray:
     """Build a 256-color palette with MiniBatchKMeans."""
     kmeans = MiniBatchKMeans(
         n_clusters=PALETTE_SIZE,
         random_state=42,
         batch_size=4096,
-        n_init=3,
+        n_init="auto",
     )
     kmeans.fit(all_pixels)
-    return kmeans.cluster_centers_.astype(np.uint8)
+    return cast(np.ndarray, kmeans.cluster_centers_).astype(np.uint8)
 
 
 def quantize_image(img: Image.Image, palette: np.ndarray) -> np.ndarray:
@@ -484,66 +497,17 @@ def _resolve_fallback_pack_specs(discovered_packs: dict[str, Path]) -> tuple[lis
     return pack_specs, base_pack_id
 
 
-def _build_support_rankings(
-    base_images: dict[str, Image.Image],
-    filenames_per_pack: dict[str, list[str]],
-    split_pairs: dict[str, list[list[str | int]]],
-    base_pack_id: str,
-) -> dict[str, dict[str, list[str]]]:
-    descriptors = {
-        filename: compute_texture_descriptor(np.asarray(image, dtype=np.uint8))
-        for filename, image in base_images.items()
-    }
-    base_filenames = set(filenames_per_pack.get(base_pack_id, []))
-    support_pool_by_pack = {
-        pack_id: sorted((base_filenames & set(filenames)) - VALIDATION_FILENAMES)
-        for pack_id, filenames in filenames_per_pack.items()
-        if pack_id != base_pack_id
-    }
-
-    support_rankings: dict[str, dict[str, list[str]]] = {}
-    for filename, pairs in split_pairs.items():
-        for pack_id, _array_idx in pairs:
-            if not isinstance(pack_id, str):
-                continue
-            if pack_id == base_pack_id:
-                continue
-            candidate_filenames = [
-                candidate_filename
-                for candidate_filename in support_pool_by_pack.get(pack_id, [])
-                if candidate_filename != filename
-            ]
-            ranked_candidates = rank_support_candidates(filename, candidate_filenames, descriptors)
-            if ranked_candidates:
-                support_rankings.setdefault(pack_id, {})[filename] = ranked_candidates
-
-    return support_rankings
-
-
-def _build_deterministic_supports(
-    support_rankings: dict[str, dict[str, list[str]]],
-    support_count: int,
-) -> dict[str, dict[str, list[str]]]:
-    deterministic_supports: dict[str, dict[str, list[str]]] = {}
-    for pack_id, rankings_for_pack in support_rankings.items():
-        for filename, ranked_candidates in rankings_for_pack.items():
-            selected_supports = ranked_candidates[: min(support_count, len(ranked_candidates))]
-            if selected_supports:
-                deterministic_supports.setdefault(pack_id, {})[filename] = selected_supports
-    return deterministic_supports
-
-
 def _select_validation_entries(
-    entries: list[dict[str, str | list[str]]],
+    entries: list[dict[str, str | int]],
     limit: int,
-) -> list[dict[str, str | list[str]]]:
+) -> list[dict[str, str | int]]:
     if len(entries) <= limit:
         return sorted(entries, key=lambda entry: str(entry["filename"]))
 
-    selected_entries: list[dict[str, str | list[str]]] = []
+    selected_entries: list[dict[str, str | int]] = []
     used_families: set[str] = set()
     for entry in sorted(entries, key=lambda item: str(item["filename"])):
-        family = infer_texture_family(str(entry["filename"]))
+        family = _infer_texture_family(str(entry["filename"]))
         if family in used_families:
             continue
         selected_entries.append(entry)
@@ -560,41 +524,60 @@ def _select_validation_entries(
     return selected_entries
 
 
+def _infer_texture_family(filename: str) -> str:
+    """Infer a coarse texture family from filename tokens."""
+    normalized = Path(filename).stem.lower().replace("-", "_").replace(" ", "_")
+    rules = (
+        ("wood", ("planks", "log", "wood", "stem", "hyphae", "bark")),
+        ("foliage", ("leaves", "vine", "grass", "moss", "azalea", "sapling")),
+        ("ore", ("ore", "raw_", "debris")),
+        ("stone", ("stone", "cobble", "slate", "calcite", "tuff", "basalt", "andesite", "granite", "diorite")),
+        ("brick", ("brick", "tiles", "bricks", "terracotta")),
+        ("glass", ("glass", "pane")),
+        ("soil", ("dirt", "mud", "sand", "gravel", "clay", "farmland", "path")),
+        ("item", ("ingot", "gem", "nugget", "stick", "bow", "sword", "pickaxe", "apple", "food")),
+    )
+    for family, tokens in rules:
+        if any(token in normalized for token in tokens):
+            return family
+    return "generic"
+
+
 def _build_validation_matrix(
     val_pair_index: dict[str, list[list[str | int]]],
-    deterministic_supports: dict[str, dict[str, list[str]]],
     pack_specs: list[PackSpec],
-    base_pack_id: str,
-) -> list[dict[str, str | list[str]]]:
+    base_pack_idx: int,
+    pack_id_to_idx: dict[str, int],
+) -> list[dict[str, str | int]]:
     spec_by_pack_id = {spec.pack_id: spec for spec in pack_specs}
-    entries_by_pack: dict[str, list[dict[str, str | list[str]]]] = defaultdict(list)
+    entries_by_pack: dict[str, list[dict[str, str | int]]] = defaultdict(list)
 
     for filename, pairs in val_pair_index.items():
         for pack_id, _array_idx in pairs:
             if not isinstance(pack_id, str):
                 continue
-            if pack_id == base_pack_id:
-                continue
-            support_filenames = deterministic_supports.get(pack_id, {}).get(filename)
-            if not support_filenames:
+            if pack_id == list(pack_id_to_idx.keys())[base_pack_idx]:
                 continue
 
-            spec = spec_by_pack_id[pack_id]
+            spec = spec_by_pack_id.get(pack_id)
+            if spec is None:
+                continue
+
             entries_by_pack[pack_id].append(
                 {
                     "split": "val",
                     "filename": filename,
                     "target_pack": pack_id,
+                    "target_pack_idx": pack_id_to_idx[pack_id],
                     "style": spec.style,
-                    "support_filenames": support_filenames,
                 }
             )
 
-    validation_matrix: list[dict[str, str | list[str]]] = []
+    validation_matrix: list[dict[str, str | int]] = []
     for pack_id in sorted(entries_by_pack):
         selected_entries = _select_validation_entries(
             entries_by_pack[pack_id],
-            limit=VALIDATION_MATRIX_EXAMPLES_PER_PACK,
+            limit=4,
         )
         validation_matrix.extend(selected_entries)
 
@@ -613,7 +596,7 @@ def run(
     discovered_packs = _discover_pack_archives(packs_dir)
     if not discovered_packs:
         raise FileNotFoundError(f"No supported pack archives found in {packs_dir}")
-    
+
     # If the configured manifest_path has a file, use it as the default
     if manifest_path is None and MANIFEST_JSON_PATH.exists():
         manifest_path = MANIFEST_JSON_PATH
@@ -725,13 +708,30 @@ def run(
     np.savez(DATASET_PATH, **flat_arrays)
     print(f"Dataset saved to {DATASET_PATH}")
 
+    # Build pack index: stable ordering with base pack first
+    pack_id_to_idx: dict[str, int] = {}
+    pack_ids: list[str] = []
+    # Base pack is index 0
+    pack_id_to_idx[base_pack_id] = 0
+    pack_ids.append(base_pack_id)
+    # Other selected packs follow in sorted order
+    for spec in sorted(selected_pack_specs, key=lambda s: s.pack_id):
+        if spec.pack_id == base_pack_id:
+            continue
+        idx = len(pack_ids)
+        pack_id_to_idx[spec.pack_id] = idx
+        pack_ids.append(spec.pack_id)
+
+    base_pack_idx = pack_id_to_idx[base_pack_id]
+
     raw_pair_index: dict[str, list[list[str | int]]] = defaultdict(list)
     for pack_id, filenames in filenames_per_pack.items():
+        pack_idx = pack_id_to_idx[pack_id]
         for array_idx, filename in enumerate(filenames):
-            raw_pair_index[filename].append([pack_id, array_idx])
+            raw_pair_index[filename].append([pack_idx, array_idx])
 
     filtered_pair_index = {
-        filename: sorted(pairs, key=lambda pair: str(pair[0]))
+        filename: sorted(pairs, key=lambda pair: int(pair[0]))
         for filename, pairs in raw_pair_index.items()
         if len(pairs) >= min_shared_packs
     }
@@ -746,49 +746,24 @@ def run(
         if filename in VALIDATION_FILENAMES
     }
 
-    support_rankings = {
-        "train": _build_support_rankings(
-            base_images=all_pack_images[base_pack_id],
-            filenames_per_pack=filenames_per_pack,
-            split_pairs=train_pair_index,
-            base_pack_id=base_pack_id,
-        ),
-        "val": _build_support_rankings(
-            base_images=all_pack_images[base_pack_id],
-            filenames_per_pack=filenames_per_pack,
-            split_pairs=val_pair_index,
-            base_pack_id=base_pack_id,
-        ),
-    }
-    deterministic_supports = {
-        "val": _build_deterministic_supports(
-            support_rankings["val"],
-            support_count=MIN_SUPPORT_EXEMPLARS,
-        )
-    }
     validation_matrix = _build_validation_matrix(
         val_pair_index=val_pair_index,
-        deterministic_supports=deterministic_supports["val"],
         pack_specs=pack_specs,
-        base_pack_id=base_pack_id,
+        base_pack_idx=base_pack_idx,
+        pack_id_to_idx=pack_id_to_idx,
     )
 
     pair_data = {
         "train": train_pair_index,
         "val": val_pair_index,
+        "pack_ids": pack_ids,
+        "base_pack_idx": base_pack_idx,
         "filenames_per_pack": filenames_per_pack,
-        "base_pack_id": base_pack_id,
         "validation_filenames": sorted(VALIDATION_FILENAMES),
         "selected_pack_ids": [spec.pack_id for spec in selected_pack_specs],
         "pack_roles": {spec.pack_id: spec.role for spec in pack_specs},
         "pack_styles": {spec.pack_id: spec.style for spec in pack_specs},
         "min_shared_packs": min_shared_packs,
-        "support_count_range": {
-            "min": MIN_SUPPORT_EXEMPLARS,
-            "max": MAX_SUPPORT_EXEMPLARS,
-        },
-        "support_rankings": support_rankings,
-        "deterministic_supports": deterministic_supports,
         "validation_matrix": validation_matrix,
     }
     with PAIR_INDEX_PATH.open("w", encoding="utf-8") as file_obj:

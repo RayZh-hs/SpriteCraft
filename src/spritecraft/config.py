@@ -21,9 +21,7 @@ MASK_TOKEN = 256
 VOCAB_SIZE = 257  # 256 palette indices + 1 mask token
 NUM_TIMESTEPS = 50
 MIN_SHARED_PACKS = 5
-MIN_SUPPORT_EXEMPLARS = 3
-MAX_SUPPORT_EXEMPLARS = 6
-VALIDATION_MATRIX_EXAMPLES_PER_PACK = 4
+STYLE_DIM = 256
 
 VALIDATION_FILENAMES = frozenset([
     "stone.png",
@@ -46,4 +44,9 @@ VALIDATION_FILENAMES = frozenset([
     "bookshelf.png",
     "mossy_cobblestone.png",
     "obsidian.png",
+    "diamond.png",
+    "iron_ingot.png",
+    "stick.png",
+    "apple.png",
+    "bow.png",
 ])
