@@ -136,6 +136,6 @@ class TextureDataset(Dataset):
         return {
             "filename": filename,
             "source": source,
-            "pack_id": target_pack_idx,
+            "pack_id": torch.tensor(target_pack_idx),
             "target": target,
         }
