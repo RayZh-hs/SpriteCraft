@@ -57,10 +57,10 @@ Start training with:
 spritecraft train --checkpoint-dir checkpoints/[RUN_X] --steps [STEPS]
 ```
 
-This will spin up a training loop. You can use tensorboard to monitor training metrics and visualize training samples. The tensorboard logs are written to `checkpoints/tensorboard/`.
+This will spin up a training loop. You can use tensorboard to monitor training metrics and visualize training samples. The tensorboard logs are written to `checkpoints/[RUN_X]/tensorboard/`.
 
 ```
-tensorboard --logdir checkpoints/tensorboard
+tensorboard --logdir checkpoints/[RUN_X]/tensorboard
 ```
 
 ### Generation and Evaluation
