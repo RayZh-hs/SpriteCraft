@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -16,8 +15,8 @@ from spritecraft.config import (
     MIN_SUPPORT_EXEMPLARS,
     pack_dataset_path,
     pack_pair_index_path,
-    VALIDATION_FILENAMES,
 )
+from spritecraft.data.support_index import compute_texture_descriptor, rank_support_candidates
 
 
 class PackStyleDataset(Dataset):
@@ -50,13 +49,15 @@ class PackStyleDataset(Dataset):
             raise FileNotFoundError(f"Dataset not found for pack {pack_id}: {dataset_path}")
 
         with np.load(dataset_path) as data:
+            self._content_rgb_train = torch.from_numpy(data["content_rgb_train"]).float()
+            self._content_rgb_val = torch.from_numpy(data["content_rgb_val"]).float()
             if split == "train":
-                self.content_rgb = torch.from_numpy(data["content_rgb_train"]).float()
+                self.content_rgb = self._content_rgb_train
                 self.target_rgb = torch.from_numpy(data["target_rgb_train"]).float()
                 self.content_alpha = torch.from_numpy(data["content_alpha_train"]).float()
                 self.target_alpha = torch.from_numpy(data["target_alpha_train"]).float()
             else:
-                self.content_rgb = torch.from_numpy(data["content_rgb_val"]).float()
+                self.content_rgb = self._content_rgb_val
                 self.target_rgb = torch.from_numpy(data["target_rgb_val"]).float()
                 self.content_alpha = torch.from_numpy(data["content_alpha_val"]).float()
                 self.target_alpha = torch.from_numpy(data["target_alpha_val"]).float()
@@ -81,6 +82,7 @@ class PackStyleDataset(Dataset):
         self.all_target_filenames = pair_index["all_target_filenames"]
         self.train_filenames = pair_index["train_filenames"]
         self.val_filenames = pair_index["val_filenames"]
+        self.shared_filenames = self.train_filenames + self.val_filenames
         
         if len(self.filenames) == 0:
             raise ValueError(f"No {split} samples found for pack {pack_id}")
@@ -89,42 +91,65 @@ class PackStyleDataset(Dataset):
         self.filename_to_all_idx = {
             filename: idx for idx, filename in enumerate(self.all_target_filenames)
         }
+        self.content_descriptors = self._build_content_descriptors()
+        self.support_rankings = self._build_support_rankings()
 
     def __len__(self) -> int:
         return len(self.filenames)
 
-    def _sample_style_refs(self, exclude_filename: str, idx: int) -> torch.Tensor:
+    def _build_content_descriptors(self) -> dict[str, np.ndarray]:
+        descriptors: dict[str, np.ndarray] = {}
+
+        for filename, tensor in zip(self.train_filenames, self._content_rgb_train, strict=False):
+            image = (tensor.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            descriptors[filename] = compute_texture_descriptor(image)
+
+        for filename, tensor in zip(self.val_filenames, self._content_rgb_val, strict=False):
+            image = (tensor.numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            descriptors[filename] = compute_texture_descriptor(image)
+
+        return descriptors
+
+    def _build_support_rankings(self) -> dict[str, list[str]]:
+        rankings: dict[str, list[str]] = {}
+        shared_set = set(self.shared_filenames)
+        for filename in self.shared_filenames:
+            candidates = [
+                candidate for candidate in self.shared_filenames
+                if candidate != filename and candidate in shared_set
+            ]
+            ranked = rank_support_candidates(filename, candidates, self.content_descriptors)
+            rankings[filename] = ranked if ranked else sorted(candidates)
+        return rankings
+
+    def _sample_style_refs(self, exclude_filename: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample style reference textures from the target pack."""
-        # During validation, only use training textures as style references
-        # to avoid data leakage
         if self.split == "val":
-            available = [
-                filename for filename in self.train_filenames
-                if filename != exclude_filename
+            ranked_available = [
+                filename for filename in self.support_rankings.get(exclude_filename, [])
+                if filename in self.train_filenames
             ]
         else:
-            # During training, can use any texture except current
-            available = [
-                filename for filename in self.all_target_filenames
-                if filename != exclude_filename
-            ]
-        
-        if not available:
+            ranked_available = self.support_rankings.get(exclude_filename, [])
+
+        if not ranked_available:
             # Fallback: use current texture if no others available
-            available = [exclude_filename]
-        
-        # Determine number of style references
+            ranked_available = [exclude_filename]
+
+        max_refs = min(self.max_style_refs, len(ranked_available))
+        min_refs = min(self.min_style_refs, max_refs)
+
         if self.split == "val":
-            # Deterministic for validation
-            num_refs = min(self.max_style_refs, len(available))
-            selected = available[:num_refs]
+            selected = ranked_available[:max_refs]
         else:
-            num_refs = self._rng.randint(self.min_style_refs, min(self.max_style_refs, len(available)))
-            selected = self._rng.sample(available, k=num_refs)
-        
+            num_refs = self._rng.randint(min_refs, max_refs)
+            candidate_pool = ranked_available[: max(num_refs, min(len(ranked_available), num_refs * 2))]
+            selected = self._rng.sample(candidate_pool, k=num_refs)
+
         # Gather RGB arrays
         ref_indices = [self.filename_to_all_idx[f] for f in selected]
         style_refs = self.all_target_rgb[ref_indices]  # [N, 32, 32, 3]
+        style_ref_mask = torch.ones(style_refs.shape[0], dtype=torch.bool)
         
         # Pad to max_style_refs if needed
         if style_refs.shape[0] < self.max_style_refs:
@@ -134,8 +159,15 @@ class PackStyleDataset(Dataset):
                 dtype=torch.float32,
             )
             style_refs = torch.cat([style_refs, padding], dim=0)
-        
-        return style_refs
+            style_ref_mask = torch.cat(
+                [
+                    style_ref_mask,
+                    torch.zeros(self.max_style_refs - style_ref_mask.shape[0], dtype=torch.bool),
+                ],
+                dim=0,
+            )
+
+        return style_refs, style_ref_mask
 
     def __getitem__(self, idx: int) -> dict[str, object]:
         if idx < 0 or idx >= len(self):
@@ -150,7 +182,7 @@ class PackStyleDataset(Dataset):
         target_alpha = self.target_alpha[idx]  # [32, 32]
         
         # Sample style references from target pack
-        style_refs = self._sample_style_refs(filename, idx)  # [max_refs, 32, 32, 3]
+        style_refs, style_ref_mask = self._sample_style_refs(filename)  # [max_refs, 32, 32, 3]
         
         # Permute to [C, H, W] format
         content_rgb = content_rgb.permute(2, 0, 1)  # [3, 32, 32]
@@ -164,6 +196,7 @@ class PackStyleDataset(Dataset):
             "content_alpha": content_alpha,
             "target_alpha": target_alpha,
             "style_refs": style_refs,
+            "style_ref_mask": style_ref_mask,
             "pack_id": self.pack_id,
             "base_pack_id": self.base_pack_id,
             "style": self.style,

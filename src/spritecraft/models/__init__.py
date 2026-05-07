@@ -3,9 +3,10 @@
 from spritecraft.models.unet import StyleAwareUNet, ResBlock, CrossAttention
 from spritecraft.models.diffusion import (
     add_noise,
+    ddpm_sample_step,
     get_beta_schedule,
     get_alpha_schedule,
-    ddim_sample_step,
+    predict_x0_from_noise,
 )
 
 __all__ = [
@@ -13,7 +14,8 @@ __all__ = [
     "ResBlock",
     "CrossAttention",
     "add_noise",
+    "ddpm_sample_step",
     "get_beta_schedule",
     "get_alpha_schedule",
-    "ddim_sample_step",
+    "predict_x0_from_noise",
 ]

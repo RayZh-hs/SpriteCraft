@@ -48,16 +48,18 @@ def _evaluate_sample(
     model: StyleAwareUNet,
     content_rgb: torch.Tensor,
     style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Generate a single sample."""
     return sample_rgb(
         model,
         content_rgb.unsqueeze(0),
         style_refs,
+        style_ref_mask=style_ref_mask,
     )
 
 
-def _tile_images(images: list[Image.Image], columns: int = 2) -> Image.Image:
+def _tile_images(images: list[Image.Image], columns: int = 2, gap: int = 6) -> Image.Image:
     if not images:
         return Image.new("RGB", (1, 1), color=(255, 255, 255))
 
@@ -65,13 +67,20 @@ def _tile_images(images: list[Image.Image], columns: int = 2) -> Image.Image:
     rows = (len(images) + columns - 1) // columns
     cell_width = max(image.width for image in images)
     cell_height = max(image.height for image in images)
-    canvas = Image.new("RGB", (columns * cell_width, rows * cell_height), color=(255, 255, 255))
+    canvas = Image.new(
+        "RGB",
+        (
+            columns * cell_width + gap * max(columns - 1, 0),
+            rows * cell_height + gap * max(rows - 1, 0),
+        ),
+        color=(255, 255, 255),
+    )
 
     for image_index, image in enumerate(images):
         row = image_index // columns
         column = image_index % columns
-        x = column * cell_width
-        y = row * cell_height
+        x = column * (cell_width + gap)
+        y = row * (cell_height + gap)
         canvas.paste(image, (x, y))
 
     return canvas
@@ -99,8 +108,11 @@ def write_validation_matrix(
         content_rgb = cast(torch.Tensor, sample["content_rgb"])
         target_rgb = cast(torch.Tensor, sample["target_rgb"])
         style_refs = cast(torch.Tensor, sample["style_refs"])
+        style_ref_mask = cast(torch.Tensor, sample["style_ref_mask"])
         
-        prediction = _evaluate_sample(model, content_rgb, style_refs)
+        prediction = _evaluate_sample(model, content_rgb, style_refs, style_ref_mask=style_ref_mask)
+        valid_support_count = int(style_ref_mask.sum().item())
+        valid_supports = [cast(torch.Tensor, style_refs[i]) for i in range(valid_support_count)]
 
         bundle_name = (
             f"{dataset.split}_{idx:03d}_{Path(filename).stem}"
@@ -124,8 +136,8 @@ def write_validation_matrix(
             bundle_name=bundle_name,
             content_rgb=content_rgb,
             content_size=IMAGE_SIZE,
-            support_rgb=[cast(torch.Tensor, style_refs[i]) for i in range(style_refs.shape[0])],
-            support_sizes=[IMAGE_SIZE] * int(style_refs.shape[0]),
+            support_rgb=valid_supports,
+            support_sizes=[IMAGE_SIZE] * len(valid_supports),
             prediction_rgb=prediction,
             prediction_size=IMAGE_SIZE,
             truth_rgb=target_rgb,

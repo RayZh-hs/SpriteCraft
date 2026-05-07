@@ -7,17 +7,20 @@ from typing import TypedDict
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from spritecraft.config import (
     CHECKPOINTS_DIR,
     IMAGE_SIZE,
+    MAX_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
     OUTPUT_DIR,
     pack_checkpoint_dir,
 )
-from spritecraft.models.diffusion import get_beta_schedule, get_alpha_schedule
+from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
 from spritecraft.models.unet import StyleAwareUNet
+
+CONTENT_INIT_MIN_ALPHA_CUMPROD = 0.25
 
 
 class PredictionBundleResult(TypedDict):
@@ -65,7 +68,7 @@ def load_model(checkpoint_dir: str | Path, pack_id: str | None = None) -> tuple[
         in_channels=3,
         style_channels=64,
         base_channels=128,
-        num_style_refs=3,
+        num_style_refs=MAX_SUPPORT_EXEMPLARS,
     ).to(device)
     
     try:
@@ -79,11 +82,28 @@ def load_model(checkpoint_dir: str | Path, pack_id: str | None = None) -> tuple[
     return model, checkpoint_path
 
 
+def _initial_sample(content_rgb: torch.Tensor, alphas_cumprod: torch.Tensor) -> torch.Tensor:
+    """Choose a reverse-process start state that matches the training regime.
+
+    A short diffusion schedule with a weak terminal noise level never teaches the
+    model to recover from pure Gaussian noise. In that case, start from the
+    terminal forward-diffused content image instead of an unconditional noise
+    sample so existing checkpoints remain usable.
+    """
+    terminal_alpha_cumprod = float(alphas_cumprod[-1].item())
+    if terminal_alpha_cumprod >= CONTENT_INIT_MIN_ALPHA_CUMPROD:
+        alpha = torch.sqrt(alphas_cumprod[-1]).view(1, 1, 1, 1)
+        sigma = torch.sqrt(1 - alphas_cumprod[-1]).view(1, 1, 1, 1)
+        return alpha * content_rgb + sigma * torch.randn_like(content_rgb)
+    return torch.randn_like(content_rgb)
+
+
 @torch.no_grad()
 def sample_rgb(
     model: StyleAwareUNet,
     content_rgb: torch.Tensor,
     style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
     num_steps: int = NUM_TIMESTEPS,
 ) -> torch.Tensor:
     """Generate RGB texture using iterative denoising.
@@ -103,44 +123,37 @@ def sample_rgb(
         content_rgb = content_rgb.unsqueeze(0)
     if style_refs.dim() == 4:
         style_refs = style_refs.unsqueeze(0)
+    if style_ref_mask is not None and style_ref_mask.dim() == 1:
+        style_ref_mask = style_ref_mask.unsqueeze(0)
     
     content_rgb = content_rgb.to(device)
     style_refs = style_refs.to(device)
+    if style_ref_mask is not None:
+        style_ref_mask = style_ref_mask.to(device)
     
     # Precompute diffusion schedule
     betas = get_beta_schedule(num_steps).to(device)
     alphas, alphas_cumprod = get_alpha_schedule(betas)
+    alphas = alphas.to(device)
     alphas_cumprod = alphas_cumprod.to(device)
-    
-    # Start from noise
-    x = torch.randn_like(content_rgb)
     
     autocast_context = (
         lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         if device.type == "cuda" and torch.cuda.is_bf16_supported()
         else nullcontext()
     )
+
+    x = _initial_sample(content_rgb, alphas_cumprod)
     
     # Iterative denoising
     for timestep in range(num_steps, 0, -1):
         t = torch.full((content_rgb.shape[0],), timestep, dtype=torch.long, device=device)
         
         with autocast_context():
-            pred = model(x, content_rgb, style_refs, t)
-        
-        if timestep > 1:
-            # DDPM sampling
-            alpha_t = alphas_cumprod[timestep - 1]
-            alpha_prev = alphas_cumprod[timestep - 2]
-            beta_t = 1 - alpha_t / alpha_prev
-            
-            # Add noise for stochasticity
-            noise = torch.randn_like(x)
-            x = (x - beta_t / torch.sqrt(1 - alpha_t) * (x - pred)) / torch.sqrt(1 - beta_t)
-            x = x + torch.sqrt(beta_t) * noise
-        else:
-            x = pred
-    
+            pred_noise = model(x, content_rgb, style_refs, t, style_ref_mask=style_ref_mask)
+
+        x = ddpm_sample_step(x, pred_noise, t, betas, alphas, alphas_cumprod, clip_x0=True)
+
     return torch.clamp(x.squeeze(0), 0, 1).cpu()
 
 
@@ -165,15 +178,32 @@ def compute_metrics(prediction: torch.Tensor, truth: torch.Tensor) -> dict[str, 
     }
 
 
-def _comparison_canvas(images: list[Image.Image]) -> Image.Image:
-    width = sum(image.width for image in images)
+def _comparison_canvas(
+    images: list[Image.Image],
+    labels: list[str] | None = None,
+    gap: int = 2,
+    label_height: int = 10,
+) -> Image.Image:
+    width = sum(image.width for image in images) + gap * max(len(images) - 1, 0)
     height = max(image.height for image in images)
-    canvas = Image.new("RGB", (width, height))
+    if labels is not None:
+        height += label_height
+    canvas = Image.new("RGB", (width, height), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
 
     x_offset = 0
-    for image in images:
-        canvas.paste(image, (x_offset, 0))
+    for index, image in enumerate(images):
+        image_y = label_height if labels is not None else 0
+        canvas.paste(image, (x_offset, image_y))
+        if labels is not None and index < len(labels):
+            draw.text((x_offset + 1, 0), labels[index], fill=(0, 0, 0))
         x_offset += image.width
+        if index < len(images) - 1:
+            draw.rectangle(
+                [(x_offset, 0), (x_offset + gap - 1, height - 1)],
+                fill=(235, 235, 235),
+            )
+            x_offset += gap
 
     return canvas
 
@@ -209,11 +239,20 @@ def save_prediction_bundle(
     prediction_image = tensor_to_image(prediction_rgb, prediction_size)
 
     original_path = bundle_dir / "original_tex.png"
+    support_path = bundle_dir / "support.png"
     produced_path = bundle_dir / "produced_tex.png"
     content_image.save(original_path)
     prediction_image.save(produced_path)
+    if support_images:
+        _comparison_canvas(
+            support_images,
+            labels=[f"support_{index + 1}" for index in range(len(support_images))],
+        ).save(support_path)
+    else:
+        Image.new("RGB", (1, 1), color=(255, 255, 255)).save(support_path)
 
     comparison_images = [content_image, prediction_image]
+    comparison_labels = ["vanilla", "generated"]
     truth_path: Path | None = None
     metrics: dict[str, float | int | bool] | None = None
 
@@ -223,6 +262,7 @@ def save_prediction_bundle(
         truth_path = bundle_dir / "source_of_truth.png"
         truth_image.save(truth_path)
         comparison_images.append(truth_image)
+        comparison_labels.append("truth")
         metrics = compute_metrics(prediction_rgb, truth_rgb)
 
     if extra_metrics:
@@ -235,7 +275,7 @@ def save_prediction_bundle(
             json.dump(metrics, metrics_file, indent=2)
 
     comparison_path = bundle_dir / "comparison.png"
-    _comparison_canvas(comparison_images).save(comparison_path)
+    _comparison_canvas(comparison_images, labels=comparison_labels).save(comparison_path)
 
     if metadata is not None:
         with open(bundle_dir / "metadata.json", "w", encoding="utf-8") as metadata_file:
@@ -244,7 +284,7 @@ def save_prediction_bundle(
     return {
         "bundle_dir": bundle_dir,
         "original_path": original_path,
-        "support_path": bundle_dir / "support.png",
+        "support_path": support_path,
         "produced_path": produced_path,
         "truth_path": truth_path,
         "comparison_path": comparison_path,

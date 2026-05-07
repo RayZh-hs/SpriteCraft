@@ -13,12 +13,13 @@ import torch
 from spritecraft.config import (
     CHECKPOINTS_DIR,
     IMAGE_SIZE,
-    MIN_SUPPORT_EXEMPLARS,
+    MAX_SUPPORT_EXEMPLARS,
     OUTPUT_DIR,
     pack_checkpoint_dir,
     pack_dataset_path,
     pack_pair_index_path,
 )
+from spritecraft.data.support_index import compute_texture_descriptor, rank_support_candidates
 from spritecraft.inference.sampler import compute_metrics, load_model, sample_rgb, save_prediction_bundle
 
 
@@ -73,16 +74,35 @@ def _select_texture_ids(
 
 def _resolve_support_filenames(
     filename: str,
-    all_target_filenames: list[str],
-    rng: random.Random,
-    support_count: int = MIN_SUPPORT_EXEMPLARS,
+    train_filenames: list[str],
+    content_descriptors: dict[str, np.ndarray],
+    support_count: int = MAX_SUPPORT_EXEMPLARS,
 ) -> list[str]:
-    available = [f for f in all_target_filenames if f != filename]
+    available = [f for f in train_filenames if f != filename]
     if not available:
         return []
-    
-    count = min(support_count, len(available))
-    return rng.sample(available, k=count)
+
+    ranked = rank_support_candidates(filename, available, content_descriptors)
+    if not ranked:
+        ranked = sorted(available)
+    count = min(support_count, len(ranked))
+    return ranked[:count]
+
+
+def _build_content_descriptors(
+    train_filenames: list[str],
+    val_filenames: list[str],
+    dataset: np.lib.npyio.NpzFile,
+) -> dict[str, np.ndarray]:
+    descriptors: dict[str, np.ndarray] = {}
+
+    for filename, image in zip(train_filenames, dataset["content_rgb_train"], strict=False):
+        descriptors[filename] = compute_texture_descriptor((image * 255.0).clip(0, 255).astype(np.uint8))
+
+    for filename, image in zip(val_filenames, dataset["content_rgb_val"], strict=False):
+        descriptors[filename] = compute_texture_descriptor((image * 255.0).clip(0, 255).astype(np.uint8))
+
+    return descriptors
 
 
 def run(
@@ -109,7 +129,7 @@ def run(
     if not base_filenames:
         raise ValueError(f"No shared textures found for pack {pack_id}. Run preprocessing first.")
 
-    support_count = MIN_SUPPORT_EXEMPLARS
+    support_count = MAX_SUPPORT_EXEMPLARS
     rng = random.Random(seed)
     selected_filenames = _select_texture_ids(textures, random_count, base_filenames, rng)
 
@@ -120,6 +140,7 @@ def run(
         model, checkpoint_path = load_model(checkpoint, pack_id)
         output_dir = Path(output_dir) / pack_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        content_descriptors = _build_content_descriptors(train_filenames, val_filenames, dataset)
 
         results = []
         for filename in selected_filenames:
@@ -144,8 +165,8 @@ def run(
             # Sample style references
             support_filenames = _resolve_support_filenames(
                 filename=filename,
-                all_target_filenames=all_target_filenames,
-                rng=rng,
+                train_filenames=train_filenames,
+                content_descriptors=content_descriptors,
                 support_count=support_count,
             )
             
@@ -162,12 +183,14 @@ def run(
                 support_rgb_list.append(srgb)
             
             support_rgb_tensor = torch.stack(support_rgb_list, dim=0)  # [N, 3, 32, 32]
+            style_ref_mask = torch.ones(len(support_rgb_list), dtype=torch.bool)
             
             # Generate
             prediction = sample_rgb(
                 model,
                 content_rgb,
                 support_rgb_tensor,
+                style_ref_mask=style_ref_mask,
             )
 
             # Compute metrics if target is available

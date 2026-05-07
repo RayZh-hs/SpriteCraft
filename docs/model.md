@@ -6,26 +6,28 @@
 - The dataset is **vanilla-anchored**: each sample pairs one base-pack texture with the matching texture from one target pack.
 - The pipeline is **continuous RGB**, not palette-token based. Preprocessing stores float RGB and alpha arrays in `dataset.npz`.
 - Conditioning uses:
+  - `noisy_target`: the current diffusion sample.
   - `content_rgb`: the base / vanilla texture.
-  - `style_refs`: `1..3` textures from the same target pack.
+  - `style_refs`: up to `3` ranked textures from the same target pack.
   - `t`: diffusion timestep.
-- The network is `StyleAwareUNet` in `src/spritecraft/models/unet.py`: content encoder, style encoder, cross-attention at `8x8`, timestep MLP, and a small decoder back to RGB.
+- The network is `StyleAwareUNet` in `src/spritecraft/models/unet.py`: noisy/content fusion at input, multi-reference style encoder, masked cross-attention at `8x8`, timestep MLP, and spatial skip connections in the decoder.
 - Diffusion utilities use a **20-step Gaussian schedule** in `src/spritecraft/models/diffusion.py`.
-- Training loss is `L1 + 0.1 *` a simplified SSIM-like term.
+- The model predicts **diffusion noise (`epsilon`)**, not clean RGB directly.
+- Training loss is `MSE(noise) + 0.5 * L1(x0) + 0.25 * gradient(x0)` to preserve local edges.
 
 ## What Is Implemented
 
 - Preprocessing filters to full-cube block textures by reading blockstates and model face textures from the base pack.
 - Images are resized to `32x32`; `16x` uses nearest-neighbor and `64x` uses Lanczos.
 - Validation is filename-based using the fixed set in `config.py`.
-- Inference starts from noise and iteratively denoises, then writes bundle directories with images, metrics, and metadata.
+- Training samples ranked support textures using vanilla/content descriptors and a filename-family prior from `support_index.py`.
+- Inference starts from noise, uses the same epsilon-prediction formulation as training, and writes bundle directories with images, metrics, and metadata.
 - Runtime debug support exists for status, snapshots, and preview generation during training.
 
 ## Current Gaps / Leftovers
 
-- `StyleAwareUNet.forward()` receives `noisy_target`, but does **not** actually encode or use it. In practice, the current model is conditioned by content, style refs, and timestep, while the outer training / sampling loop is still shaped like diffusion.
 - Alpha channels are preprocessed and loaded, but the model and loss currently operate on RGB only.
-- The dataset and model support up to 3 style references, but `generate.py` currently uses `MIN_SUPPORT_EXEMPLARS`, so generation is effectively **1-shot** by default.
-- `support_index.py` exists, but current training / generation sample support textures directly rather than using the ranking helpers.
+- `64x -> 32x` preprocessing still uses Lanczos globally; realistic packs may benefit from a pack-specific or configurable resize policy.
+- Training and generation now default to **3-shot** support when available, but support ranking is still heuristic rather than learned.
 - `inference/export.py` and `config.PALETTE_PATH` are leftovers from the older discrete / palette pipeline and are not part of the current RGB training path.
 - `inference/evaluate.py` exists for validation matrices, but it is not exposed through the CLI today.

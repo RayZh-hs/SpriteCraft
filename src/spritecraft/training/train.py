@@ -33,7 +33,8 @@ from spritecraft.debug.utility import (
     utcnow_iso,
     write_json_atomic,
 )
-from spritecraft.models.diffusion import add_noise, get_beta_schedule, get_alpha_schedule
+from spritecraft.inference.sampler import sample_rgb
+from spritecraft.models.diffusion import add_noise, get_alpha_schedule, get_beta_schedule, predict_x0_from_noise
 from spritecraft.models.unet import StyleAwareUNet
 
 MetricRecord = dict[str, Any]
@@ -227,26 +228,30 @@ def _gradient_norm(model: StyleAwareUNet) -> float:
     return math.sqrt(squared_norm)
 
 
-def _compute_loss(pred_rgb: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
-    """Compute L1 + MS-SSIM loss for RGB images."""
-    l1_loss = F.l1_loss(pred_rgb, target_rgb)
-    
-    # Simple SSIM-like loss (structural similarity)
-    # For speed, use a simplified version
-    pred_mean = pred_rgb.mean(dim=(2, 3), keepdim=True)
-    target_mean = target_rgb.mean(dim=(2, 3), keepdim=True)
-    pred_var = pred_rgb.var(dim=(2, 3), keepdim=True, unbiased=False)
-    target_var = target_rgb.var(dim=(2, 3), keepdim=True, unbiased=False)
-    covar = ((pred_rgb - pred_mean) * (target_rgb - target_mean)).mean(dim=(2, 3), keepdim=True)
-    
-    c1 = 0.01 ** 2
-    c2 = 0.03 ** 2
-    
-    ssim = ((2 * pred_mean * target_mean + c1) * (2 * covar + c2)) / \
-           ((pred_mean ** 2 + target_mean ** 2 + c1) * (pred_var + target_var + c2))
-    ssim_loss = 1 - ssim.mean()
-    
-    return l1_loss + 0.1 * ssim_loss
+def _luminance_gradient_map(rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    luminance = (
+        0.299 * rgb[:, 0:1] +
+        0.587 * rgb[:, 1:2] +
+        0.114 * rgb[:, 2:3]
+    )
+    grad_x = luminance[:, :, :, 1:] - luminance[:, :, :, :-1]
+    grad_y = luminance[:, :, 1:, :] - luminance[:, :, :-1, :]
+    return grad_x, grad_y
+
+
+def _compute_loss(
+    pred_noise: torch.Tensor,
+    true_noise: torch.Tensor,
+    pred_x0: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> torch.Tensor:
+    """Balance diffusion correctness with explicit edge preservation."""
+    noise_loss = F.mse_loss(pred_noise, true_noise)
+    recon_loss = F.l1_loss(pred_x0, target_rgb)
+    pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
+    target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
+    gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+    return noise_loss + 0.5 * recon_loss + 0.25 * gradient_loss
 
 
 def train_pack(
@@ -365,17 +370,22 @@ def train_pack(
             content_rgb = batch["content_rgb"].to(device)  # [B, 3, 32, 32]
             target_rgb = batch["target_rgb"].to(device)  # [B, 3, 32, 32]
             style_refs = batch["style_refs"].to(device)  # [B, N, 3, 32, 32]
+            style_ref_mask = batch["style_ref_mask"].to(device)  # [B, N]
 
             # Sample timesteps
             t = torch.randint(1, NUM_TIMESTEPS + 1, (target_rgb.shape[0],), device=device)
             
             # Add noise
-            noisy_target, noise = add_noise(target_rgb, t, alphas_cumprod)
+            noisy_target, true_noise = add_noise(target_rgb, t, alphas_cumprod)
 
             with autocast_context():
-                # Predict denoised image
-                pred = model(noisy_target, content_rgb, style_refs, t)
-                loss = _compute_loss(pred, target_rgb) / grad_accum_steps
+                pred_noise = model(noisy_target, content_rgb, style_refs, t, style_ref_mask=style_ref_mask)
+                pred_x0 = torch.clamp(
+                    predict_x0_from_noise(noisy_target, pred_noise, t, alphas_cumprod),
+                    0.0,
+                    1.0,
+                )
+                loss = _compute_loss(pred_noise, true_noise, pred_x0, target_rgb) / grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -426,7 +436,7 @@ def train_pack(
 
         if current_step % validation_interval == 0 or current_step == steps:
             if len(val_dataset) > 0:
-                preview_dir = _run_validation(model, val_dataset, pack_checkpoint, current_step, device, alphas_cumprod, writer)
+                preview_dir = _run_validation(model, val_dataset, pack_checkpoint, current_step, device, writer)
                 if preview_dir is not None:
                     last_preview_dir = preview_dir
                     last_validation_step = current_step
@@ -480,7 +490,6 @@ def _run_validation(
     checkpoint_dir: Path,
     step: int,
     device: torch.device,
-    alphas_cumprod: torch.Tensor,
     writer: Any = None,
 ) -> Path | None:
     """Run validation and save preview images."""
@@ -498,28 +507,22 @@ def _run_validation(
         content_rgb = batch["content_rgb"].to(device)
         target_rgb = batch["target_rgb"].to(device)
         style_refs = batch["style_refs"].to(device)
+        style_ref_mask = batch["style_ref_mask"].to(device)
         filename = batch["filename"][0]
-        
-        # Full diffusion sampling
-        t = torch.full((1,), NUM_TIMESTEPS, device=device, dtype=torch.long)
-        noisy = torch.randn_like(content_rgb)
-        
-        # Iterative denoising
-        x = noisy
-        for timestep in range(NUM_TIMESTEPS, 0, -1):
-            t_batch = torch.full((1,), timestep, device=device, dtype=torch.long)
-            pred = model(x, content_rgb, style_refs, t_batch)
-            
-            if timestep > 1:
-                alpha_t = alphas_cumprod[timestep - 1]
-                alpha_prev = alphas_cumprod[timestep - 2] if timestep > 1 else alphas_cumprod[0]
-                x = torch.sqrt(alpha_prev) * pred + torch.sqrt(1 - alpha_prev) * torch.randn_like(x)
-            else:
-                x = pred
-        
-        pred_rgb = torch.clamp(x, 0, 1)
-        loss = _compute_loss(pred_rgb, target_rgb)
-        total_loss += loss.item()
+
+        pred_rgb = sample_rgb(
+            model,
+            content_rgb,
+            style_refs,
+            style_ref_mask=style_ref_mask,
+            num_steps=NUM_TIMESTEPS,
+        ).unsqueeze(0).to(device)
+        recon_loss = F.l1_loss(pred_rgb, target_rgb)
+        pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_rgb)
+        target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
+        gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+        loss = recon_loss + 0.25 * gradient_loss
+        total_loss += float(loss.item())
         count += 1
         
         # Save preview

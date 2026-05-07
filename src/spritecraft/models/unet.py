@@ -49,9 +49,14 @@ class CrossAttention(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         B, C, H, W = x.shape
-        _,CtxC, _, _ = context.shape
+        _, _ctx_c, ctx_h, ctx_w = context.shape
 
         # Normalize and project
         x_norm = self.norm(x)
@@ -60,13 +65,15 @@ class CrossAttention(nn.Module):
         v = self.v_proj(context)  # [B, C, H, W]
 
         # Reshape for multi-head attention
-        # [B, heads, head_dim, H, W] -> [B, heads, HW, head_dim]
         q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
-        k = k.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
-        v = v.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+        k = k.view(B, self.num_heads, self.head_dim, ctx_h * ctx_w).transpose(2, 3)
+        v = v.view(B, self.num_heads, self.head_dim, ctx_h * ctx_w).transpose(2, 3)
 
         # Scaled dot-product attention
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if context_mask is not None:
+            mask = context_mask[:, None, None, :].to(dtype=torch.bool, device=attn.device)
+            attn = attn.masked_fill(~mask, torch.finfo(attn.dtype).min)
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, v)
 
@@ -109,15 +116,15 @@ class StyleAwareUNet(nn.Module):
         self.base_channels = base_channels
         self.num_style_refs = num_style_refs
 
-        # Content encoder: processes vanilla target block
-        self.content_encoder = nn.Sequential(
-            nn.Conv2d(in_channels, base_channels, 3, padding=1),
-            ResBlock(base_channels),
-            nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1),  # 16x16
-            ResBlock(base_channels * 2),
-            nn.Conv2d(base_channels * 2, base_channels * 2, 4, 2, 1),  # 8x8
-            ResBlock(base_channels * 2),
-        )
+        # Encode the current noisy sample and the vanilla source separately,
+        # then fuse them early so the denoiser can use both structure and state.
+        self.noisy_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        self.content_in = nn.Conv2d(in_channels, base_channels, 3, padding=1)
+        self.enc32 = ResBlock(base_channels)
+        self.down16 = nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1)
+        self.enc16 = ResBlock(base_channels * 2)
+        self.down8 = nn.Conv2d(base_channels * 2, base_channels * 2, 4, 2, 1)
+        self.enc8 = ResBlock(base_channels * 2)
 
         # Style encoder: processes reference textures from target pack
         self.style_encoder = nn.Sequential(
@@ -144,18 +151,20 @@ class StyleAwareUNet(nn.Module):
             nn.Linear(256, time_embed_dim),
         )
 
-        # Decoder with skip connections
+        # Decoder with explicit spatial skips to preserve high-contrast edges.
         self.dec1 = nn.Sequential(
             ResBlock(base_channels * 2),
             nn.ConvTranspose2d(base_channels * 2, base_channels, 4, 2, 1),  # 8x8 -> 16x16
         )
+        self.skip16_proj = nn.Conv2d(base_channels * 2, base_channels, kernel_size=1)
         self.dec2 = nn.Sequential(
             ResBlock(base_channels),
             nn.ConvTranspose2d(base_channels, base_channels, 4, 2, 1),  # 16x16 -> 32x32
         )
+        self.merge32 = ResBlock(base_channels)
         self.dec3 = nn.Sequential(
             ResBlock(base_channels),
-            nn.Conv2d(base_channels, in_channels, 1),  # Predict RGB
+            nn.Conv2d(base_channels, in_channels, 1),  # Predict diffusion noise
         )
 
         self._count_parameters()
@@ -170,6 +179,7 @@ class StyleAwareUNet(nn.Module):
         content_source: torch.Tensor,
         style_refs: torch.Tensor,
         t: torch.Tensor,
+        style_ref_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass.
         
@@ -182,30 +192,38 @@ class StyleAwareUNet(nn.Module):
         Returns:
             [B, 3, H, W] predicted denoised RGB
         """
-        B = noisy_target.shape[0]
+        B, _, H, W = noisy_target.shape
 
-        # Encode content (vanilla structure)
-        content_feat = self.content_encoder(content_source)  # [B, C*2, 8, 8]
+        noisy_feat = self.noisy_in(noisy_target)
+        content_feat = self.content_in(content_source)
+        x32 = self.enc32(noisy_feat + content_feat)
+        x16 = self.enc16(self.down16(x32))
+        x8 = self.enc8(self.down8(x16))
 
-        # Encode style references (average pool across N refs)
+        # Encode style references and preserve all support tokens rather than
+        # collapsing them into an average feature map.
         N = style_refs.shape[1]
-        style_refs = style_refs.view(B * N, self.in_channels, noisy_target.shape[2], noisy_target.shape[3])
+        style_refs = style_refs.reshape(B * N, self.in_channels, H, W)
         style_feat = self.style_encoder(style_refs)  # [B*N, style_C, 8, 8]
         style_feat = style_feat.view(B, N, self.style_channels, 8, 8)
-        style_feat = style_feat.mean(dim=1)  # [B, style_C, 8, 8]
+        style_context = style_feat.permute(0, 2, 3, 1, 4).reshape(B, self.style_channels, 8, 8 * N)
 
-        # Cross-attention: content attends to style
-        content_feat = self.cross_attn(content_feat, style_feat)
+        context_mask = None
+        if style_ref_mask is not None:
+            context_mask = style_ref_mask[:, :, None].expand(B, N, 64).reshape(B, N * 64)
+
+        x8 = self.cross_attn(x8, style_context, context_mask=context_mask)
 
         # Add time embedding
         time_emb = self.time_embed(timestep_embedding(t, 64))
-        content_feat = content_feat + time_emb[:, :, None, None]
+        x8 = x8 + time_emb[:, :, None, None]
 
         # Decode
-        x = self.dec1(content_feat)  # [B, C, 16, 16]
+        x = self.dec1(x8)  # [B, C, 16, 16]
+        x = x + self.skip16_proj(x16)
         x = self.dec2(x)  # [B, C, 32, 32]
+        x = self.merge32(x + x32)
         x = self.dec3(x)  # [B, 3, 32, 32]
         return x
-
 
 
