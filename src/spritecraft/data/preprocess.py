@@ -13,6 +13,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 from sklearn.cluster import MiniBatchKMeans
+from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 
 from spritecraft.config import (
     MANIFEST_JSON_PATH,
@@ -344,10 +346,12 @@ def build_palette(all_pixels: np.ndarray) -> np.ndarray:
 
 
 def quantize_image(img: Image.Image, palette: np.ndarray) -> np.ndarray:
-    """Map an RGB image to palette indices."""
+    """Map an RGB image to palette indices using a KD-tree for fast lookup."""
     arr = np.array(img, dtype=np.float32).reshape(-1, 3)
-    dists = np.linalg.norm(arr[:, None, :] - palette[None, :, :], axis=2)
-    return np.argmin(dists, axis=1).astype(np.uint8).reshape(IMAGE_SIZE, IMAGE_SIZE)
+    nn = NearestNeighbors(n_neighbors=1, algorithm="kd_tree", metric="euclidean")
+    nn.fit(palette)
+    indices = nn.kneighbors(arr, return_distance=False)
+    return indices.astype(np.uint8).reshape(IMAGE_SIZE, IMAGE_SIZE)
 
 
 def _load_manifest(
@@ -704,11 +708,14 @@ def run(
     print(f"Palette saved to {PALETTE_PATH}")
 
     pack_arrays: dict[str, dict[str, np.ndarray]] = {}
+    total_images = sum(len(images) for images in all_pack_images.values())
+    progress = tqdm(total=total_images, desc="Quantizing images", unit="img")
     for pack_id, images in all_pack_images.items():
-        pack_arrays[pack_id] = {
-            filename: quantize_image(image, palette)
-            for filename, image in images.items()
-        }
+        pack_arrays[pack_id] = {}
+        for filename, image in images.items():
+            pack_arrays[pack_id][filename] = quantize_image(image, palette)
+            progress.update(1)
+    progress.close()
 
     flat_arrays: dict[str, Any] = {}
     filenames_per_pack: dict[str, list[str]] = {}

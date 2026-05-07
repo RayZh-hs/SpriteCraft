@@ -6,6 +6,10 @@
 # Data Directories
 /data
 
+# Temp Files
+*.tmp
+tmp/
+
 # Trained Models
 /checkpoints
 /output

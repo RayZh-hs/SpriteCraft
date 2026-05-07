@@ -10,6 +10,7 @@ dependencies = [
     "pillow",
     "scikit-learn",
     "tensorboard",
+    "tqdm",
 ]
 
 [project.scripts]
@@ -21,3 +22,8 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/spritecraft"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+]

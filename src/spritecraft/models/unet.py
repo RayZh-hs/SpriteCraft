@@ -198,7 +198,7 @@ class UNet(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.SiLU(),
-            nn.Linear(embed_dim * 4, embed_dim)
+            nn.Linear(embed_dim * 4, embed_dim),
         )
         self.support_pair_proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
         self.support_aggregator = SupportAggregator(embed_dim, num_heads=8)
@@ -231,7 +231,7 @@ class UNet(nn.Module):
         self.out = nn.Sequential(
             nn.GroupNorm(32, 128),
             nn.SiLU(),
-            nn.Conv2d(128, vocab_size - 1, kernel_size=1)
+            nn.Conv2d(128, vocab_size - 1, kernel_size=1),
         )
 
 
