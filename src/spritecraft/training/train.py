@@ -61,6 +61,46 @@ def _metrics_history_path(checkpoint_dir: Path) -> Path:
     return checkpoint_dir / "training_metrics.csv"
 
 
+def _write_runtime_status(
+    checkpoint_dir: Path,
+    pid: int,
+    step: int,
+    target_steps: int,
+    device: torch.device,
+    batch_size: int,
+    grad_accum_steps: int,
+    validation_interval: int,
+    save_interval: int,
+    last_loss: float,
+    last_lr: float,
+    last_saved_step: int,
+    last_validation_step: int,
+    last_preview_dir: Path | None = None,
+    status: str = "running",
+) -> None:
+    """Write runtime status JSON for debug tooling."""
+    status_path = runtime_status_path(checkpoint_dir, pid)
+    payload: dict[str, object] = {
+        "pid": pid,
+        "status": status,
+        "checkpoint_dir": str(checkpoint_dir.resolve()),
+        "device": str(device),
+        "step": step,
+        "target_steps": target_steps,
+        "batch_size": batch_size,
+        "grad_accum_steps": grad_accum_steps,
+        "validation_interval": validation_interval,
+        "save_interval": save_interval,
+        "last_loss": last_loss,
+        "last_lr": last_lr,
+        "last_saved_step": last_saved_step,
+        "last_validation_step": last_validation_step,
+        "last_preview_dir": str(last_preview_dir.resolve()) if last_preview_dir is not None else None,
+        "updated_at": utcnow_iso(),
+    }
+    write_json_atomic(status_path, payload)
+
+
 def _write_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
     with metrics_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
@@ -305,6 +345,11 @@ def train_pack(
     print(f"[{pack_id}] Training on {len(train_dataset)} samples, validating on {len(val_dataset)} samples")
     print(f"[{pack_id}] Device: {device}, Batch size: {batch_size}, Steps: {steps}")
 
+    pid = os.getpid()
+    last_saved_step = start_step
+    last_validation_step = start_step
+    last_preview_dir: Path | None = None
+
     model.train()
     for step in range(start_step, steps):
         optimizer.zero_grad(set_to_none=True)
@@ -377,10 +422,50 @@ def train_pack(
             _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
             step_checkpoint = pack_checkpoint / f"step_{current_step:06d}.pt"
             _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
+            last_saved_step = current_step
 
         if current_step % validation_interval == 0 or current_step == steps:
             if len(val_dataset) > 0:
-                _run_validation(model, val_dataset, pack_checkpoint, current_step, device, alphas_cumprod)
+                preview_dir = _run_validation(model, val_dataset, pack_checkpoint, current_step, device, alphas_cumprod, writer)
+                if preview_dir is not None:
+                    last_preview_dir = preview_dir
+                    last_validation_step = current_step
+
+        _write_runtime_status(
+            checkpoint_dir=pack_checkpoint,
+            pid=pid,
+            step=current_step,
+            target_steps=steps,
+            device=device,
+            batch_size=batch_size,
+            grad_accum_steps=grad_accum_steps,
+            validation_interval=validation_interval,
+            save_interval=save_interval,
+            last_loss=average_loss,
+            last_lr=lr,
+            last_saved_step=last_saved_step,
+            last_validation_step=last_validation_step,
+            last_preview_dir=last_preview_dir,
+            status="running",
+        )
+
+    _write_runtime_status(
+        checkpoint_dir=pack_checkpoint,
+        pid=pid,
+        step=steps,
+        target_steps=steps,
+        device=device,
+        batch_size=batch_size,
+        grad_accum_steps=grad_accum_steps,
+        validation_interval=validation_interval,
+        save_interval=save_interval,
+        last_loss=average_loss,
+        last_lr=lr,
+        last_saved_step=last_saved_step,
+        last_validation_step=last_validation_step,
+        last_preview_dir=last_preview_dir,
+        status="stopped",
+    )
 
     if writer is not None:
         writer.close()
@@ -396,7 +481,8 @@ def _run_validation(
     step: int,
     device: torch.device,
     alphas_cumprod: torch.Tensor,
-) -> None:
+    writer: Any = None,
+) -> Path | None:
     """Run validation and save preview images."""
     model.eval()
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
@@ -406,6 +492,7 @@ def _run_validation(
     
     total_loss = 0.0
     count = 0
+    summary_images: list[Image.Image] = []
     
     for batch in val_loader:
         content_rgb = batch["content_rgb"].to(device)
@@ -444,11 +531,32 @@ def _run_validation(
             pred_rgb[0],
             step,
         )
+        
+        # Collect images for tensorboard summary
+        content_np = (content_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        target_np = (target_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        pred_np = (pred_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        canvas = Image.new("RGB", (IMAGE_SIZE * 3, IMAGE_SIZE))
+        canvas.paste(Image.fromarray(content_np), (0, 0))
+        canvas.paste(Image.fromarray(pred_np), (IMAGE_SIZE, 0))
+        canvas.paste(Image.fromarray(target_np), (IMAGE_SIZE * 2, 0))
+        summary_images.append(canvas)
     
     avg_loss = total_loss / max(count, 1)
     print(f"[{val_dataset.pack_id}] Validation step={step} loss={avg_loss:.4f}")
     
+    # Log validation loss and images to tensorboard
+    if writer is not None:
+        writer.add_scalar("val/loss", avg_loss, step)
+        if summary_images:
+            # Create a tiled summary image
+            from spritecraft.inference.evaluate import _tile_images
+            tiled = _tile_images(summary_images, columns=2)
+            tiled_np = np.array(tiled)
+            writer.add_image(f"validation/packs/{val_dataset.pack_id}/summary", tiled_np, step, dataformats="HWC")
+    
     model.train()
+    return preview_dir
 
 
 def _save_preview(
