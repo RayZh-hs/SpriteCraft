@@ -328,7 +328,7 @@ def train_pack(
     alphas, alphas_cumprod = get_alpha_schedule(betas)
     alphas_cumprod = alphas_cumprod.to(device)
 
-    tensorboard_dir = _tensorboard_log_dir(pack_checkpoint)
+    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir)
     try:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=str(tensorboard_dir))
@@ -403,8 +403,8 @@ def train_pack(
         pending_metric_history.append(metric_record)
 
         if writer is not None:
-            writer.add_scalar("train/loss", average_loss, current_step)
-            writer.add_scalar("train/learning_rate", lr, current_step)
+            writer.add_scalar(f"train/{pack_id}/loss", average_loss, current_step)
+            writer.add_scalar(f"train/{pack_id}/learning_rate", lr, current_step)
 
         if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
             _append_metric_history(metrics_path, pending_metric_history)
@@ -545,9 +545,8 @@ def _run_validation(
     avg_loss = total_loss / max(count, 1)
     print(f"[{val_dataset.pack_id}] Validation step={step} loss={avg_loss:.4f}")
     
-    # Log validation loss and images to tensorboard
+    # Log validation images to tensorboard
     if writer is not None:
-        writer.add_scalar("val/loss", avg_loss, step)
         if summary_images:
             # Create a tiled summary image
             from spritecraft.inference.evaluate import _tile_images
