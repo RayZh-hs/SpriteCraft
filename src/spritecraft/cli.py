@@ -29,7 +29,8 @@ def main():
 
     train_parser = subparsers.add_parser("train", help="Train the model")
     train_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    train_parser.add_argument("--steps", type=int, default=100_000)
+    train_parser.add_argument("--steps", type=int, default=10_000)
+    train_parser.add_argument("--pack", type=str, default=None, help="Train specific pack (default: all)")
 
     generate_parser = subparsers.add_parser("generate", help="Generate textures from a resource pack")
     generate_parser.add_argument("--pack", type=str, required=True)
@@ -53,7 +54,7 @@ def main():
         )
     elif args.command == "train":
         from spritecraft.training import train
-        train.run(args.checkpoint_dir, args.steps)
+        train.run(args.checkpoint_dir, args.steps, args.pack)
     elif args.command == "generate":
         from spritecraft.inference import generate
         generate.run(

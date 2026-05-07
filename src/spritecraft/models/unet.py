@@ -1,345 +1,211 @@
-"""U-Net model architecture."""
+"""Style-aware U-Net model for per-pack RGB diffusion."""
 
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class ResBlock(nn.Module):
-    """Residual block with FiLM conditioning."""
+    """Residual block with GroupNorm and SiLU activation."""
 
-    def __init__(self, channels: int, cond_dim: int = 128):
+    def __init__(self, channels: int):
         super().__init__()
-        assert channels % 32 == 0, "Channels must be divisible by 32 for GroupNorm"
-        self.norm1 = nn.GroupNorm(32, channels)
+        self.norm1 = nn.GroupNorm(8, channels)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(32, channels)
+        self.norm2 = nn.GroupNorm(8, channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.cond_proj = nn.Linear(cond_dim, channels * 4)
         self.activation = nn.SiLU()
 
-    def _get_film_tr(self, cond: torch.Tensor):
-        """Compute FiLM transformation, generating [batch, channels, 1, 1] tensors"""
-        scale1, shift1, scale2, shift2 = self.cond_proj(cond).chunk(4, dim=-1)
-        scale1 = scale1[:, :, None, None]
-        shift1 = shift1[:, :, None, None]
-        scale2 = scale2[:, :, None, None]
-        shift2 = shift2[:, :, None, None]
-        return scale1, shift1, scale2, shift2
-
-    def forward(self, x: torch.Tensor, cond: torch.Tensor):
-        residual = x    # To be added back at the end
-        scale1, shift1, scale2, shift2 = self._get_film_tr(cond)
-        
-        # First convolutional layer
-        h = self.norm1(x)
-        h = h * (1 + scale1) + shift1
-        h = self.activation(h)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        h = self.activation(self.norm1(x))
         h = self.conv1(h)
-        
-        # Second convolutional layer
-        h = self.norm2(h)
-        h = h * (1 + scale2) + shift2
-        h = self.activation(h)
+        h = self.activation(self.norm2(h))
         h = self.conv2(h)
-
         return h + residual
 
 
-class SelfAttention(nn.Module):
-    """Spatial self-attention with GroupNorm and residual connection."""
-    
-    def __init__(self, channels: int, num_heads: int = 8):
-        super().__init__()
-        assert channels % num_heads == 0, (
-            f"channels ({channels}) must be divisible by num_heads ({num_heads})"
-        )
-        self.channels = channels
-        self.num_heads = num_heads
-        
-        self.norm = nn.GroupNorm(32, channels)
-        self.qkv = nn.Conv2d(channels, channels * 3, kernel_size=1)
-        self.proj = nn.Conv2d(channels, channels, kernel_size=1)
-        
-        # Initialize projection to zero
-        nn.init.zeros_(self.proj.weight)
-        if self.proj.bias is not None:
-            nn.init.zeros_(self.proj.bias)
+class CrossAttention(nn.Module):
+    """Cross-attention module for content-to-style attention."""
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def __init__(self, dim: int, context_dim: int, num_heads: int = 4):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.norm = nn.GroupNorm(8, dim)
+        self.q_proj = nn.Conv2d(dim, dim, kernel_size=1)
+        self.k_proj = nn.Conv2d(context_dim, dim, kernel_size=1)
+        self.v_proj = nn.Conv2d(context_dim, dim, kernel_size=1)
+        self.out_proj = nn.Conv2d(dim, dim, kernel_size=1)
+
+        # Initialize output projection to zero
+        nn.init.zeros_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
-        
-        # Quick aliases for readability
-        h = self.norm(x)
-        qkv = self.qkv(h)
-        q, k, v = qkv.chunk(3, dim=1)  # Each: [B, C, H, W]
-        
-        # Reshape to [B, heads, HW, dim_per_head]
-        q = q.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
-        k = k.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
-        v = v.view(B, self.num_heads, C // self.num_heads, H * W).transpose(2, 3)
-        
-        # Calculate using FlashAttention
-        h = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        h = h.transpose(2, 3).reshape(B, C, H, W)
-        h = self.proj(h)
-        return x + h
+        _,CtxC, _, _ = context.shape
 
-
-class SupportAggregator(nn.Module):
-    """Aggregate per-support style pairs with spatial cross-attention."""
-
-    def __init__(self, embed_dim: int, num_heads: int = 8):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.query_proj = nn.Linear(embed_dim, embed_dim)
-        self.key_proj = nn.Linear(embed_dim, embed_dim)
-        self.value_proj = nn.Linear(embed_dim, embed_dim)
-        self.output_proj = nn.Linear(embed_dim, embed_dim)
-        self.norm = nn.LayerNorm(embed_dim)
-
-    def forward(
-        self,
-        content_map: torch.Tensor,
-        support_pair_maps: torch.Tensor,
-        support_mask: torch.Tensor,
-        return_attention: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        batch_size, num_supports, channels, height, width = support_pair_maps.shape
-        head_dim = channels // self.num_heads
-
-        # Flatten spatial dims: [B, N, C, H, W] -> [B, N, HW, C]
-        support_flat = support_pair_maps.reshape(batch_size, num_supports, channels, height * width)
-        support_flat = support_flat.permute(0, 1, 3, 2)  # [B, N, HW, C]
-
-        # Content: [B, C, H, W] -> [B, HW, C]
-        content_flat = content_map.reshape(batch_size, channels, height * width)
-        content_flat = content_flat.permute(0, 2, 1)  # [B, HW, C]
-
-        # Project queries, keys, values
-        query = self.query_proj(self.norm(content_flat))  # [B, HW, C]
-        key = self.key_proj(self.norm(support_flat))      # [B, N, HW, C]
-        value = self.value_proj(support_flat)             # [B, N, HW, C]
+        # Normalize and project
+        x_norm = self.norm(x)
+        q = self.q_proj(x_norm)  # [B, C, H, W]
+        k = self.k_proj(context)  # [B, C, H, W]
+        v = self.v_proj(context)  # [B, C, H, W]
 
         # Reshape for multi-head attention
-        # Query: [B, HW, heads, head_dim] -> [B, heads, HW, head_dim]
-        query = query.view(batch_size, height * width, self.num_heads, head_dim).permute(0, 2, 1, 3)
+        # [B, heads, head_dim, H, W] -> [B, heads, HW, head_dim]
+        q = q.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+        k = k.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
+        v = v.view(B, self.num_heads, self.head_dim, H * W).transpose(2, 3)
 
-        # Key/Value: [B, N, HW, heads, head_dim] -> [B, heads, N*HW, head_dim]
-        key = key.view(batch_size, num_supports, height * width, self.num_heads, head_dim)
-        key = key.permute(0, 3, 1, 2, 4).reshape(batch_size, self.num_heads, num_supports * height * width, head_dim)
+        # Scaled dot-product attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        out = torch.matmul(attn, v)
 
-        value = value.view(batch_size, num_supports, height * width, self.num_heads, head_dim)
-        value = value.permute(0, 3, 1, 2, 4).reshape(batch_size, self.num_heads, num_supports * height * width, head_dim)
-
-        # Compute attention scores: [B, heads, HW, N*HW]
-        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(head_dim)
-
-        # Apply support mask
-        if support_mask.dtype != torch.bool:
-            support_mask = support_mask.to(dtype=torch.bool)
-        flat_mask = support_mask.unsqueeze(-1).expand(-1, -1, height * width).reshape(batch_size, 1, 1, num_supports * height * width)
-        attn_scores = attn_scores.masked_fill(~flat_mask, float("-inf"))
-
-        # Handle empty rows
-        empty_rows = ~support_mask.any(dim=1)
-        if empty_rows.any():
-            attn_scores = attn_scores.masked_fill(empty_rows.view(batch_size, 1, 1, 1), 0.0)
-
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_weights = attn_weights * flat_mask.to(dtype=attn_weights.dtype)
-        attn_weights = attn_weights / attn_weights.sum(dim=-1, keepdim=True).clamp_min(1e-6)
-
-        # Apply attention to values: [B, heads, HW, head_dim]
-        out = torch.matmul(attn_weights, value)
-        out = out.permute(0, 2, 1, 3).reshape(batch_size, height * width, channels)
-        out = self.output_proj(out)
-
-        # Reshape back to spatial map
-        attended_map = out.permute(0, 2, 1).reshape(batch_size, channels, height, width)
-        attended_summary = attended_map.mean(dim=(2, 3))
-
-        if return_attention:
-            return attended_map, attended_summary, attn_weights
-        return attended_map, attended_summary
+        # Reshape back
+        out = out.transpose(2, 3).reshape(B, C, H, W)
+        out = self.out_proj(out)
+        return x + out
 
 
-class UNet(nn.Module):
-    """U-Net for masked diffusion on pixel-art textures."""
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+    """Create sinusoidal timestep embeddings."""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=t.device) / half
+    )
+    args = t[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
 
-    class Downsample(nn.Module):
-        """Downsampling block"""
-        
-        def __init__(self, in_channels: int, out_channels: int):
-            super().__init__()
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1)
 
-        def forward(self, x: torch.Tensor):
-            return self.conv(x)
+class StyleAwareUNet(nn.Module):
+    """Small U-Net (~5M parameters) for 32x32 pixel-art style transfer.
     
-    class Upsample(nn.Module):
-        """Upsampling block"""
-        
-        def __init__(self, in_channels: int, out_channels: int):
-            super().__init__()
-            self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-            self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        
-        def forward(self, x: torch.Tensor):
-            x = self.upsample(x)
-            return self.conv(x)
+    Uses explicit style reference images via cross-attention.
+    Input/Output: RGB images in [0, 1] range.
+    """
 
-    def __init__(self, vocab_size: int = 257, embed_dim: int = 192):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        self.time_mlp = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.SiLU(),
-            nn.Linear(embed_dim * 4, embed_dim),
-        )
-        self.support_pair_proj = nn.Conv2d(embed_dim * 2, embed_dim, kernel_size=1)
-        self.support_aggregator = SupportAggregator(embed_dim, num_heads=8)
-        self.support_cond_proj = nn.Linear(embed_dim, embed_dim)
-        self.in_proj = nn.Conv2d(embed_dim * 3, 128, kernel_size=3, padding=1)
-        self.enc32 = ResBlock(128, cond_dim=embed_dim)
-        self.down32_16 = self.Downsample(128, 256)
-        self.enc16 = ResBlock(256, cond_dim=embed_dim)
-        self.down16_8 = self.Downsample(256, 384)
-        self.enc8 = ResBlock(384, cond_dim=embed_dim)
-        self.attn8 = SelfAttention(384)
-        self.down8_4 = self.Downsample(384, 384)
-        self.enc4 = ResBlock(384, cond_dim=embed_dim)
-        self.attn4 = SelfAttention(384)
-        self.down4_2 = self.Downsample(384, 384)
-        self.enc2 = ResBlock(384, cond_dim=embed_dim)
-        self.attn2 = SelfAttention(384)
-        self.up2_4 = self.Upsample(384, 384)
-        self.merge4 = nn.Conv2d(384 * 2, 384, kernel_size=1)
-        self.dec4 = ResBlock(384, cond_dim=embed_dim)
-        self.up4_8 = self.Upsample(384, 384)
-        self.merge8 = nn.Conv2d(384 * 2, 384, kernel_size=1)
-        self.dec8 = ResBlock(384, cond_dim=embed_dim)
-        self.up8_16 = self.Upsample(384, 256)
-        self.merge16 = nn.Conv2d(256 * 2, 256, kernel_size=1)
-        self.dec16 = ResBlock(256, cond_dim=embed_dim)
-        self.up16_32 = self.Upsample(256, 128)
-        self.merge32 = nn.Conv2d(128 * 2, 128, kernel_size=1)
-        self.dec32 = ResBlock(128, cond_dim=embed_dim)
-        self.out = nn.Sequential(
-            nn.GroupNorm(32, 128),
-            nn.SiLU(),
-            nn.Conv2d(128, vocab_size - 1, kernel_size=1),
-        )
-
-
-    def _embed_tokens(self, x: torch.Tensor):
-        """Embed input tokens and reshape to [B, C, H, W]."""
-        x = self.token_embedding(x.long())
-        return x.permute(0, 3, 1, 2)  # [B, C, H, W]
-
-    def _embed_support_pairs(
+    def __init__(
         self,
-        support_content_ref: torch.Tensor,
-        support_style_ref: torch.Tensor,
-        support_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed and aggregate support exemplars with content-conditioned attention."""
-        if support_content_ref.dim() == 3:
-            support_content_ref = support_content_ref.unsqueeze(1)
-            support_style_ref = support_style_ref.unsqueeze(1)
-        if support_mask is None:
-            support_mask = torch.ones(
-                support_content_ref.shape[:2],
-                device=support_content_ref.device,
-                dtype=torch.bool,
-            )
-        elif support_mask.dim() == 1:
-            support_mask = support_mask.unsqueeze(0)
+        in_channels: int = 3,
+        style_channels: int = 64,
+        base_channels: int = 128,
+        num_style_refs: int = 3,
+    ):
+        super().__init__()
+        self.in_channels = in_channels
+        self.style_channels = style_channels
+        self.base_channels = base_channels
+        self.num_style_refs = num_style_refs
 
-        support_content = self.token_embedding(support_content_ref.long()).permute(0, 1, 4, 2, 3)
-        support_style = self.token_embedding(support_style_ref.long()).permute(0, 1, 4, 2, 3)
+        # Content encoder: processes vanilla target block
+        self.content_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, base_channels, 3, padding=1),
+            ResBlock(base_channels),
+            nn.Conv2d(base_channels, base_channels * 2, 4, 2, 1),  # 16x16
+            ResBlock(base_channels * 2),
+            nn.Conv2d(base_channels * 2, base_channels * 2, 4, 2, 1),  # 8x8
+            ResBlock(base_channels * 2),
+        )
 
-        batch_size, num_supports, _channels, height, width = support_content.shape
-        support_pairs = torch.cat([support_content, support_style], dim=2).reshape(
-            batch_size * num_supports,
-            self.embed_dim * 2,
-            height,
-            width,
+        # Style encoder: processes reference textures from target pack
+        self.style_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, style_channels, 3, padding=1),
+            ResBlock(style_channels),
+            nn.Conv2d(style_channels, style_channels, 4, 2, 1),  # 16x16
+            ResBlock(style_channels),
+            nn.Conv2d(style_channels, style_channels, 4, 2, 1),  # 8x8
+            ResBlock(style_channels),
         )
-        support_pairs = self.support_pair_proj(support_pairs)
-        return support_pairs.reshape(batch_size, num_supports, self.embed_dim, height, width), support_mask
-    
-    def _time_embedding(self, t: torch.Tensor):
-        """Embed time step t into a vector."""
-        t = t.view(-1).float()
-        half_dim = (self.token_embedding.embedding_dim + 1) // 2
-        freqs = torch.exp(
-            -math.log(10000.0) * torch.arange(half_dim, device=t.device, dtype=torch.float32) / half_dim
+
+        # Cross-attention: content queries attend to style keys/values
+        self.cross_attn = CrossAttention(
+            dim=base_channels * 2,
+            context_dim=style_channels,
+            num_heads=4,
         )
-        angles = t[:, None] * freqs[None, :]
-        emb = torch.cat([torch.sin(angles), torch.cos(angles)], dim=1)[:, : self.token_embedding.embedding_dim]
-        return self.time_mlp(emb)
-    
+
+        # Time embedding (for diffusion)
+        time_embed_dim = base_channels * 2
+        self.time_embed = nn.Sequential(
+            nn.Linear(64, 256),
+            nn.SiLU(),
+            nn.Linear(256, time_embed_dim),
+        )
+
+        # Decoder with skip connections
+        self.dec1 = nn.Sequential(
+            ResBlock(base_channels * 2),
+            nn.ConvTranspose2d(base_channels * 2, base_channels, 4, 2, 1),  # 8x8 -> 16x16
+        )
+        self.dec2 = nn.Sequential(
+            ResBlock(base_channels),
+            nn.ConvTranspose2d(base_channels, base_channels, 4, 2, 1),  # 16x16 -> 32x32
+        )
+        self.dec3 = nn.Sequential(
+            ResBlock(base_channels),
+            nn.Conv2d(base_channels, in_channels, 1),  # Predict RGB
+        )
+
+        self._count_parameters()
+
+    def _count_parameters(self):
+        total = sum(p.numel() for p in self.parameters())
+        print(f"StyleAwareUNet initialized with {total / 1e6:.2f}M parameters")
+
     def forward(
         self,
         noisy_target: torch.Tensor,
-        content_ref: torch.Tensor,
-        support_content_ref: torch.Tensor,
-        support_style_ref: torch.Tensor,
-        support_mask: torch.Tensor | None,
+        content_source: torch.Tensor,
+        style_refs: torch.Tensor,
         t: torch.Tensor,
-        return_aux: bool = False,
-    ):
-        target = self._embed_tokens(noisy_target)
-        content = self._embed_tokens(content_ref)
-        support_pairs, support_mask = self._embed_support_pairs(
-            support_content_ref,
-            support_style_ref,
-            support_mask=support_mask,
-        )
-        if return_aux:
-            support_map, support_summary, support_attention_weights = self.support_aggregator(
-                content,
-                support_pairs,
-                support_mask,
-                return_attention=True,
-            )
-        else:
-            support_map, support_summary = self.support_aggregator(content, support_pairs, support_mask)
+    ) -> torch.Tensor:
+        """Forward pass.
+        
+        Args:
+            noisy_target: [B, 3, H, W] noisy target RGB
+            content_source: [B, 3, H, W] vanilla content RGB
+            style_refs: [B, N, 3, H, W] N reference textures from target pack
+            t: [B] diffusion timesteps
+        
+        Returns:
+            [B, 3, H, W] predicted denoised RGB
+        """
+        B = noisy_target.shape[0]
 
-        cond = self._time_embedding(t) + self.support_cond_proj(support_summary)
-        x = torch.cat([target, content, support_map], dim=1)
-        x = self.in_proj(x)
+        # Encode content (vanilla structure)
+        content_feat = self.content_encoder(content_source)  # [B, C*2, 8, 8]
 
-        skip32 = self.enc32(x, cond)
-        x = self.down32_16(skip32)
-        skip16 = self.enc16(x, cond)
-        x = self.down16_8(skip16)
-        skip8 = self.enc8(x, cond)
-        skip8 = self.attn8(skip8)
-        x = self.down8_4(skip8)
-        skip4 = self.enc4(x, cond)
-        skip4 = self.attn4(skip4)
-        x = self.down4_2(skip4)
-        center = self.enc2(x, cond)
-        center = self.attn2(center)
+        # Encode style references (average pool across N refs)
+        N = style_refs.shape[1]
+        style_refs = style_refs.view(B * N, self.in_channels, noisy_target.shape[2], noisy_target.shape[3])
+        style_feat = self.style_encoder(style_refs)  # [B*N, style_C, 8, 8]
+        style_feat = style_feat.view(B, N, self.style_channels, 8, 8)
+        style_feat = style_feat.mean(dim=1)  # [B, style_C, 8, 8]
 
-        x = self.up2_4(center)
-        x = self.merge4(torch.cat([x, skip4], dim=1))
-        x = self.dec4(x, cond)
-        x = self.up4_8(x)
-        x = self.merge8(torch.cat([x, skip8], dim=1))
-        x = self.dec8(x, cond)
-        x = self.up8_16(x)
-        x = self.merge16(torch.cat([x, skip16], dim=1))
-        x = self.dec16(x, cond)
-        x = self.up16_32(x)
-        x = self.merge32(torch.cat([x, skip32], dim=1))
-        x = self.dec32(x, cond)
-        logits = self.out(x)
-        if return_aux:
-            return logits, {"support_attention_weights": support_attention_weights}
-        return logits
+        # Cross-attention: content attends to style
+        content_feat = self.cross_attn(content_feat, style_feat)
+
+        # Add time embedding
+        time_emb = self.time_embed(timestep_embedding(t, 64))
+        content_feat = content_feat + time_emb[:, :, None, None]
+
+        # Decode
+        x = self.dec1(content_feat)  # [B, C, 16, 16]
+        x = self.dec2(x)  # [B, C, 32, 32]
+        x = self.dec3(x)  # [B, 3, 32, 32]
+        return x
+
+
+

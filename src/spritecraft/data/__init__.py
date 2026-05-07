@@ -1,6 +1,6 @@
 """Data package: preprocessing and dataset utilities."""
 
 from spritecraft.data.preprocess import run
-from spritecraft.data.dataset import TextureDataset
+from spritecraft.data.dataset import PackStyleDataset, get_available_pack_ids
 
-__all__ = ["run", "TextureDataset"]
+__all__ = ["run", "PackStyleDataset", "get_available_pack_ids"]

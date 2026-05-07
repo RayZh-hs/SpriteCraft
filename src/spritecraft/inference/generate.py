@@ -9,19 +9,17 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from spritecraft.config import (
     CHECKPOINTS_DIR,
-    DATASET_PATH,
     IMAGE_SIZE,
-    MASK_TOKEN,
     MIN_SUPPORT_EXEMPLARS,
-    NUM_TIMESTEPS,
     OUTPUT_DIR,
-    PAIR_INDEX_PATH,
+    pack_checkpoint_dir,
+    pack_dataset_path,
+    pack_pair_index_path,
 )
-from spritecraft.inference.sampler import load_model, sample_tokens, save_prediction_bundle
+from spritecraft.inference.sampler import compute_metrics, load_model, sample_rgb, save_prediction_bundle
 
 
 def _normalize_texture_id(texture_id: str) -> str:
@@ -31,9 +29,10 @@ def _normalize_texture_id(texture_id: str) -> str:
     return name
 
 
-def _load_pair_index(pair_index_path: Path) -> dict[str, Any]:
+def _load_pair_index(pack_id: str) -> dict[str, Any]:
+    pair_index_path = pack_pair_index_path(pack_id)
     if not pair_index_path.exists():
-        raise FileNotFoundError(f"Pair index not found at {pair_index_path}. Run preprocessing first.")
+        raise FileNotFoundError(f"Pair index not found for pack {pack_id}: {pair_index_path}. Run preprocessing first.")
     with pair_index_path.open(encoding="utf-8") as file_obj:
         data = json.load(file_obj)
     if not isinstance(data, dict):
@@ -41,32 +40,11 @@ def _load_pair_index(pair_index_path: Path) -> dict[str, Any]:
     return data
 
 
-def _build_filename_lookup(filenames_per_pack: dict[str, list[str]]) -> dict[str, dict[str, int]]:
-    return {
-        pack_id: {filename: idx for idx, filename in enumerate(filenames)}
-        for pack_id, filenames in filenames_per_pack.items()
-    }
-
-
-@torch.no_grad()
-def _compute_cross_entropy(
-    model: torch.nn.Module,
-    content_ref: torch.Tensor,
-    support_content_refs: torch.Tensor,
-    support_style_refs: torch.Tensor,
-    target_ref: torch.Tensor,
-) -> float:
-    device = next(model.parameters()).device
-    content_ref = content_ref.unsqueeze(0).to(device)
-    support_content_refs = support_content_refs.unsqueeze(0).to(device)
-    support_style_refs = support_style_refs.unsqueeze(0).to(device)
-    target_ref = target_ref.unsqueeze(0).to(device)
-
-    noisy_target = torch.full_like(target_ref, fill_value=MASK_TOKEN)
-    t = torch.full((1,), NUM_TIMESTEPS, device=device, dtype=torch.long)
-    logits = model(noisy_target, content_ref, support_content_refs, support_style_refs, None, t)
-    loss = F.cross_entropy(logits, target_ref)
-    return float(loss.detach().cpu().item())
+def _load_dataset(pack_id: str) -> np.lib.npyio.NpzFile:
+    dataset_path = pack_dataset_path(pack_id)
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found for pack {pack_id}: {dataset_path}. Run preprocessing first.")
+    return np.load(dataset_path)
 
 
 def _select_texture_ids(
@@ -95,40 +73,16 @@ def _select_texture_ids(
 
 def _resolve_support_filenames(
     filename: str,
-    target_pack: str,
-    support_rankings: dict[str, dict[str, dict[str, list[str]]]],
-    deterministic_supports: dict[str, dict[str, dict[str, list[str]]]],
-    support_pool: list[str],
-    support_count: int,
+    all_target_filenames: list[str],
     rng: random.Random,
+    support_count: int = MIN_SUPPORT_EXEMPLARS,
 ) -> list[str]:
-    deterministic = deterministic_supports.get("val", {}).get(target_pack, {}).get(filename)
-    if deterministic:
-        return deterministic[:support_count]
-
-    for split in ("val", "train"):
-        ranked = support_rankings.get(split, {}).get(target_pack, {}).get(filename)
-        if ranked:
-            return ranked[:support_count]
-
-    if not support_pool:
+    available = [f for f in all_target_filenames if f != filename]
+    if not available:
         return []
-
-    if support_count >= len(support_pool):
-        return list(support_pool)
-    return rng.sample(support_pool, k=support_count)
-
-
-def _lookup_tokens(
-    dataset: np.lib.npyio.NpzFile,
-    filename_to_index: dict[str, dict[str, int]],
-    pack_id: str,
-    filename: str,
-) -> torch.Tensor | None:
-    array_idx = filename_to_index.get(pack_id, {}).get(filename)
-    if array_idx is None:
-        return None
-    return torch.as_tensor(dataset[pack_id][array_idx], dtype=torch.long)
+    
+    count = min(support_count, len(available))
+    return rng.sample(available, k=count)
 
 
 def run(
@@ -140,112 +94,101 @@ def run(
     seed: int | None = None,
 ):
     """Generate textures for a target pack using preprocessed dataset assets."""
-    pair_index = _load_pair_index(Path(PAIR_INDEX_PATH))
-    filenames_per_pack = pair_index.get("filenames_per_pack", {})
-    if not isinstance(filenames_per_pack, dict) or not filenames_per_pack:
-        raise ValueError("Pair index is missing filenames_per_pack; re-run preprocessing.")
-
+    pair_index = _load_pair_index(pack_id)
     base_pack_id = pair_index.get("base_pack_id")
+    
     if not isinstance(base_pack_id, str):
         raise ValueError("Pair index is missing base_pack_id; re-run preprocessing.")
-    if pack_id not in filenames_per_pack:
-        raise ValueError(f"Unknown pack id {pack_id!r}. Available packs: {sorted(filenames_per_pack)}")
-    if base_pack_id not in filenames_per_pack:
-        raise ValueError(f"Base pack {base_pack_id!r} not found in pair index; re-run preprocessing.")
 
-    base_filenames = list(filenames_per_pack[base_pack_id])
-    pack_filenames = set(filenames_per_pack[pack_id])
-    support_pool_base = sorted(set(base_filenames) & pack_filenames)
-    if not support_pool_base:
-        raise ValueError(f"No shared textures between base pack {base_pack_id!r} and {pack_id!r}.")
+    # Load all available filenames
+    train_filenames = pair_index.get("train_filenames", [])
+    val_filenames = pair_index.get("val_filenames", [])
+    all_target_filenames = pair_index.get("all_target_filenames", [])
+    base_filenames = train_filenames + val_filenames
+    
+    if not base_filenames:
+        raise ValueError(f"No shared textures found for pack {pack_id}. Run preprocessing first.")
 
     support_count = MIN_SUPPORT_EXEMPLARS
-    support_count_range = pair_index.get("support_count_range")
-    if isinstance(support_count_range, dict) and isinstance(support_count_range.get("min"), int):
-        support_count = max(1, int(support_count_range["min"]))
-
     rng = random.Random(seed)
     selected_filenames = _select_texture_ids(textures, random_count, base_filenames, rng)
 
-    support_rankings = pair_index.get("support_rankings", {})
-    deterministic_supports = pair_index.get("deterministic_supports", {})
-    filename_to_index = _build_filename_lookup(filenames_per_pack)
-
-    dataset = np.load(DATASET_PATH)
+    # Load dataset
+    dataset = _load_dataset(pack_id)
+    
     try:
-        model, checkpoint_path = load_model(checkpoint)
+        model, checkpoint_path = load_model(checkpoint, pack_id)
         output_dir = Path(output_dir) / pack_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
         results = []
         for filename in selected_filenames:
-            content_ref = _lookup_tokens(dataset, filename_to_index, base_pack_id, filename)
-            if content_ref is None:
-                print(f"Skipping {filename}: missing in base pack {base_pack_id}")
+            # Find index of this filename in train/val
+            try:
+                if filename in train_filenames:
+                    idx = train_filenames.index(filename)
+                    content_rgb = torch.from_numpy(dataset["content_rgb_train"][idx]).float()
+                    target_rgb = torch.from_numpy(dataset["target_rgb_train"][idx]).float()
+                else:
+                    idx = val_filenames.index(filename)
+                    content_rgb = torch.from_numpy(dataset["content_rgb_val"][idx]).float()
+                    target_rgb = torch.from_numpy(dataset["target_rgb_val"][idx]).float()
+            except (ValueError, KeyError, IndexError):
+                print(f"Skipping {filename}: not found in dataset")
                 continue
 
-            support_pool = [name for name in support_pool_base if name != filename]
+            # Permute to [C, H, W]
+            content_rgb = content_rgb.permute(2, 0, 1)  # [3, 32, 32]
+            target_rgb = target_rgb.permute(2, 0, 1)  # [3, 32, 32]
+
+            # Sample style references
             support_filenames = _resolve_support_filenames(
                 filename=filename,
-                target_pack=pack_id,
-                support_rankings=support_rankings,
-                deterministic_supports=deterministic_supports,
-                support_pool=support_pool,
-                support_count=min(support_count, len(support_pool)),
+                all_target_filenames=all_target_filenames,
                 rng=rng,
+                support_count=support_count,
             )
+            
             if not support_filenames:
-                print(f"Skipping {filename}: no support pairs available for pack {pack_id}")
+                print(f"Skipping {filename}: no support pairs available")
                 continue
 
-            support_content_refs = []
-            support_style_refs = []
-            for support_filename in support_filenames:
-                support_content = _lookup_tokens(dataset, filename_to_index, base_pack_id, support_filename)
-                support_style = _lookup_tokens(dataset, filename_to_index, pack_id, support_filename)
-                if support_content is None or support_style is None:
-                    continue
-                support_content_refs.append(support_content)
-                support_style_refs.append(support_style)
-
-            if not support_content_refs:
-                print(f"Skipping {filename}: could not resolve support tensors for {pack_id}")
-                continue
-
-            support_content_tensor = torch.stack(support_content_refs, dim=0)
-            support_style_tensor = torch.stack(support_style_refs, dim=0)
-            prediction = sample_tokens(
+            # Load style reference RGBs
+            support_rgb_list = []
+            support_indices = [all_target_filenames.index(f) for f in support_filenames]
+            all_target_rgb = dataset["all_target_rgb"]
+            for sidx in support_indices:
+                srgb = torch.from_numpy(all_target_rgb[sidx]).float().permute(2, 0, 1)
+                support_rgb_list.append(srgb)
+            
+            support_rgb_tensor = torch.stack(support_rgb_list, dim=0)  # [N, 3, 32, 32]
+            
+            # Generate
+            prediction = sample_rgb(
                 model,
-                content_ref,
-                support_content_tensor,
-                support_style_tensor,
+                content_rgb,
+                support_rgb_tensor,
             )
 
-            truth_ref = _lookup_tokens(dataset, filename_to_index, pack_id, filename)
+            # Compute metrics if target is available
             extra_metrics = None
-            if truth_ref is not None:
-                cross_entropy = _compute_cross_entropy(
-                    model,
-                    content_ref,
-                    support_content_tensor,
-                    support_style_tensor,
-                    truth_ref,
-                )
-                extra_metrics = {"cross_entropy": cross_entropy}
+            try:
+                metrics = compute_metrics(prediction, target_rgb)
+                extra_metrics = metrics
+            except Exception:
+                pass
 
-            bundle_name = f"{Path(filename).stem}_in_{pack_id}_{len(support_content_refs)}shot"
+            bundle_name = f"{Path(filename).stem}_in_{pack_id}_{len(support_rgb_list)}shot"
             result = save_prediction_bundle(
                 output_dir=output_dir,
                 bundle_name=bundle_name,
-                content_tokens=content_ref,
+                content_rgb=content_rgb,
                 content_size=IMAGE_SIZE,
-                support_content_tokens=support_content_refs,
-                support_content_sizes=[IMAGE_SIZE] * len(support_content_refs),
-                support_style_tokens=support_style_refs,
-                support_style_sizes=[IMAGE_SIZE] * len(support_style_refs),
-                prediction_tokens=prediction,
+                support_rgb=support_rgb_list,
+                support_sizes=[IMAGE_SIZE] * len(support_rgb_list),
+                prediction_rgb=prediction,
                 prediction_size=IMAGE_SIZE,
-                truth_tokens=truth_ref,
+                truth_rgb=target_rgb,
                 truth_size=IMAGE_SIZE,
                 metadata={
                     "filename": filename,
@@ -253,7 +196,7 @@ def run(
                     "target_pack": pack_id,
                     "support_filenames": support_filenames,
                     "checkpoint_path": str(Path(checkpoint_path).resolve()),
-                    "target_available": truth_ref is not None,
+                    "target_available": True,
                 },
                 extra_metrics=extra_metrics,
             )
@@ -261,8 +204,8 @@ def run(
 
             print(f"Generated {filename} -> {result['produced_path']}")
             metrics = result["metrics"]
-            if isinstance(metrics, dict) and "cross_entropy" in metrics:
-                print(f"  cross_entropy={metrics['cross_entropy']:.4f}")
+            if isinstance(metrics, dict) and "mae" in metrics:
+                print(f"  mae={metrics['mae']:.4f} pixel_accuracy={metrics['pixel_accuracy']:.4f}")
 
         if not results:
             raise RuntimeError("No textures were generated. Check your selection and pack data.")

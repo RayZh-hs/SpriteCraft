@@ -11,19 +11,26 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 
 MANIFEST_JSON_PATH = DATA_DIR / "manifest.json"
 PALETTE_PATH = PROCESSED_DIR / "palette.npy"
-DATASET_PATH = PROCESSED_DIR / "dataset.npz"
-PAIR_INDEX_PATH = PROCESSED_DIR / "pair_index.json"
 PACK_REPORT_PATH = PROCESSED_DIR / "pack_report.json"
 
 IMAGE_SIZE = 32
-PALETTE_SIZE = 256
-MASK_TOKEN = 256
-VOCAB_SIZE = 257  # 256 palette indices + 1 mask token
-NUM_TIMESTEPS = 50
+NUM_TIMESTEPS = 20
 MIN_SHARED_PACKS = 5
-MIN_SUPPORT_EXEMPLARS = 3
-MAX_SUPPORT_EXEMPLARS = 6
+MIN_SUPPORT_EXEMPLARS = 1
+MAX_SUPPORT_EXEMPLARS = 3
 VALIDATION_MATRIX_EXAMPLES_PER_PACK = 4
+
+# Per-pack dataset directories
+PACK_DATASET_DIR = PROCESSED_DIR / "packs"
+
+def pack_dataset_path(pack_id: str) -> pathlib.Path:
+    return PACK_DATASET_DIR / pack_id / "dataset.npz"
+
+def pack_pair_index_path(pack_id: str) -> pathlib.Path:
+    return PACK_DATASET_DIR / pack_id / "pair_index.json"
+
+def pack_checkpoint_dir(checkpoint_dir: pathlib.Path | str, pack_id: str) -> pathlib.Path:
+    return pathlib.Path(checkpoint_dir) / pack_id
 
 VALIDATION_FILENAMES = frozenset([
     "stone.png",

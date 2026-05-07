@@ -1,4 +1,4 @@
-"""Preprocessing pipeline."""
+"""Preprocessing pipeline for per-pack RGB datasets."""
 
 from __future__ import annotations
 
@@ -12,30 +12,18 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
-from sklearn.cluster import MiniBatchKMeans
-from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
 from spritecraft.config import (
     MANIFEST_JSON_PATH,
-    DATASET_PATH,
     IMAGE_SIZE,
-    MAX_SUPPORT_EXEMPLARS,
     MIN_SHARED_PACKS,
-    MIN_SUPPORT_EXEMPLARS,
+    PACK_DATASET_DIR,
     PACK_REPORT_PATH,
-    PAIR_INDEX_PATH,
-    PALETTE_PATH,
-    PALETTE_SIZE,
     PROCESSED_DIR,
     RAW_PACKS_DIR,
     VALIDATION_FILENAMES,
     VALIDATION_MATRIX_EXAMPLES_PER_PACK,
-)
-from spritecraft.data.support_index import (
-    compute_texture_descriptor,
-    infer_texture_family,
-    rank_support_candidates,
 )
 
 FULL_CUBE_FACES = frozenset({"down", "up", "north", "south", "west", "east"})
@@ -266,8 +254,13 @@ def should_keep_image(img_path: Path, img: Image.Image) -> bool:
     return True
 
 
-def preprocess_image(img: Image.Image) -> Image.Image:
-    """Resize and handle alpha for a single image."""
+def preprocess_image(img: Image.Image) -> tuple[Image.Image, np.ndarray]:
+    """Resize image and extract RGB + alpha channels.
+    
+    Returns:
+        rgb_image: PIL Image in RGB mode, resized to IMAGE_SIZE
+        alpha: numpy array of shape (IMAGE_SIZE, IMAGE_SIZE) with values in [0, 1]
+    """
     width, _height = img.size
 
     if img.mode == "P":
@@ -279,29 +272,40 @@ def preprocess_image(img: Image.Image) -> Image.Image:
         img = img.convert("RGB")
 
     if img.mode == "RGBA":
-        magenta = Image.new("RGBA", img.size, (255, 0, 255, 255))
-        img = Image.alpha_composite(magenta, img).convert("RGB")
-    elif img.mode != "RGB":
-        img = img.convert("RGB")
-
-    if width == 16:
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
-    elif width == 64:
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
-
-    return img
+        rgb = img.convert("RGB")
+        alpha = np.array(img)[:, :, 3].astype(np.float32) / 255.0
+        if width == 16:
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
+            alpha = np.array(Image.fromarray((alpha * 255).astype(np.uint8)).resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)) / 255.0
+        elif width == 64:
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
+            alpha = np.array(Image.fromarray((alpha * 255).astype(np.uint8)).resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)) / 255.0
+        return rgb, alpha
+    else:
+        rgb = img.convert("RGB")
+        if width == 16:
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
+        elif width == 64:
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
+        alpha = np.ones((IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+        return rgb, alpha
 
 
 def collect_images(
     pack_dir: Path,
     allowed_filenames: set[str] | None = None,
-) -> tuple[dict[str, Image.Image], int]:
-    """Collect all valid block textures from an extracted pack."""
+) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], int]:
+    """Collect all valid block textures from an extracted pack.
+    
+    Returns:
+        images: dict mapping filename to (rgb_array, alpha_array)
+        total_textures: total number of textures scanned
+    """
     block_dir = pack_dir / "assets" / "minecraft" / "textures" / "block"
     if not block_dir.exists():
         return {}, 0
 
-    images: dict[str, Image.Image] = {}
+    images: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     block_texture_paths = sorted(block_dir.rglob("*.png"))
     total_textures = len(block_texture_paths)
     
@@ -317,10 +321,8 @@ def collect_images(
 
         # Determine the canonical filename for this texture
         if img_path.parent == block_dir:
-            # Flat structure: block/foo.png -> foo.png
             canonical_name = img_path.name
         else:
-            # Nested structure: block/foo/1.png -> foo.png (use parent dir name)
             canonical_name = img_path.parent.name + ".png"
         
         if allowed_filenames is not None and canonical_name not in allowed_filenames:
@@ -328,30 +330,11 @@ def collect_images(
 
         # Only keep the first matching texture for each canonical name
         if canonical_name not in images:
-            images[canonical_name] = preprocess_image(img)
+            rgb, alpha = preprocess_image(img)
+            rgb_array = np.array(rgb, dtype=np.float32) / 255.0
+            images[canonical_name] = (rgb_array, alpha)
 
     return images, total_textures
-
-
-def build_palette(all_pixels: np.ndarray) -> np.ndarray:
-    """Build a 256-color palette with MiniBatchKMeans."""
-    kmeans = MiniBatchKMeans(
-        n_clusters=PALETTE_SIZE,
-        random_state=42,
-        batch_size=4096,
-        n_init=3,
-    )
-    kmeans.fit(all_pixels)
-    return kmeans.cluster_centers_.astype(np.uint8)
-
-
-def quantize_image(img: Image.Image, palette: np.ndarray) -> np.ndarray:
-    """Map an RGB image to palette indices using a KD-tree for fast lookup."""
-    arr = np.array(img, dtype=np.float32).reshape(-1, 3)
-    nn = NearestNeighbors(n_neighbors=1, algorithm="kd_tree", metric="euclidean")
-    nn.fit(palette)
-    indices = nn.kneighbors(arr, return_distance=False)
-    return indices.astype(np.uint8).reshape(IMAGE_SIZE, IMAGE_SIZE)
 
 
 def _load_manifest(
@@ -488,53 +471,13 @@ def _resolve_fallback_pack_specs(discovered_packs: dict[str, Path]) -> tuple[lis
     return pack_specs, base_pack_id
 
 
-def _build_support_rankings(
-    base_images: dict[str, Image.Image],
-    filenames_per_pack: dict[str, list[str]],
-    split_pairs: dict[str, list[list[str | int]]],
-    base_pack_id: str,
-) -> dict[str, dict[str, list[str]]]:
-    descriptors = {
-        filename: compute_texture_descriptor(np.asarray(image, dtype=np.uint8))
-        for filename, image in base_images.items()
-    }
-    base_filenames = set(filenames_per_pack.get(base_pack_id, []))
-    support_pool_by_pack = {
-        pack_id: sorted((base_filenames & set(filenames)) - VALIDATION_FILENAMES)
-        for pack_id, filenames in filenames_per_pack.items()
-        if pack_id != base_pack_id
-    }
-
-    support_rankings: dict[str, dict[str, list[str]]] = {}
-    for filename, pairs in split_pairs.items():
-        for pack_id, _array_idx in pairs:
-            if not isinstance(pack_id, str):
-                continue
-            if pack_id == base_pack_id:
-                continue
-            candidate_filenames = [
-                candidate_filename
-                for candidate_filename in support_pool_by_pack.get(pack_id, [])
-                if candidate_filename != filename
-            ]
-            ranked_candidates = rank_support_candidates(filename, candidate_filenames, descriptors)
-            if ranked_candidates:
-                support_rankings.setdefault(pack_id, {})[filename] = ranked_candidates
-
-    return support_rankings
-
-
-def _build_deterministic_supports(
-    support_rankings: dict[str, dict[str, list[str]]],
-    support_count: int,
-) -> dict[str, dict[str, list[str]]]:
-    deterministic_supports: dict[str, dict[str, list[str]]] = {}
-    for pack_id, rankings_for_pack in support_rankings.items():
-        for filename, ranked_candidates in rankings_for_pack.items():
-            selected_supports = ranked_candidates[: min(support_count, len(ranked_candidates))]
-            if selected_supports:
-                deterministic_supports.setdefault(pack_id, {})[filename] = selected_supports
-    return deterministic_supports
+def _build_support_pool(
+    base_filenames: set[str],
+    target_filenames: set[str],
+) -> list[str]:
+    """Build pool of textures shared between base and target, excluding validation."""
+    shared = sorted((base_filenames & target_filenames) - VALIDATION_FILENAMES)
+    return shared
 
 
 def _select_validation_entries(
@@ -547,7 +490,7 @@ def _select_validation_entries(
     selected_entries: list[dict[str, str | list[str]]] = []
     used_families: set[str] = set()
     for entry in sorted(entries, key=lambda item: str(item["filename"])):
-        family = infer_texture_family(str(entry["filename"]))
+        family = _infer_texture_family(str(entry["filename"]))
         if family in used_families:
             continue
         selected_entries.append(entry)
@@ -564,45 +507,20 @@ def _select_validation_entries(
     return selected_entries
 
 
-def _build_validation_matrix(
-    val_pair_index: dict[str, list[list[str | int]]],
-    deterministic_supports: dict[str, dict[str, list[str]]],
-    pack_specs: list[PackSpec],
-    base_pack_id: str,
-) -> list[dict[str, str | list[str]]]:
-    spec_by_pack_id = {spec.pack_id: spec for spec in pack_specs}
-    entries_by_pack: dict[str, list[dict[str, str | list[str]]]] = defaultdict(list)
-
-    for filename, pairs in val_pair_index.items():
-        for pack_id, _array_idx in pairs:
-            if not isinstance(pack_id, str):
-                continue
-            if pack_id == base_pack_id:
-                continue
-            support_filenames = deterministic_supports.get(pack_id, {}).get(filename)
-            if not support_filenames:
-                continue
-
-            spec = spec_by_pack_id[pack_id]
-            entries_by_pack[pack_id].append(
-                {
-                    "split": "val",
-                    "filename": filename,
-                    "target_pack": pack_id,
-                    "style": spec.style,
-                    "support_filenames": support_filenames,
-                }
-            )
-
-    validation_matrix: list[dict[str, str | list[str]]] = []
-    for pack_id in sorted(entries_by_pack):
-        selected_entries = _select_validation_entries(
-            entries_by_pack[pack_id],
-            limit=VALIDATION_MATRIX_EXAMPLES_PER_PACK,
-        )
-        validation_matrix.extend(selected_entries)
-
-    return validation_matrix
+def _infer_texture_family(filename: str) -> str:
+    """Infer texture family from filename for validation selection."""
+    name = filename.replace(".png", "")
+    if "_ore" in name:
+        return "ore"
+    if "_planks" in name or "_log" in name:
+        return "wood"
+    if "stone" in name or "cobble" in name or "brick" in name:
+        return "stone"
+    if "dirt" in name or "sand" in name or "gravel" in name:
+        return "ground"
+    if "leaves" in name or "glass" in name:
+        return "vegetation"
+    return "other"
 
 
 def run(
@@ -610,9 +528,10 @@ def run(
     manifest_path: str | Path | None = None,
     min_shared_packs: int = MIN_SHARED_PACKS,
 ):
-    """Run full preprocessing pipeline."""
+    """Run full preprocessing pipeline, splitting data per pack."""
     packs_dir = Path(packs_dir)
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    PACK_DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
     discovered_packs = _discover_pack_archives(packs_dir)
     if not discovered_packs:
@@ -654,7 +573,7 @@ def run(
         raise ValueError(f"Could not derive any allowed block textures from base pack {base_pack_id}")
     print(f"Allowed full-cube block textures: {len(allowed_texture_filenames)}")
 
-    all_pack_images: dict[str, dict[str, Image.Image]] = {}
+    all_pack_images: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
     pack_report: dict[str, Any] = {
         "base_pack_id": base_pack_id,
         "manifest_path": str(resolved_manifest_path.resolve()) if resolved_manifest_path is not None else None,
@@ -693,124 +612,84 @@ def run(
         json.dump(pack_report, file_obj, indent=2)
     print(f"Pack report saved to {PACK_REPORT_PATH}")
 
-    all_pixels = [
-        np.asarray(image, dtype=np.uint8).reshape(-1, 3)
-        for images in all_pack_images.values()
-        for image in images.values()
-    ]
-    if not all_pixels:
-        raise ValueError("No selected pack images were collected. Update the manifest or pack directory.")
-
-    all_pixel_array = np.concatenate(all_pixels, axis=0)
-    print(f"Total pixels for palette: {all_pixel_array.shape[0]:,}")
-    palette = build_palette(all_pixel_array)
-    np.save(PALETTE_PATH, palette)
-    print(f"Palette saved to {PALETTE_PATH}")
-
-    pack_arrays: dict[str, dict[str, np.ndarray]] = {}
-    total_images = sum(len(images) for images in all_pack_images.values())
-    progress = tqdm(total=total_images, desc="Quantizing images", unit="img")
-    for pack_id, images in all_pack_images.items():
-        pack_arrays[pack_id] = {}
-        for filename, image in images.items():
-            pack_arrays[pack_id][filename] = quantize_image(image, palette)
-            progress.update(1)
-    progress.close()
-
-    flat_arrays: dict[str, Any] = {}
-    filenames_per_pack: dict[str, list[str]] = {}
-    for pack_id, arr_dict in pack_arrays.items():
-        filenames = sorted(arr_dict)
-        if not filenames:
-            print(f"  {pack_id}: skipped (no valid images)")
+    # Build per-pack datasets
+    base_images = all_pack_images[base_pack_id]
+    base_filenames = set(base_images.keys())
+    
+    target_pack_specs = [spec for spec in selected_pack_specs if spec.pack_id != base_pack_id]
+    
+    for spec in target_pack_specs:
+        pack_id = spec.pack_id
+        target_images = all_pack_images[pack_id]
+        target_filenames = set(target_images.keys())
+        
+        # Find shared filenames between base and target
+        shared_filenames = sorted(base_filenames & target_filenames)
+        
+        if len(shared_filenames) < min_shared_packs:
+            print(f"  {pack_id}: skipped (only {len(shared_filenames)} shared textures, need {min_shared_packs})")
             continue
-        filenames_per_pack[pack_id] = filenames
-        stack = np.stack([arr_dict[filename] for filename in filenames], axis=0)
-        flat_arrays[pack_id] = stack
-        print(f"  {pack_id}: quantized shape {stack.shape}")
-
-    np.savez(DATASET_PATH, **flat_arrays)
-    print(f"Dataset saved to {DATASET_PATH}")
-
-    raw_pair_index: dict[str, list[list[str | int]]] = defaultdict(list)
-    for pack_id, filenames in filenames_per_pack.items():
-        for array_idx, filename in enumerate(filenames):
-            raw_pair_index[filename].append([pack_id, array_idx])
-
-    filtered_pair_index = {
-        filename: sorted(pairs, key=lambda pair: str(pair[0]))
-        for filename, pairs in raw_pair_index.items()
-        if len(pairs) >= min_shared_packs
-    }
-    train_pair_index = {
-        filename: pairs
-        for filename, pairs in filtered_pair_index.items()
-        if filename not in VALIDATION_FILENAMES
-    }
-    val_pair_index = {
-        filename: pairs
-        for filename, pairs in filtered_pair_index.items()
-        if filename in VALIDATION_FILENAMES
-    }
-
-    support_rankings = {
-        "train": _build_support_rankings(
-            base_images=all_pack_images[base_pack_id],
-            filenames_per_pack=filenames_per_pack,
-            split_pairs=train_pair_index,
-            base_pack_id=base_pack_id,
-        ),
-        "val": _build_support_rankings(
-            base_images=all_pack_images[base_pack_id],
-            filenames_per_pack=filenames_per_pack,
-            split_pairs=val_pair_index,
-            base_pack_id=base_pack_id,
-        ),
-    }
-    deterministic_supports = {
-        "val": _build_deterministic_supports(
-            support_rankings["val"],
-            support_count=MIN_SUPPORT_EXEMPLARS,
+        
+        # Split into train/val
+        train_filenames = [f for f in shared_filenames if f not in VALIDATION_FILENAMES]
+        val_filenames = [f for f in shared_filenames if f in VALIDATION_FILENAMES]
+        
+        # Stack RGB and alpha arrays
+        content_rgb_train = np.stack([base_images[f][0] for f in train_filenames], axis=0)
+        content_alpha_train = np.stack([base_images[f][1] for f in train_filenames], axis=0)
+        target_rgb_train = np.stack([target_images[f][0] for f in train_filenames], axis=0)
+        target_alpha_train = np.stack([target_images[f][1] for f in train_filenames], axis=0)
+        
+        if val_filenames:
+            content_rgb_val = np.stack([base_images[f][0] for f in val_filenames], axis=0)
+            content_alpha_val = np.stack([base_images[f][1] for f in val_filenames], axis=0)
+            target_rgb_val = np.stack([target_images[f][0] for f in val_filenames], axis=0)
+            target_alpha_val = np.stack([target_images[f][1] for f in val_filenames], axis=0)
+        else:
+            content_rgb_val = np.zeros((0, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
+            content_alpha_val = np.zeros((0, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+            target_rgb_val = np.zeros((0, IMAGE_SIZE, IMAGE_SIZE, 3), dtype=np.float32)
+            target_alpha_val = np.zeros((0, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+        
+        # Also save all target pack textures for style reference sampling
+        all_target_filenames = sorted(target_images.keys())
+        all_target_rgb = np.stack([target_images[f][0] for f in all_target_filenames], axis=0)
+        all_target_alpha = np.stack([target_images[f][1] for f in all_target_filenames], axis=0)
+        
+        # Save per-pack dataset
+        pack_dir = PACK_DATASET_DIR / pack_id
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        
+        np.savez(
+            pack_dir / "dataset.npz",
+            content_rgb_train=content_rgb_train,
+            content_alpha_train=content_alpha_train,
+            target_rgb_train=target_rgb_train,
+            target_alpha_train=target_alpha_train,
+            content_rgb_val=content_rgb_val,
+            content_alpha_val=content_alpha_val,
+            target_rgb_val=target_rgb_val,
+            target_alpha_val=target_alpha_val,
+            all_target_rgb=all_target_rgb,
+            all_target_alpha=all_target_alpha,
         )
-    }
-    validation_matrix = _build_validation_matrix(
-        val_pair_index=val_pair_index,
-        deterministic_supports=deterministic_supports["val"],
-        pack_specs=pack_specs,
-        base_pack_id=base_pack_id,
-    )
-
-    pair_data = {
-        "train": train_pair_index,
-        "val": val_pair_index,
-        "filenames_per_pack": filenames_per_pack,
-        "base_pack_id": base_pack_id,
-        "validation_filenames": sorted(VALIDATION_FILENAMES),
-        "selected_pack_ids": [spec.pack_id for spec in selected_pack_specs],
-        "pack_roles": {spec.pack_id: spec.role for spec in pack_specs},
-        "pack_styles": {spec.pack_id: spec.style for spec in pack_specs},
-        "min_shared_packs": min_shared_packs,
-        "support_count_range": {
-            "min": MIN_SUPPORT_EXEMPLARS,
-            "max": MAX_SUPPORT_EXEMPLARS,
-        },
-        "support_rankings": support_rankings,
-        "deterministic_supports": deterministic_supports,
-        "validation_matrix": validation_matrix,
-    }
-    with PAIR_INDEX_PATH.open("w", encoding="utf-8") as file_obj:
-        json.dump(pair_data, file_obj, indent=2)
-
-    print(f"Pair index saved to {PAIR_INDEX_PATH}")
-    print(f"  Training filenames: {len(train_pair_index)}")
-    print(f"  Validation filenames: {len(val_pair_index)}")
-    target_pack_ids: set[str] = set()
-    for entry in validation_matrix:
-        target_pack = entry.get("target_pack")
-        if isinstance(target_pack, str):
-            target_pack_ids.add(target_pack)
-    print(
-        "  Validation matrix entries: "
-        f"{len(validation_matrix)} across {len(target_pack_ids)} pack(s)"
-    )
+        
+        # Save pair index
+        pair_index = {
+            "pack_id": pack_id,
+            "base_pack_id": base_pack_id,
+            "train_filenames": train_filenames,
+            "val_filenames": val_filenames,
+            "all_target_filenames": all_target_filenames,
+            "style": spec.style,
+        }
+        with (pack_dir / "pair_index.json").open("w", encoding="utf-8") as f:
+            json.dump(pair_index, f, indent=2)
+        
+        print(
+            f"  {pack_id}: saved dataset "
+            f"train={len(train_filenames)} val={len(val_filenames)} "
+            f"all_target={len(all_target_filenames)}"
+        )
+    
     print("Preprocessing complete.")

@@ -26,7 +26,7 @@ class MultiScaleStructuralLoss(nn.Module):
         Returns:
             Scalar loss
         """
-        loss = 0.0
+        loss = torch.tensor(0.0, device=pred_rgb.device)
         pred = pred_rgb
         target = target_rgb
         
