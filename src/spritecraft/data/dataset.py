@@ -79,6 +79,8 @@ class PackStyleDataset(Dataset):
             self.filenames = pair_index["val_filenames"]
         
         self.all_target_filenames = pair_index["all_target_filenames"]
+        self.train_filenames = pair_index["train_filenames"]
+        self.val_filenames = pair_index["val_filenames"]
         
         if len(self.filenames) == 0:
             raise ValueError(f"No {split} samples found for pack {pack_id}")
@@ -93,14 +95,22 @@ class PackStyleDataset(Dataset):
 
     def _sample_style_refs(self, exclude_filename: str, idx: int) -> torch.Tensor:
         """Sample style reference textures from the target pack."""
-        # Get available textures excluding the current one
-        available = [
-            filename for filename in self.all_target_filenames
-            if filename != exclude_filename
-        ]
+        # During validation, only use training textures as style references
+        # to avoid data leakage
+        if self.split == "val":
+            available = [
+                filename for filename in self.train_filenames
+                if filename != exclude_filename
+            ]
+        else:
+            # During training, can use any texture except current
+            available = [
+                filename for filename in self.all_target_filenames
+                if filename != exclude_filename
+            ]
         
         if not available:
-            # If no other textures, use the current one as style ref
+            # Fallback: use current texture if no others available
             available = [exclude_filename]
         
         # Determine number of style references
