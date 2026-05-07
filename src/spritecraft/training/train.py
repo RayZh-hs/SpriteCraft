@@ -328,7 +328,7 @@ def train_pack(
     alphas, alphas_cumprod = get_alpha_schedule(betas)
     alphas_cumprod = alphas_cumprod.to(device)
 
-    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir)
+    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir) / pack_id
     try:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=str(tensorboard_dir))
@@ -403,8 +403,8 @@ def train_pack(
         pending_metric_history.append(metric_record)
 
         if writer is not None:
-            writer.add_scalar(f"train/{pack_id}/loss", average_loss, current_step)
-            writer.add_scalar(f"train/{pack_id}/learning_rate", lr, current_step)
+            writer.add_scalar("train/loss", average_loss, current_step)
+            writer.add_scalar("train/learning_rate", lr, current_step)
 
         if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
             _append_metric_history(metrics_path, pending_metric_history)
@@ -552,7 +552,7 @@ def _run_validation(
             from spritecraft.inference.evaluate import _tile_images
             tiled = _tile_images(summary_images, columns=2)
             tiled_np = np.array(tiled)
-            writer.add_image(f"validation/packs/{val_dataset.pack_id}/summary", tiled_np, step, dataformats="HWC")
+            writer.add_image("validation/summary", tiled_np, step, dataformats="HWC")
     
     model.train()
     return preview_dir
