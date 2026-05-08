@@ -112,11 +112,10 @@ class PackStyleDataset(Dataset):
 
     def _build_support_rankings(self) -> dict[str, list[str]]:
         rankings: dict[str, list[str]] = {}
-        shared_set = set(self.shared_filenames)
         for filename in self.shared_filenames:
             candidates = [
-                candidate for candidate in self.shared_filenames
-                if candidate != filename and candidate in shared_set
+                candidate for candidate in self.train_filenames
+                if candidate != filename
             ]
             ranked = rank_support_candidates(filename, candidates, self.content_descriptors)
             rankings[filename] = ranked if ranked else sorted(candidates)
@@ -124,16 +123,10 @@ class PackStyleDataset(Dataset):
 
     def _sample_style_refs(self, exclude_filename: str) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample style reference textures from the target pack."""
-        if self.split == "val":
-            ranked_available = [
-                filename for filename in self.support_rankings.get(exclude_filename, [])
-                if filename in self.train_filenames
-            ]
-        else:
-            ranked_available = self.support_rankings.get(exclude_filename, [])
+        ranked_available = self.support_rankings.get(exclude_filename, [])
 
-        if not ranked_available:
-            # Fallback: use current texture if no others available
+        if not ranked_available and self.split == "train":
+            # Training fallback for tiny packs with only one train texture.
             ranked_available = [exclude_filename]
 
         max_refs = min(self.max_style_refs, len(ranked_available))
