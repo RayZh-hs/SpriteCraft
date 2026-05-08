@@ -9,7 +9,6 @@
 - `checkpoints/`: training runs and per-pack checkpoints.
 - `output/`: generated texture bundles and evaluation artifacts.
 - `docs/`: legacy planning docs only; now intentionally reduced.
-- `rebuild_validation_images.py`, `rebuild_tensorboard.py`, `migrate_tensorboard.py`, `migrate_all_tensorboard.py`: one-off maintenance scripts for old checkpoint / TensorBoard layouts.
 
 ## Package Layout
 
@@ -27,7 +26,6 @@
   - `generate.py`: load a pack checkpoint and generate bundles for selected textures.
   - `sampler.py`: iterative denoising sampler, metrics, bundle saving.
   - `evaluate.py`: validation-matrix rendering and summary export.
-  - `export.py`: leftover palette-based export utility from the older discrete pipeline.
 - `src/spritecraft/debug/`: runtime status, snapshots, preview requests for live training inspection.
 
 ## Data Outputs

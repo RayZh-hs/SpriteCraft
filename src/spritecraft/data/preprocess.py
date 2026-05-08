@@ -5,14 +5,12 @@ from __future__ import annotations
 import json
 import tempfile
 import zipfile
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 from PIL import Image
-from tqdm import tqdm
 
 from spritecraft.config import (
     MANIFEST_JSON_PATH,
@@ -23,7 +21,6 @@ from spritecraft.config import (
     PROCESSED_DIR,
     RAW_PACKS_DIR,
     VALIDATION_FILENAMES,
-    VALIDATION_MATRIX_EXAMPLES_PER_PACK,
 )
 
 FULL_CUBE_FACES = frozenset({"down", "up", "north", "south", "west", "east"})
@@ -469,58 +466,6 @@ def _resolve_fallback_pack_specs(discovered_packs: dict[str, Path]) -> tuple[lis
 
     pack_specs.sort(key=lambda spec: (not spec.selected, spec.role, spec.pack_id))
     return pack_specs, base_pack_id
-
-
-def _build_support_pool(
-    base_filenames: set[str],
-    target_filenames: set[str],
-) -> list[str]:
-    """Build pool of textures shared between base and target, excluding validation."""
-    shared = sorted((base_filenames & target_filenames) - VALIDATION_FILENAMES)
-    return shared
-
-
-def _select_validation_entries(
-    entries: list[dict[str, str | list[str]]],
-    limit: int,
-) -> list[dict[str, str | list[str]]]:
-    if len(entries) <= limit:
-        return sorted(entries, key=lambda entry: str(entry["filename"]))
-
-    selected_entries: list[dict[str, str | list[str]]] = []
-    used_families: set[str] = set()
-    for entry in sorted(entries, key=lambda item: str(item["filename"])):
-        family = _infer_texture_family(str(entry["filename"]))
-        if family in used_families:
-            continue
-        selected_entries.append(entry)
-        used_families.add(family)
-        if len(selected_entries) == limit:
-            return selected_entries
-
-    for entry in sorted(entries, key=lambda item: str(item["filename"])):
-        if entry in selected_entries:
-            continue
-        selected_entries.append(entry)
-        if len(selected_entries) == limit:
-            break
-    return selected_entries
-
-
-def _infer_texture_family(filename: str) -> str:
-    """Infer texture family from filename for validation selection."""
-    name = filename.replace(".png", "")
-    if "_ore" in name:
-        return "ore"
-    if "_planks" in name or "_log" in name:
-        return "wood"
-    if "stone" in name or "cobble" in name or "brick" in name:
-        return "stone"
-    if "dirt" in name or "sand" in name or "gravel" in name:
-        return "ground"
-    if "leaves" in name or "glass" in name:
-        return "vegetation"
-    return "other"
 
 
 def run(

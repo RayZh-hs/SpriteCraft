@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import TypedDict, cast
 
 from PIL import Image
 import torch
@@ -247,7 +246,7 @@ def run(
             print(f"Dataset split {split!r} is empty for pack {pack_id}")
             return output_dir
         
-        summary = write_validation_matrix(
+        write_validation_matrix(
             model=model,
             dataset=dataset,
             output_dir=output_dir,
@@ -275,7 +274,7 @@ def run(
                 print(f"Skipping {pack_id}: dataset split {split!r} is empty")
                 continue
             
-            summary = write_validation_matrix(
+            write_validation_matrix(
                 model=model,
                 dataset=dataset,
                 output_dir=output_dir,

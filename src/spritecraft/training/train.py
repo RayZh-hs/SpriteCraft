@@ -2,15 +2,14 @@
 
 import csv
 from contextlib import nullcontext
-import math
 import os
 from pathlib import Path
-from typing import Any, Iterable, Mapping, cast
+from typing import Any, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -25,11 +24,7 @@ from spritecraft.config import (
 )
 from spritecraft.data.dataset import PackStyleDataset, get_available_pack_ids
 from spritecraft.debug.utility import (
-    list_request_paths,
-    load_json,
-    previews_dir,
     runtime_status_path,
-    snapshots_dir,
     utcnow_iso,
     write_json_atomic,
 )
@@ -212,22 +207,6 @@ def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda
     return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
-def _parameter_norm(model: StyleAwareUNet) -> float:
-    squared_norm = 0.0
-    for parameter in model.parameters():
-        squared_norm += float(parameter.detach().float().pow(2).sum().item())
-    return math.sqrt(squared_norm)
-
-
-def _gradient_norm(model: StyleAwareUNet) -> float:
-    squared_norm = 0.0
-    for parameter in model.parameters():
-        if parameter.grad is None:
-            continue
-        squared_norm += float(parameter.grad.detach().float().pow(2).sum().item())
-    return math.sqrt(squared_norm)
-
-
 def _luminance_gradient_map(rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     luminance = (
         0.299 * rgb[:, 0:1] +
@@ -263,6 +242,7 @@ def train_pack(
     """Train a single per-pack model."""
     if device is None:
         device = _select_device()
+    assert device is not None
     
     pack_checkpoint = pack_checkpoint_dir(checkpoint_dir, pack_id)
     pack_checkpoint.mkdir(parents=True, exist_ok=True)
@@ -354,6 +334,8 @@ def train_pack(
     last_saved_step = start_step
     last_validation_step = start_step
     last_preview_dir: Path | None = None
+    average_loss = float(metric_history[-1]["loss"]) if metric_history else 0.0
+    lr = float(scheduler.get_last_lr()[0])
 
     model.train()
     for step in range(start_step, steps):

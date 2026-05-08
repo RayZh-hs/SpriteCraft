@@ -15,7 +15,6 @@ from spritecraft.config import (
     IMAGE_SIZE,
     MAX_SUPPORT_EXEMPLARS,
     OUTPUT_DIR,
-    pack_checkpoint_dir,
     pack_dataset_path,
     pack_pair_index_path,
 )

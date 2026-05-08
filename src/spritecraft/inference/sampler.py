@@ -10,11 +10,9 @@ import torch
 from PIL import Image, ImageDraw
 
 from spritecraft.config import (
-    CHECKPOINTS_DIR,
     IMAGE_SIZE,
     MAX_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
-    OUTPUT_DIR,
     pack_checkpoint_dir,
 )
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule

@@ -14,7 +14,6 @@ from spritecraft.config import CHECKPOINTS_DIR
 from spritecraft.debug.utility import (
     STATUS_PREFIX,
     is_pid_alive,
-    list_request_paths,
     load_json,
     previews_dir,
     runtime_request_dir,

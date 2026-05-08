@@ -1,7 +1,5 @@
 """Forward diffusion and denoising utilities for continuous RGB."""
 
-import math
-
 import torch
 
 from spritecraft.config import NUM_TIMESTEPS
