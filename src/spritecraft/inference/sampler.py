@@ -9,17 +9,10 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw
 
-from spritecraft.config import (
-    IMAGE_SIZE,
-    MAX_SUPPORT_EXEMPLARS,
-    NUM_TIMESTEPS,
-    pack_checkpoint_dir,
-)
+from spritecraft.config import IMAGE_SIZE, MAX_SUPPORT_EXEMPLARS, NUM_TIMESTEPS, pack_checkpoint_dir
+from spritecraft.data.support_index import compute_texture_descriptor
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
 from spritecraft.models.unet import StyleAwareUNet
-
-CONTENT_INIT_MIN_ALPHA_CUMPROD = 0.25
-
 
 class PredictionBundleResult(TypedDict):
     bundle_dir: Path
@@ -81,19 +74,109 @@ def load_model(checkpoint_dir: str | Path, pack_id: str | None = None) -> tuple[
 
 
 def _initial_sample(content_rgb: torch.Tensor, alphas_cumprod: torch.Tensor) -> torch.Tensor:
-    """Choose a reverse-process start state that matches the training regime.
-
-    A short diffusion schedule with a weak terminal noise level never teaches the
-    model to recover from pure Gaussian noise. In that case, start from the
-    terminal forward-diffused content image instead of an unconditional noise
-    sample so existing checkpoints remain usable.
-    """
-    terminal_alpha_cumprod = float(alphas_cumprod[-1].item())
-    if terminal_alpha_cumprod >= CONTENT_INIT_MIN_ALPHA_CUMPROD:
-        alpha = torch.sqrt(alphas_cumprod[-1]).view(1, 1, 1, 1)
-        sigma = torch.sqrt(1 - alphas_cumprod[-1]).view(1, 1, 1, 1)
-        return alpha * content_rgb + sigma * torch.randn_like(content_rgb)
+    """Start the reverse process from the same pure-noise prior used in training."""
+    del alphas_cumprod
     return torch.randn_like(content_rgb)
+
+
+def _texture_descriptor(rgb_tensor: torch.Tensor) -> np.ndarray:
+    """Convert a [3, H, W] RGB tensor in [0, 1] to a normalized descriptor."""
+    image = (rgb_tensor.permute(1, 2, 0).detach().cpu().float().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+    return compute_texture_descriptor(image)
+
+
+def _sharpness_stats(rgb_tensor: torch.Tensor) -> tuple[float, float]:
+    """Return simple edge/detail scalars for support-aware candidate ranking."""
+    gray = (
+        0.299 * rgb_tensor[0:1]
+        + 0.587 * rgb_tensor[1:2]
+        + 0.114 * rgb_tensor[2:3]
+    )
+    grad_x = gray[:, :, 1:] - gray[:, :, :-1]
+    grad_y = gray[:, 1:, :] - gray[:, :-1, :]
+    edge_energy = 0.5 * (grad_x.abs().mean().item() + grad_y.abs().mean().item())
+    blurred = torch.nn.functional.avg_pool2d(gray.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
+    high_pass_energy = (gray - blurred).abs().mean().item()
+    return edge_energy, high_pass_energy
+
+
+def _support_descriptor_score(
+    prediction_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+) -> float:
+    """Score a sample by support similarity while rejecting under-sharp candidates."""
+    prediction_descriptor = _texture_descriptor(prediction_rgb)
+    prediction_edge, prediction_high_pass = _sharpness_stats(prediction_rgb)
+
+    if style_refs.dim() == 5:
+        refs = style_refs[0]
+    else:
+        refs = style_refs
+
+    if style_ref_mask is not None:
+        if style_ref_mask.dim() == 2:
+            keep = style_ref_mask[0]
+        else:
+            keep = style_ref_mask
+        refs = refs[keep]
+
+    if refs.shape[0] == 0:
+        return float(np.linalg.norm(prediction_descriptor))
+
+    support_descriptors = [_texture_descriptor(ref_rgb) for ref_rgb in refs]
+    support_stats = [_sharpness_stats(ref_rgb) for ref_rgb in refs]
+    support_mean = np.mean(np.stack(support_descriptors, axis=0), axis=0)
+    support_mean = support_mean / (np.linalg.norm(support_mean) + 1e-6)
+    support_edge = float(np.mean([edge for edge, _high_pass in support_stats]))
+    support_high_pass = float(np.mean([high_pass for _edge, high_pass in support_stats]))
+    prediction_descriptor = prediction_descriptor / (np.linalg.norm(prediction_descriptor) + 1e-6)
+    descriptor_score = float(np.dot(prediction_descriptor, support_mean))
+
+    # Penalize candidates that are noticeably softer than the support set.
+    # This improves stochastic candidate selection without incentivizing
+    # arbitrarily noisy or over-sharpened outputs.
+    edge_shortfall = max(0.0, support_edge - prediction_edge) / (support_edge + 1e-6)
+    high_pass_shortfall = max(0.0, support_high_pass - prediction_high_pass) / (support_high_pass + 1e-6)
+    sharpness_penalty = 0.2 * edge_shortfall + 0.1 * high_pass_shortfall
+    return descriptor_score - sharpness_penalty
+
+
+@torch.no_grad()
+def _sample_once(
+    model: StyleAwareUNet,
+    content_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+    num_steps: int = NUM_TIMESTEPS,
+) -> torch.Tensor:
+    """Run a single stochastic reverse process and return a CPU RGB tensor."""
+    device = next(model.parameters()).device
+
+    # Precompute diffusion schedule
+    betas = get_beta_schedule(num_steps).to(device)
+    alphas, alphas_cumprod = get_alpha_schedule(betas)
+    alphas = alphas.to(device)
+    alphas_cumprod = alphas_cumprod.to(device)
+
+    autocast_context = (
+        lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        else nullcontext()
+    )
+
+    x = _initial_sample(content_rgb, alphas_cumprod)
+
+    # Iterative denoising
+    for timestep in range(num_steps, 0, -1):
+        t = torch.full((content_rgb.shape[0],), timestep, dtype=torch.long, device=device)
+
+        with autocast_context():
+            pred_noise = model(x, content_rgb, style_refs, t, style_ref_mask=style_ref_mask)
+
+        x = ddpm_sample_step(x, pred_noise, t, betas, alphas, alphas_cumprod, clip_x0=True)
+
+    return torch.clamp(x.squeeze(0), 0, 1).cpu()
 
 
 @torch.no_grad()
@@ -103,6 +186,7 @@ def sample_rgb(
     style_refs: torch.Tensor,
     style_ref_mask: torch.Tensor | None = None,
     num_steps: int = NUM_TIMESTEPS,
+    num_candidates: int = 1,
 ) -> torch.Tensor:
     """Generate RGB texture using iterative denoising.
     
@@ -111,48 +195,44 @@ def sample_rgb(
         content_rgb: [1, 3, H, W] or [3, H, W] vanilla content
         style_refs: [N, 3, H, W] or [1, N, 3, H, W] style reference textures
         num_steps: number of denoising steps
+        num_candidates: number of stochastic candidates to sample before
+            choosing the support-most-consistent result
     
     Returns:
         [3, H, W] generated RGB texture
     """
-    device = next(model.parameters()).device
-    
     if content_rgb.dim() == 3:
         content_rgb = content_rgb.unsqueeze(0)
     if style_refs.dim() == 4:
         style_refs = style_refs.unsqueeze(0)
     if style_ref_mask is not None and style_ref_mask.dim() == 1:
         style_ref_mask = style_ref_mask.unsqueeze(0)
-    
+
+    device = next(model.parameters()).device
     content_rgb = content_rgb.to(device)
     style_refs = style_refs.to(device)
     if style_ref_mask is not None:
         style_ref_mask = style_ref_mask.to(device)
-    
-    # Precompute diffusion schedule
-    betas = get_beta_schedule(num_steps).to(device)
-    alphas, alphas_cumprod = get_alpha_schedule(betas)
-    alphas = alphas.to(device)
-    alphas_cumprod = alphas_cumprod.to(device)
-    
-    autocast_context = (
-        lambda: torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        if device.type == "cuda" and torch.cuda.is_bf16_supported()
-        else nullcontext()
-    )
 
-    x = _initial_sample(content_rgb, alphas_cumprod)
-    
-    # Iterative denoising
-    for timestep in range(num_steps, 0, -1):
-        t = torch.full((content_rgb.shape[0],), timestep, dtype=torch.long, device=device)
-        
-        with autocast_context():
-            pred_noise = model(x, content_rgb, style_refs, t, style_ref_mask=style_ref_mask)
+    candidate_count = max(1, num_candidates)
+    best_prediction: torch.Tensor | None = None
+    best_score = float("-inf")
 
-        x = ddpm_sample_step(x, pred_noise, t, betas, alphas, alphas_cumprod, clip_x0=True)
+    for _ in range(candidate_count):
+        prediction = _sample_once(
+            model,
+            content_rgb,
+            style_refs,
+            style_ref_mask=style_ref_mask,
+            num_steps=num_steps,
+        )
+        score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
+        if score > best_score or best_prediction is None:
+            best_score = score
+            best_prediction = prediction
 
-    return torch.clamp(x.squeeze(0), 0, 1).cpu()
+    assert best_prediction is not None
+    return best_prediction
 
 
 def compute_metrics(prediction: torch.Tensor, truth: torch.Tensor) -> dict[str, float | int | bool]:

@@ -5,11 +5,12 @@ from contextlib import nullcontext
 import os
 from pathlib import Path
 from typing import Any, cast
+import zlib
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
+from PIL import Image, ImageDraw
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
@@ -31,10 +32,37 @@ from spritecraft.debug.utility import (
 from spritecraft.inference.sampler import sample_rgb
 from spritecraft.models.diffusion import add_noise, get_alpha_schedule, get_beta_schedule, predict_x0_from_noise
 from spritecraft.models.unet import StyleAwareUNet
+from spritecraft.training.content_loss import rgb_content_diagnostic_maps, rgb_content_loss_components
 
 MetricRecord = dict[str, Any]
-METRIC_FIELDNAMES = ("step", "loss", "lr")
+LOSS_COMPONENT_NAMES = (
+    "noise_loss",
+    "recon_loss",
+    "gradient_loss",
+    "content_loss",
+    "content_structure_loss",
+    "content_gradient_delta_loss",
+    "content_detail_delta_loss",
+    "content_contrast_loss",
+)
+TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
+VAL_SCALAR_NAMES = (
+    "loss",
+    "recon_loss",
+    "gradient_loss",
+    "content_loss",
+    "content_structure_loss",
+    "content_gradient_delta_loss",
+    "content_detail_delta_loss",
+    "content_contrast_loss",
+)
+METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
+
+
+def _stable_validation_seed(filename: str) -> int:
+    """Return a stable per-texture seed so validation previews are comparable."""
+    return zlib.crc32(filename.encode("utf-8")) & 0x7FFFFFFF
 
 
 def _select_device() -> torch.device:
@@ -99,9 +127,9 @@ def _write_runtime_status(
 
 def _write_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
     with metrics_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
-        writer.writeheader()
-        writer.writerows(cast(Any, metric_history))
+        csv_writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
+        csv_writer.writeheader()
+        csv_writer.writerows(cast(Any, metric_history))
 
 
 def _append_metric_history(metrics_path: Path, metric_history: list[MetricRecord]) -> None:
@@ -110,10 +138,10 @@ def _append_metric_history(metrics_path: Path, metric_history: list[MetricRecord
 
     file_exists = metrics_path.exists() and metrics_path.stat().st_size > 0
     with metrics_path.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
+        csv_writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDNAMES)
         if not file_exists:
-            writer.writeheader()
-        writer.writerows(cast(Any, metric_history))
+            csv_writer.writeheader()
+        csv_writer.writerows(cast(Any, metric_history))
 
 
 def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord]:
@@ -136,8 +164,16 @@ def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord
 
             records_by_step[step] = {
                 "step": step,
-                "loss": float(row["loss"]),
-                "lr": float(row["lr"]),
+                "loss": float(row.get("loss", 0.0)),
+                "lr": float(row.get("lr", 0.0)),
+                "noise_loss": float(row.get("noise_loss", 0.0)),
+                "recon_loss": float(row.get("recon_loss", 0.0)),
+                "gradient_loss": float(row.get("gradient_loss", 0.0)),
+                "content_loss": float(row.get("content_loss", 0.0)),
+                "content_structure_loss": float(row.get("content_structure_loss", 0.0)),
+                "content_gradient_delta_loss": float(row.get("content_gradient_delta_loss", 0.0)),
+                "content_detail_delta_loss": float(row.get("content_detail_delta_loss", 0.0)),
+                "content_contrast_loss": float(row.get("content_contrast_loss", 0.0)),
             }
             previous_step = step
 
@@ -222,15 +258,102 @@ def _compute_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
     pred_x0: torch.Tensor,
+    content_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
-) -> torch.Tensor:
+) -> dict[str, torch.Tensor]:
     """Balance diffusion correctness with explicit edge preservation."""
     noise_loss = F.mse_loss(pred_noise, true_noise)
     recon_loss = F.l1_loss(pred_x0, target_rgb)
     pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
     target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
     gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
-    return noise_loss + 0.5 * recon_loss + 0.25 * gradient_loss
+    components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
+    total_loss = noise_loss + 0.5 * recon_loss + 0.15 * gradient_loss + 0.2 * components["content_loss"]
+    return {
+        "loss": total_loss,
+        "noise_loss": noise_loss,
+        "recon_loss": recon_loss,
+        "gradient_loss": gradient_loss,
+        **components,
+    }
+
+
+def _init_scalar_totals(names: tuple[str, ...]) -> dict[str, float]:
+    return {name: 0.0 for name in names}
+
+
+def _average_scalar_totals(totals: dict[str, float], divisor: float) -> dict[str, float]:
+    if divisor <= 0:
+        return {name: 0.0 for name in totals}
+    return {name: value / divisor for name, value in totals.items()}
+
+
+def _normalize_map_to_rgb(map_tensor: torch.Tensor) -> Image.Image:
+    """Render a single-channel tensor as a grayscale RGB image."""
+    if map_tensor.dim() == 3:
+        map_tensor = map_tensor[0]
+    array = map_tensor.detach().cpu().float().numpy()
+    array = array - float(array.min())
+    max_value = float(array.max())
+    if max_value > 0:
+        array = array / max_value
+    image = (array * 255.0).clip(0, 255).astype(np.uint8)
+    return Image.fromarray(image, mode="L").convert("RGB")
+
+
+def _make_labeled_tile(label: str, image: Image.Image, label_height: int = 10) -> Image.Image:
+    tile = Image.new("RGB", (image.width, image.height + label_height), color=(255, 255, 255))
+    tile.paste(image, (0, label_height))
+    draw = ImageDraw.Draw(tile)
+    draw.text((1, 0), label, fill=(0, 0, 0))
+    return tile
+
+
+def _build_diagnostic_panel(
+    content_rgb: torch.Tensor,
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> Image.Image:
+    """Create a compact panel that exposes why the content loss is active."""
+    diagnostics = rgb_content_diagnostic_maps(
+        pred_rgb.unsqueeze(0),
+        content_rgb.unsqueeze(0),
+        target_rgb.unsqueeze(0),
+    )
+
+    def rgb_tile(label: str, rgb_tensor: torch.Tensor) -> Image.Image:
+        rgb_np = (rgb_tensor.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
+        return _make_labeled_tile(label, Image.fromarray(rgb_np))
+
+    map_tiles = [
+        _make_labeled_tile("pred_std", _normalize_map_to_rgb(diagnostics["pred_local_std"][0])),
+        _make_labeled_tile("target_std", _normalize_map_to_rgb(diagnostics["target_local_std"][0])),
+        _make_labeled_tile("under_ctr", _normalize_map_to_rgb(diagnostics["weighted_under_contrast"][0])),
+        _make_labeled_tile("edge_short", _normalize_map_to_rgb(diagnostics["weighted_edge_shortfall"][0])),
+        _make_labeled_tile("pred_det", _normalize_map_to_rgb(diagnostics["pred_detail_delta"][0])),
+        _make_labeled_tile("target_det", _normalize_map_to_rgb(diagnostics["target_detail_delta"][0])),
+        _make_labeled_tile("detail_gap", _normalize_map_to_rgb(diagnostics["detail_delta_gap"][0])),
+        _make_labeled_tile("lap_gap", _normalize_map_to_rgb(diagnostics["laplacian_delta_gap"][0])),
+        _make_labeled_tile("pred_grad", _normalize_map_to_rgb(diagnostics["pred_grad_delta_mag"][0])),
+        _make_labeled_tile("target_grad", _normalize_map_to_rgb(diagnostics["target_grad_delta_mag"][0])),
+        _make_labeled_tile("grad_gap", _normalize_map_to_rgb(diagnostics["grad_delta_gap"][0])),
+    ]
+    rgb_tiles = [
+        rgb_tile("content", content_rgb),
+        rgb_tile("pred", pred_rgb),
+        rgb_tile("target", target_rgb),
+    ]
+    all_tiles = rgb_tiles + map_tiles
+    columns = 3
+    tile_width = all_tiles[0].width
+    tile_height = all_tiles[0].height
+    rows = (len(all_tiles) + columns - 1) // columns
+    canvas = Image.new("RGB", (tile_width * columns, tile_height * rows), color=(255, 255, 255))
+    for index, tile in enumerate(all_tiles):
+        x = (index % columns) * tile_width
+        y = (index // columns) * tile_height
+        canvas.paste(tile, (x, y))
+    return canvas
 
 
 def train_pack(
@@ -340,9 +463,9 @@ def train_pack(
     model.train()
     for step in range(start_step, steps):
         optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        scalar_totals = _init_scalar_totals(LOSS_COMPONENT_NAMES + ("loss",))
 
-        for accum_idx in range(grad_accum_steps):
+        for _accum_idx in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
             except StopIteration:
@@ -367,13 +490,15 @@ def train_pack(
                     0.0,
                     1.0,
                 )
-                loss = _compute_loss(pred_noise, true_noise, pred_x0, target_rgb) / grad_accum_steps
+                loss_components = _compute_loss(pred_noise, true_noise, pred_x0, content_rgb, target_rgb)
+                loss = loss_components["loss"] / grad_accum_steps
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
-            total_loss += float(loss.detach().item()) * grad_accum_steps
+            for name in scalar_totals:
+                scalar_totals[name] += float(loss_components[name].detach().item())
 
         if scaler.is_enabled():
             scaler.step(optimizer)
@@ -383,13 +508,15 @@ def train_pack(
         scheduler.step()
 
         current_step = step + 1
-        average_loss = total_loss / grad_accum_steps
+        averaged_scalars = _average_scalar_totals(scalar_totals, grad_accum_steps)
+        average_loss = averaged_scalars["loss"]
         lr = float(scheduler.get_last_lr()[0])
         
         metric_record: MetricRecord = {
             "step": current_step,
             "loss": average_loss,
             "lr": lr,
+            **{name: averaged_scalars[name] for name in LOSS_COMPONENT_NAMES},
         }
         metric_history.append(metric_record)
         pending_metric_history.append(metric_record)
@@ -397,6 +524,8 @@ def train_pack(
         if writer is not None:
             writer.add_scalar("train/loss", average_loss, current_step)
             writer.add_scalar("train/learning_rate", lr, current_step)
+            for name in LOSS_COMPONENT_NAMES:
+                writer.add_scalar(f"train/{name}", averaged_scalars[name], current_step)
 
         if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
             _append_metric_history(metrics_path, pending_metric_history)
@@ -405,7 +534,14 @@ def train_pack(
                 writer.flush()
 
         if current_step == 1 or current_step % 10 == 0 or current_step == steps:
-            print(f"[{pack_id}] step={current_step}/{steps} loss={average_loss:.4f} lr={lr:.6e}")
+            print(
+                f"[{pack_id}] step={current_step}/{steps} "
+                f"loss={average_loss:.4f} "
+                f"recon={averaged_scalars['recon_loss']:.4f} "
+                f"content={averaged_scalars['content_loss']:.4f} "
+                f"contrast={averaged_scalars['content_contrast_loss']:.4f} "
+                f"lr={lr:.6e}"
+            )
 
         if current_step % save_interval == 0 or current_step == steps:
             if pending_metric_history:
@@ -481,9 +617,11 @@ def _run_validation(
     preview_dir = checkpoint_dir / "validation" / f"step_{step:06d}"
     preview_dir.mkdir(parents=True, exist_ok=True)
     
-    total_loss = 0.0
+    scalar_totals = _init_scalar_totals(VAL_SCALAR_NAMES)
     count = 0
     summary_images: list[Image.Image] = []
+    debug_images: list[Image.Image] = []
+    loss_breakdown_rows: list[dict[str, float | str]] = []
     
     for batch in val_loader:
         content_rgb = batch["content_rgb"].to(device)
@@ -492,20 +630,39 @@ def _run_validation(
         style_ref_mask = batch["style_ref_mask"].to(device)
         filename = batch["filename"][0]
 
+        validation_seed = _stable_validation_seed(filename)
+        torch.manual_seed(validation_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(validation_seed)
+
         pred_rgb = sample_rgb(
             model,
             content_rgb,
             style_refs,
             style_ref_mask=style_ref_mask,
             num_steps=NUM_TIMESTEPS,
+            num_candidates=4,
         ).unsqueeze(0).to(device)
+        content_components = rgb_content_loss_components(pred_rgb, content_rgb, target_rgb)
         recon_loss = F.l1_loss(pred_rgb, target_rgb)
         pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_rgb)
         target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
         gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
-        loss = recon_loss + 0.25 * gradient_loss
-        total_loss += float(loss.item())
+        loss = recon_loss + 0.15 * gradient_loss + 0.2 * content_components["content_loss"]
+        sample_scalars = {
+            "loss": float(loss.item()),
+            "recon_loss": float(recon_loss.item()),
+            "gradient_loss": float(gradient_loss.item()),
+            "content_loss": float(content_components["content_loss"].item()),
+            "content_structure_loss": float(content_components["content_structure_loss"].item()),
+            "content_gradient_delta_loss": float(content_components["content_gradient_delta_loss"].item()),
+            "content_detail_delta_loss": float(content_components["content_detail_delta_loss"].item()),
+            "content_contrast_loss": float(content_components["content_contrast_loss"].item()),
+        }
+        for name in VAL_SCALAR_NAMES:
+            scalar_totals[name] += sample_scalars[name]
         count += 1
+        loss_breakdown_rows.append({"filename": filename, **sample_scalars})
         
         # Save preview
         _save_preview(
@@ -516,6 +673,9 @@ def _run_validation(
             pred_rgb[0],
             step,
         )
+        debug_panel = _build_diagnostic_panel(content_rgb[0], pred_rgb[0], target_rgb[0])
+        debug_panel.save(preview_dir / f"{Path(filename).stem}_debug.png")
+        debug_images.append(debug_panel)
         
         # Collect images for tensorboard summary
         content_np = (content_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
@@ -527,17 +687,30 @@ def _run_validation(
         canvas.paste(Image.fromarray(target_np), (IMAGE_SIZE * 2, 0))
         summary_images.append(canvas)
     
-    avg_loss = total_loss / max(count, 1)
+    averaged_scalars = _average_scalar_totals(scalar_totals, count)
+    avg_loss = averaged_scalars["loss"]
     print(f"[{val_dataset.pack_id}] Validation step={step} loss={avg_loss:.4f}")
+
+    breakdown_path = preview_dir / "loss_breakdown.csv"
+    with breakdown_path.open("w", newline="", encoding="utf-8") as handle:
+        csv_writer = csv.DictWriter(handle, fieldnames=("filename",) + VAL_SCALAR_NAMES)
+        csv_writer.writeheader()
+        csv_writer.writerows(cast(Any, loss_breakdown_rows))
     
     # Log validation images to tensorboard
     if writer is not None:
+        for name in VAL_SCALAR_NAMES:
+            writer.add_scalar(f"validation/{name}", averaged_scalars[name], step)
         if summary_images:
             # Create a tiled summary image
             from spritecraft.inference.evaluate import _tile_images
             tiled = _tile_images(summary_images, columns=2)
             tiled_np = np.array(tiled)
             writer.add_image("validation/summary", tiled_np, step, dataformats="HWC")
+        if debug_images:
+            from spritecraft.inference.evaluate import _tile_images
+            tiled_debug = _tile_images(debug_images, columns=1)
+            writer.add_image("validation/debug", np.array(tiled_debug), step, dataformats="HWC")
     
     model.train()
     return preview_dir

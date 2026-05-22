@@ -132,12 +132,15 @@ class PackStyleDataset(Dataset):
         max_refs = min(self.max_style_refs, len(ranked_available))
         min_refs = min(self.min_style_refs, max_refs)
 
-        if self.split == "val":
-            selected = ranked_available[:max_refs]
+        if max_refs == 0:
+            selected: list[str] = []
         else:
-            num_refs = self._rng.randint(min_refs, max_refs)
-            candidate_pool = ranked_available[: max(num_refs, min(len(ranked_available), num_refs * 2))]
-            selected = self._rng.sample(candidate_pool, k=num_refs)
+            # Keep training aligned with validation and generation by using the
+            # highest-ranked supports directly instead of injecting additional
+            # randomness from a broader candidate pool.
+            selected = ranked_available[:max_refs]
+            if len(selected) < min_refs:
+                selected = ranked_available[:min_refs]
 
         # Gather RGB arrays
         ref_indices = [self.filename_to_all_idx[f] for f in selected]

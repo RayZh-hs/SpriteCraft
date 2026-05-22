@@ -11,10 +11,11 @@ TEXTURE_FAMILY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("wood", ("planks", "log", "wood", "stem", "hyphae", "bark")),
     ("foliage", ("leaves", "vine", "grass", "moss", "azalea", "sapling")),
     ("ore", ("ore", "raw_", "debris")),
-    ("stone", ("stone", "cobble", "slate", "calcite", "tuff", "basalt", "andesite", "granite", "diorite")),
-    ("brick", ("brick", "tiles", "bricks", "terracotta")),
+    ("brick", ("brick", "bricks", "tile", "tiles")),
     ("glass", ("glass", "pane")),
     ("soil", ("dirt", "mud", "sand", "gravel", "clay", "farmland", "path")),
+    ("stone", ("stone", "cobble", "slate", "calcite", "tuff", "basalt", "andesite", "granite", "diorite")),
+    ("ceramic", ("terracotta", "glazed")),
 )
 
 SURFACE_ROLE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -23,6 +24,38 @@ SURFACE_ROLE_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("side", ("_side",)),
     ("end", ("_end",)),
 )
+
+SEMANTIC_STOP_TOKENS = frozenset({
+    "block",
+    "top",
+    "bottom",
+    "side",
+    "end",
+    "front",
+    "back",
+    "powered",
+    "lit",
+    "open",
+    "smooth",
+    "polished",
+    "chiseled",
+    "cracked",
+    "cut",
+    "waxed",
+    "weathered",
+    "oxidized",
+    "exposed",
+    "stripped",
+    "light",
+    "dark",
+})
+
+TOKEN_ALIASES = {
+    "bricks": "brick",
+    "tiles": "tile",
+    "planks": "plank",
+    "leaves": "leaf",
+}
 
 
 def _normalize_name(filename: str) -> str:
@@ -45,6 +78,17 @@ def infer_surface_role(filename: str) -> str:
         if any(normalized.endswith(suffix) for suffix in suffixes):
             return role
     return "core"
+
+
+def _semantic_tokens(filename: str) -> set[str]:
+    """Extract meaningful lexical tokens from a texture filename."""
+    tokens = set()
+    for raw_token in _normalize_name(filename).split("_"):
+        token = TOKEN_ALIASES.get(raw_token, raw_token)
+        if not token or token in SEMANTIC_STOP_TOKENS:
+            continue
+        tokens.add(token)
+    return tokens
 
 
 def compute_texture_descriptor(image_array: np.ndarray) -> np.ndarray:
@@ -126,18 +170,35 @@ def rank_support_candidates(
 
     target_family = infer_texture_family(target_filename)
     target_role = infer_surface_role(target_filename)
+    target_tokens = _semantic_tokens(target_filename)
+    family_matched_candidates = [
+        candidate_filename
+        for candidate_filename in candidate_filenames
+        if infer_texture_family(candidate_filename) == target_family
+    ]
+    restricted_candidates = (
+        family_matched_candidates
+        if target_family != "generic" and len(family_matched_candidates) >= 3
+        else candidate_filenames
+    )
     scored_candidates: list[tuple[float, str]] = []
 
-    for candidate_filename in candidate_filenames:
+    for candidate_filename in restricted_candidates:
         candidate_descriptor = descriptors.get(candidate_filename)
         if candidate_descriptor is None:
             continue
 
         similarity = float(np.dot(target_descriptor, candidate_descriptor))
-        if infer_texture_family(candidate_filename) == target_family and target_family != "generic":
+        candidate_family = infer_texture_family(candidate_filename)
+        candidate_tokens = _semantic_tokens(candidate_filename)
+        shared_tokens = target_tokens & candidate_tokens
+
+        if candidate_family == target_family and target_family != "generic":
             similarity += 0.12
         if infer_surface_role(candidate_filename) == target_role and target_role != "core":
             similarity += 0.04
+        if shared_tokens:
+            similarity += 0.18 * len(shared_tokens)
         if candidate_filename == target_filename:
             continue
         scored_candidates.append((similarity, candidate_filename))

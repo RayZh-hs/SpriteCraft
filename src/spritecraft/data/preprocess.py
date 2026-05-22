@@ -259,6 +259,7 @@ def preprocess_image(img: Image.Image) -> tuple[Image.Image, np.ndarray]:
         alpha: numpy array of shape (IMAGE_SIZE, IMAGE_SIZE) with values in [0, 1]
     """
     width, _height = img.size
+    downsample_filter = Image.Resampling.BOX
 
     if img.mode == "P":
         if "transparency" in img.info:
@@ -275,15 +276,19 @@ def preprocess_image(img: Image.Image) -> tuple[Image.Image, np.ndarray]:
             rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
             alpha = np.array(Image.fromarray((alpha * 255).astype(np.uint8)).resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)) / 255.0
         elif width == 64:
-            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
-            alpha = np.array(Image.fromarray((alpha * 255).astype(np.uint8)).resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)) / 255.0
+            # 64x -> 32x for texture packs is an exact 2x downsample. BOX keeps
+            # texel edges crisper than Lanczos and avoids ringing artifacts.
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), downsample_filter)
+            alpha = np.array(
+                Image.fromarray((alpha * 255).astype(np.uint8)).resize((IMAGE_SIZE, IMAGE_SIZE), downsample_filter)
+            ) / 255.0
         return rgb, alpha
     else:
         rgb = img.convert("RGB")
         if width == 16:
             rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.NEAREST)
         elif width == 64:
-            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), Image.Resampling.LANCZOS)
+            rgb = rgb.resize((IMAGE_SIZE, IMAGE_SIZE), downsample_filter)
         alpha = np.ones((IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
         return rgb, alpha
 

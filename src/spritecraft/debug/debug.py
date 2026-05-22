@@ -24,6 +24,9 @@ from spritecraft.debug.utility import (
 from spritecraft.inference import evaluate
 from spritecraft.inference.sampler import _latest_checkpoint_path
 
+RUNNING_STATUS = "running"
+HEARTBEAT_STALE_WARNING_S = 60.0
+
 
 def _coerce_int(value: Any, default: int = 0) -> int:
     try:
@@ -40,6 +43,17 @@ def _coerce_str(value: object, default: str = "") -> str:
     return default
 
 
+def _heartbeat_age_s(status: dict[str, object]) -> float | None:
+    updated_at_raw = status.get("updated_at")
+    if not isinstance(updated_at_raw, str):
+        return None
+    try:
+        updated_at = datetime.fromisoformat(updated_at_raw)
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - updated_at).total_seconds()
+
+
 def _discover_running_instances(checkpoints_root: str | Path = CHECKPOINTS_DIR) -> list[dict[str, object]]:
     root = Path(checkpoints_root)
     status_paths = sorted(root.glob(f"**/.spritecraft-runtime/{STATUS_PREFIX}*.json"))
@@ -51,6 +65,8 @@ def _discover_running_instances(checkpoints_root: str | Path = CHECKPOINTS_DIR) 
             continue
         pid = _coerce_int(status.get("pid", -1), -1)
         if pid <= 0 or not is_pid_alive(pid):
+            continue
+        if _coerce_str(status.get("status"), RUNNING_STATUS).lower() != RUNNING_STATUS:
             continue
         status["pid"] = pid
         checkpoint_dir_raw = _coerce_str(status.get("checkpoint_dir"))
@@ -67,7 +83,6 @@ def _known_issues(status: dict[str, object]) -> list[str]:
     step = _coerce_int(status.get("step", 0))
     last_saved_step = _coerce_int(status.get("last_saved_step", 0))
     last_validation_step = _coerce_int(status.get("last_validation_step", 0))
-    updated_at_raw = status.get("updated_at")
     last_preview_dir = status.get("last_preview_dir")
 
     if step > last_saved_step:
@@ -76,15 +91,9 @@ def _known_issues(status: dict[str, object]) -> list[str]:
         issues.append(f"Preview images lag live model by {step - last_validation_step} step(s).")
     if not last_preview_dir:
         issues.append("No preview images have been generated yet.")
-    if isinstance(updated_at_raw, str):
-        try:
-            updated_at = datetime.fromisoformat(updated_at_raw)
-        except ValueError:
-            updated_at = None
-        if updated_at is not None:
-            age_s = (datetime.now(timezone.utc) - updated_at).total_seconds()
-            if age_s > 60:
-                issues.append(f"Runtime heartbeat is stale ({age_s:.0f}s old).")
+    age_s = _heartbeat_age_s(status)
+    if age_s is not None and age_s > HEARTBEAT_STALE_WARNING_S:
+        issues.append(f"Runtime heartbeat is stale ({age_s:.0f}s old).")
     return issues
 
 

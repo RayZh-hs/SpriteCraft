@@ -1,13 +1,27 @@
 """Forward diffusion and denoising utilities for continuous RGB."""
 
+import math
 import torch
 
 from spritecraft.config import NUM_TIMESTEPS
 
 
-def get_beta_schedule(T: int = NUM_TIMESTEPS, beta_start: float = 1e-4, beta_end: float = 0.02) -> torch.Tensor:
-    """Linear beta schedule for Gaussian diffusion."""
-    return torch.linspace(beta_start, beta_end, T)
+def get_beta_schedule(T: int = NUM_TIMESTEPS, s: float = 0.008, max_beta: float = 0.999) -> torch.Tensor:
+    """Cosine beta schedule with a near-zero terminal signal-to-noise ratio.
+
+    A shallow linear schedule leaves too much of the clean target visible at the
+    terminal timestep. That makes training easier than inference because the
+    model can recover structure directly from a lightly-corrupted target.
+    """
+    if T <= 0:
+        raise ValueError("T must be positive")
+
+    steps = torch.arange(T + 1, dtype=torch.float32)
+    angles = ((steps / T) + s) / (1 + s) * (math.pi / 2)
+    alpha_bar = torch.cos(angles).square()
+    alpha_bar = alpha_bar / alpha_bar[0]
+    betas = 1 - (alpha_bar[1:] / alpha_bar[:-1])
+    return betas.clamp(1e-4, max_beta)
 
 
 def get_alpha_schedule(betas: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

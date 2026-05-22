@@ -55,6 +55,7 @@ def _evaluate_sample(
         content_rgb.unsqueeze(0),
         style_refs,
         style_ref_mask=style_ref_mask,
+        num_candidates=4,
     )
 
 

@@ -132,6 +132,11 @@ def run(
     rng = random.Random(seed)
     selected_filenames = _select_texture_ids(textures, random_count, base_filenames, rng)
 
+    if seed is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
     # Load dataset
     dataset = _load_dataset(pack_id)
     
@@ -190,6 +195,7 @@ def run(
                 content_rgb,
                 support_rgb_tensor,
                 style_ref_mask=style_ref_mask,
+                num_candidates=4,
             )
 
             # Compute metrics if target is available
