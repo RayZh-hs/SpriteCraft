@@ -180,13 +180,18 @@ def run(
 
             # Load style reference RGBs
             support_rgb_list = []
+            support_content_list = []
             support_indices = [all_target_filenames.index(f) for f in support_filenames]
             all_target_rgb = dataset["all_target_rgb"]
-            for sidx in support_indices:
+            for support_filename, sidx in zip(support_filenames, support_indices, strict=True):
                 srgb = torch.from_numpy(all_target_rgb[sidx]).float().permute(2, 0, 1)
                 support_rgb_list.append(srgb)
+                source_idx = train_filenames.index(support_filename)
+                source_rgb = torch.from_numpy(dataset["content_rgb_train"][source_idx]).float().permute(2, 0, 1)
+                support_content_list.append(source_rgb)
             
             support_rgb_tensor = torch.stack(support_rgb_list, dim=0)  # [N, 3, 32, 32]
+            support_content_tensor = torch.stack(support_content_list, dim=0)  # [N, 3, 32, 32]
             style_ref_mask = torch.ones(len(support_rgb_list), dtype=torch.bool)
             
             # Generate
@@ -195,6 +200,7 @@ def run(
                 content_rgb,
                 support_rgb_tensor,
                 style_ref_mask=style_ref_mask,
+                support_content_refs=support_content_tensor,
                 num_candidates=4,
             )
 

@@ -44,6 +44,7 @@ LOSS_COMPONENT_NAMES = (
     "content_gradient_delta_loss",
     "content_detail_delta_loss",
     "content_contrast_loss",
+    "content_hue_loss",
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 VAL_SCALAR_NAMES = (
@@ -55,6 +56,7 @@ VAL_SCALAR_NAMES = (
     "content_gradient_delta_loss",
     "content_detail_delta_loss",
     "content_contrast_loss",
+    "content_hue_loss",
 )
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
@@ -174,6 +176,7 @@ def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord
                 "content_gradient_delta_loss": float(row.get("content_gradient_delta_loss", 0.0)),
                 "content_detail_delta_loss": float(row.get("content_detail_delta_loss", 0.0)),
                 "content_contrast_loss": float(row.get("content_contrast_loss", 0.0)),
+                "content_hue_loss": float(row.get("content_hue_loss", 0.0)),
             }
             previous_step = step
 
@@ -329,6 +332,7 @@ def _build_diagnostic_panel(
         _make_labeled_tile("pred_std", _normalize_map_to_rgb(diagnostics["pred_local_std"][0])),
         _make_labeled_tile("target_std", _normalize_map_to_rgb(diagnostics["target_local_std"][0])),
         _make_labeled_tile("under_ctr", _normalize_map_to_rgb(diagnostics["weighted_under_contrast"][0])),
+        _make_labeled_tile("hue_gap", _normalize_map_to_rgb(diagnostics["hue_gap"][0])),
         _make_labeled_tile("edge_short", _normalize_map_to_rgb(diagnostics["weighted_edge_shortfall"][0])),
         _make_labeled_tile("pred_det", _normalize_map_to_rgb(diagnostics["pred_detail_delta"][0])),
         _make_labeled_tile("target_det", _normalize_map_to_rgb(diagnostics["target_detail_delta"][0])),
@@ -628,6 +632,7 @@ def _run_validation(
         target_rgb = batch["target_rgb"].to(device)
         style_refs = batch["style_refs"].to(device)
         style_ref_mask = batch["style_ref_mask"].to(device)
+        support_content_refs = batch["support_content_refs"].to(device)
         filename = batch["filename"][0]
 
         validation_seed = _stable_validation_seed(filename)
@@ -640,6 +645,7 @@ def _run_validation(
             content_rgb,
             style_refs,
             style_ref_mask=style_ref_mask,
+            support_content_refs=support_content_refs,
             num_steps=NUM_TIMESTEPS,
             num_candidates=4,
         ).unsqueeze(0).to(device)
@@ -658,6 +664,7 @@ def _run_validation(
             "content_gradient_delta_loss": float(content_components["content_gradient_delta_loss"].item()),
             "content_detail_delta_loss": float(content_components["content_detail_delta_loss"].item()),
             "content_contrast_loss": float(content_components["content_contrast_loss"].item()),
+            "content_hue_loss": float(content_components["content_hue_loss"].item()),
         }
         for name in VAL_SCALAR_NAMES:
             scalar_totals[name] += sample_scalars[name]
@@ -675,7 +682,8 @@ def _run_validation(
         )
         debug_panel = _build_diagnostic_panel(content_rgb[0], pred_rgb[0], target_rgb[0])
         debug_panel.save(preview_dir / f"{Path(filename).stem}_debug.png")
-        debug_images.append(debug_panel)
+        if writer is not None and len(debug_images) < 4:
+            debug_images.append(debug_panel)
         
         # Collect images for tensorboard summary
         content_np = (content_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)

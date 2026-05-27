@@ -7,7 +7,9 @@ import torch.nn.functional as F
 
 STRUCTURE_LOSS_WEIGHT = 1.0
 CONTRAST_LOSS_WEIGHT = 1.75
+HUE_LOSS_WEIGHT = 0.5
 CONTRAST_GATE_GAMMA = 2.0
+HUE_GATE_GAMMA = 0.5
 DETAIL_EMPHASIS_SCALE = 1.5
 DETAIL_TOP_FRACTION = 0.125
 LAPLACIAN_STRUCTURE_WEIGHT = 0.75
@@ -21,6 +23,17 @@ def _luminance(rgb: torch.Tensor) -> torch.Tensor:
         + 0.587 * rgb[:, 1:2]
         + 0.114 * rgb[:, 2:3]
     )
+
+
+def _opponent_chroma(rgb: torch.Tensor) -> torch.Tensor:
+    """Represent hue as two opponent-color channels without HSV discontinuities."""
+    red_green = rgb[:, 0:1] - rgb[:, 1:2]
+    blue_yellow = rgb[:, 2:3] - 0.5 * (rgb[:, 0:1] + rgb[:, 1:2])
+    return torch.cat([red_green, blue_yellow], dim=1)
+
+
+def _chroma_magnitude(chroma: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(chroma.square().sum(dim=1, keepdim=True) + 1e-6)
 
 
 def _directional_gradients(gray: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -68,6 +81,30 @@ def _detail_emphasis(target_std: torch.Tensor) -> torch.Tensor:
     detail_strength = (top_values.mean(dim=1, keepdim=True) / max_value).clamp(0.0, 1.0)
     emphasis = 1.0 + DETAIL_EMPHASIS_SCALE * detail_strength
     return emphasis.view(-1, 1, 1, 1)
+
+
+def _hue_alignment_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Penalize chroma direction drift only where the target has meaningful color."""
+    pred_chroma = _opponent_chroma(pred_rgb)
+    target_chroma = _opponent_chroma(target_rgb)
+    pred_chroma_mag = _chroma_magnitude(pred_chroma)
+    target_chroma_mag = _chroma_magnitude(target_chroma)
+
+    pred_unit = pred_chroma / pred_chroma_mag.clamp_min(1e-4)
+    target_unit = target_chroma / target_chroma_mag.clamp_min(1e-4)
+    hue_gap = 0.5 * (1.0 - (pred_unit * target_unit).sum(dim=1, keepdim=True)).clamp(0.0, 2.0)
+
+    max_target_chroma = target_chroma_mag.amax(dim=(2, 3), keepdim=True).clamp_min(1e-4)
+    hue_gate = (target_chroma_mag / max_target_chroma).clamp(0.0, 1.0).pow(HUE_GATE_GAMMA)
+    normalizer = hue_gate.sum(dim=(1, 2, 3), keepdim=True).clamp_min(1.0)
+    angular_loss = (hue_gate * hue_gap).sum(dim=(1, 2, 3), keepdim=True) / normalizer
+
+    chroma_strength_loss = F.l1_loss(pred_chroma_mag, target_chroma_mag)
+    hue_loss = angular_loss.mean() + 0.25 * chroma_strength_loss
+    return hue_loss, hue_gap, hue_gate, chroma_strength_loss
 
 
 def _build_content_state(
@@ -120,6 +157,7 @@ def _build_content_state(
 
     pred_std = 0.5 * (_local_std(pred_gray, kernel_size=3) + _local_std(pred_gray, kernel_size=5))
     target_std = 0.5 * (_local_std(target_gray, kernel_size=3) + _local_std(target_gray, kernel_size=5))
+    hue_loss, hue_gap, hue_gate, chroma_strength_loss = _hue_alignment_loss(pred_rgb, target_rgb)
 
     # Gate each spatial location by the target's local contrast energy so flat
     # target regions are effectively ignored. A squared gate focuses the penalty
@@ -166,6 +204,10 @@ def _build_content_state(
         "laplacian_delta_loss": laplacian_delta_loss,
         "structure_loss": structure_loss,
         "contrast_loss": contrast_loss,
+        "hue_loss": hue_loss,
+        "hue_gap": hue_gap,
+        "hue_gate": hue_gate,
+        "chroma_strength_loss": chroma_strength_loss,
         "edge_shortfall": edge_shortfall,
         "weighted_edge_shortfall": weighted_edge_shortfall,
         "edge_shortfall_loss": edge_shortfall_loss,
@@ -198,13 +240,15 @@ def rgb_content_loss_components(
     state = _build_content_state(pred_rgb, content_rgb, target_rgb)
     total = (
         STRUCTURE_LOSS_WEIGHT * state["structure_loss"] +
-        CONTRAST_LOSS_WEIGHT * state["contrast_loss"]
+        CONTRAST_LOSS_WEIGHT * state["contrast_loss"] +
+        HUE_LOSS_WEIGHT * state["hue_loss"]
     )
     return {
         "content_structure_loss": state["structure_loss"],
         "content_gradient_delta_loss": state["gradient_delta_loss"],
         "content_detail_delta_loss": state["detail_delta_loss"],
         "content_contrast_loss": state["contrast_loss"],
+        "content_hue_loss": state["hue_loss"],
         "content_loss": total,
     }
 
@@ -223,6 +267,8 @@ def rgb_content_diagnostic_maps(
         "detail_emphasis": state["detail_emphasis"],
         "under_contrast": state["under_contrast"],
         "weighted_under_contrast": state["weighted_under_contrast"],
+        "hue_gate": state["hue_gate"],
+        "hue_gap": state["hue_gate"] * state["hue_gap"],
         "edge_shortfall": state["edge_shortfall"],
         "weighted_edge_shortfall": state["weighted_edge_shortfall"],
         "pred_detail_delta": state["pred_detail_delta"].abs(),

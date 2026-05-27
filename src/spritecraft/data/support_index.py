@@ -57,6 +57,23 @@ TOKEN_ALIASES = {
     "leaves": "leaf",
 }
 
+COLOR_TOKENS = frozenset({
+    "black",
+    "blue",
+    "brown",
+    "cyan",
+    "gray",
+    "green",
+    "lime",
+    "magenta",
+    "orange",
+    "pink",
+    "purple",
+    "red",
+    "white",
+    "yellow",
+})
+
 
 def _normalize_name(filename: str) -> str:
     return Path(filename).stem.lower().replace("-", "_").replace(" ", "_")
@@ -171,6 +188,7 @@ def rank_support_candidates(
     target_family = infer_texture_family(target_filename)
     target_role = infer_surface_role(target_filename)
     target_tokens = _semantic_tokens(target_filename)
+    target_color_tokens = target_tokens & COLOR_TOKENS
     family_matched_candidates = [
         candidate_filename
         for candidate_filename in candidate_filenames
@@ -191,6 +209,7 @@ def rank_support_candidates(
         similarity = float(np.dot(target_descriptor, candidate_descriptor))
         candidate_family = infer_texture_family(candidate_filename)
         candidate_tokens = _semantic_tokens(candidate_filename)
+        candidate_color_tokens = candidate_tokens & COLOR_TOKENS
         shared_tokens = target_tokens & candidate_tokens
 
         if candidate_family == target_family and target_family != "generic":
@@ -199,6 +218,11 @@ def rank_support_candidates(
             similarity += 0.04
         if shared_tokens:
             similarity += 0.18 * len(shared_tokens)
+        extra_color_tokens = candidate_color_tokens - target_color_tokens
+        if extra_color_tokens:
+            similarity -= 0.20 * len(extra_color_tokens)
+        if "stained" in candidate_tokens and "stained" not in target_tokens:
+            similarity -= 0.18
         if candidate_filename == target_filename:
             continue
         scored_candidates.append((similarity, candidate_filename))

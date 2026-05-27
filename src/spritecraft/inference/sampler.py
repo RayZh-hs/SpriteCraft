@@ -14,6 +14,11 @@ from spritecraft.data.support_index import compute_texture_descriptor
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
 from spritecraft.models.unet import StyleAwareUNet
 
+DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
+MIN_RECOLOR_SUPPORT_SCORE = 0.55
+RECOLOR_SUPPORT_MARGIN = 0.30
+
+
 class PredictionBundleResult(TypedDict):
     bundle_dir: Path
     original_path: Path
@@ -98,6 +103,94 @@ def _sharpness_stats(rgb_tensor: torch.Tensor) -> tuple[float, float]:
     blurred = torch.nn.functional.avg_pool2d(gray.unsqueeze(0), kernel_size=3, stride=1, padding=1).squeeze(0)
     high_pass_energy = (gray - blurred).abs().mean().item()
     return edge_energy, high_pass_energy
+
+
+def _active_reference_tensors(
+    refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return unpadded reference tensors for a single sample."""
+    if refs.dim() == 5:
+        refs = refs[0]
+
+    if style_ref_mask is not None:
+        mask = style_ref_mask[0] if style_ref_mask.dim() == 2 else style_ref_mask
+        refs = refs[mask.to(device=refs.device, dtype=torch.bool)]
+
+    return refs
+
+
+def _fit_channel_affine(
+    source_refs: torch.Tensor,
+    target_refs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit per-channel target ~= scale * source + bias from support pairs."""
+    source_pixels = source_refs.permute(1, 0, 2, 3).reshape(3, -1)
+    target_pixels = target_refs.permute(1, 0, 2, 3).reshape(3, -1)
+
+    source_mean = source_pixels.mean(dim=1, keepdim=True)
+    target_mean = target_pixels.mean(dim=1, keepdim=True)
+    source_centered = source_pixels - source_mean
+    target_centered = target_pixels - target_mean
+    source_var = source_centered.square().mean(dim=1, keepdim=True)
+    covariance = (source_centered * target_centered).mean(dim=1, keepdim=True)
+
+    scale = (covariance / source_var.clamp_min(1e-5)).clamp(0.2, 3.0)
+    bias = target_mean - scale * source_mean
+    return scale.view(3, 1, 1), bias.view(3, 1, 1)
+
+
+def _style_stat_recolor(
+    content_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+) -> torch.Tensor:
+    """Fallback recolor using support color moments when source support pairs are unavailable."""
+    content_pixels = content_rgb.reshape(3, -1)
+    style_pixels = style_refs.permute(1, 0, 2, 3).reshape(3, -1)
+
+    content_mean = content_pixels.mean(dim=1, keepdim=True).view(3, 1, 1)
+    content_std = content_pixels.std(dim=1, keepdim=True).view(3, 1, 1).clamp_min(1e-4)
+    style_mean = style_pixels.mean(dim=1, keepdim=True).view(3, 1, 1)
+    style_std = style_pixels.std(dim=1, keepdim=True).view(3, 1, 1)
+    return ((content_rgb - content_mean) / content_std * style_std + style_mean).clamp(0.0, 1.0)
+
+
+def _support_pair_recolor(
+    content_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+    support_content_refs: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    """Produce a vanilla-structure fallback by applying support-pair color migration."""
+    content = content_rgb[0] if content_rgb.dim() == 4 else content_rgb
+    active_style_refs = _active_reference_tensors(style_refs, style_ref_mask)
+    if active_style_refs.shape[0] == 0:
+        return None
+
+    if support_content_refs is not None:
+        active_source_refs = _active_reference_tensors(support_content_refs, style_ref_mask)
+        if active_source_refs.shape[0] == active_style_refs.shape[0] and active_source_refs.shape[0] > 0:
+            scale, bias = _fit_channel_affine(active_source_refs, active_style_refs)
+            return (content * scale + bias).clamp(0.0, 1.0)
+
+    return _style_stat_recolor(content, active_style_refs)
+
+
+def _local_blur(rgb_tensor: torch.Tensor) -> torch.Tensor:
+    """Small edge-safe blur used to separate color mass from pixel detail."""
+    padded = torch.nn.functional.pad(rgb_tensor.unsqueeze(0), (1, 1, 1, 1), mode="replicate")
+    return torch.nn.functional.avg_pool2d(padded, kernel_size=3, stride=1).squeeze(0)
+
+
+def _inject_detail(
+    prediction_rgb: torch.Tensor,
+    detail_source_rgb: torch.Tensor,
+    amount: float,
+) -> torch.Tensor:
+    """Preserve generated color while borrowing high-frequency structure from a stable source."""
+    prediction_low = _local_blur(prediction_rgb)
+    source_detail = detail_source_rgb - _local_blur(detail_source_rgb)
+    return (prediction_low + amount * source_detail).clamp(0.0, 1.0)
 
 
 def _support_descriptor_score(
@@ -185,6 +278,7 @@ def sample_rgb(
     content_rgb: torch.Tensor,
     style_refs: torch.Tensor,
     style_ref_mask: torch.Tensor | None = None,
+    support_content_refs: torch.Tensor | None = None,
     num_steps: int = NUM_TIMESTEPS,
     num_candidates: int = 1,
 ) -> torch.Tensor:
@@ -194,6 +288,9 @@ def sample_rgb(
         model: trained StyleAwareUNet
         content_rgb: [1, 3, H, W] or [3, H, W] vanilla content
         style_refs: [N, 3, H, W] or [1, N, 3, H, W] style reference textures
+        support_content_refs: optional vanilla-side matches for each support
+            reference, used for a deterministic structure-preserving recolor
+            candidate.
         num_steps: number of denoising steps
         num_candidates: number of stochastic candidates to sample before
             choosing the support-most-consistent result
@@ -207,16 +304,28 @@ def sample_rgb(
         style_refs = style_refs.unsqueeze(0)
     if style_ref_mask is not None and style_ref_mask.dim() == 1:
         style_ref_mask = style_ref_mask.unsqueeze(0)
+    if support_content_refs is not None and support_content_refs.dim() == 4:
+        support_content_refs = support_content_refs.unsqueeze(0)
 
     device = next(model.parameters()).device
     content_rgb = content_rgb.to(device)
     style_refs = style_refs.to(device)
     if style_ref_mask is not None:
         style_ref_mask = style_ref_mask.to(device)
+    if support_content_refs is not None:
+        support_content_refs = support_content_refs.to(device)
 
     candidate_count = max(1, num_candidates)
+    recolor_candidate = _support_pair_recolor(
+        content_rgb,
+        style_refs,
+        style_ref_mask=style_ref_mask,
+        support_content_refs=support_content_refs,
+    )
     best_prediction: torch.Tensor | None = None
     best_score = float("-inf")
+    recolor_score: float | None = None
+    candidate_predictions: list[tuple[str, torch.Tensor]] = []
 
     for _ in range(candidate_count):
         prediction = _sample_once(
@@ -226,12 +335,39 @@ def sample_rgb(
             style_ref_mask=style_ref_mask,
             num_steps=num_steps,
         )
+        candidate_predictions.append(("diffusion", prediction))
+        if recolor_candidate is not None:
+            for amount in DETAIL_INJECTION_AMOUNTS:
+                candidate_predictions.append(
+                    (
+                        f"detail_{amount:.2f}",
+                        _inject_detail(prediction.to(device), recolor_candidate, amount).cpu(),
+                    )
+                )
+
+    if recolor_candidate is not None:
+        candidate_predictions.append(("support_recolor", recolor_candidate.cpu()))
+
+    for candidate_name, prediction in candidate_predictions:
         score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
+        if candidate_name == "support_recolor":
+            recolor_score = score
         if score > best_score or best_prediction is None:
             best_score = score
             best_prediction = prediction
 
     assert best_prediction is not None
+    # Prefer a support-pair recolor when it is a plausible style match. This
+    # keeps difficult near-zero-shot blocks usable instead of returning a noisy
+    # sample that only wins on loose support statistics.
+    if (
+        recolor_candidate is not None
+        and recolor_score is not None
+        and recolor_score >= MIN_RECOLOR_SUPPORT_SCORE
+        and recolor_score >= best_score - RECOLOR_SUPPORT_MARGIN
+    ):
+        return recolor_candidate.cpu()
+
     return best_prediction
 
 

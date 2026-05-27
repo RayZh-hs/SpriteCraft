@@ -83,6 +83,9 @@ class PackStyleDataset(Dataset):
         self.train_filenames = pair_index["train_filenames"]
         self.val_filenames = pair_index["val_filenames"]
         self.shared_filenames = self.train_filenames + self.val_filenames
+        self.train_filename_to_idx = {
+            filename: idx for idx, filename in enumerate(self.train_filenames)
+        }
         
         if len(self.filenames) == 0:
             raise ValueError(f"No {split} samples found for pack {pack_id}")
@@ -121,7 +124,7 @@ class PackStyleDataset(Dataset):
             rankings[filename] = ranked if ranked else sorted(candidates)
         return rankings
 
-    def _sample_style_refs(self, exclude_filename: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def _sample_style_refs(self, exclude_filename: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample style reference textures from the target pack."""
         ranked_available = self.support_rankings.get(exclude_filename, [])
 
@@ -144,7 +147,9 @@ class PackStyleDataset(Dataset):
 
         # Gather RGB arrays
         ref_indices = [self.filename_to_all_idx[f] for f in selected]
+        train_ref_indices = [self.train_filename_to_idx[f] for f in selected]
         style_refs = self.all_target_rgb[ref_indices]  # [N, 32, 32, 3]
+        support_content_refs = self._content_rgb_train[train_ref_indices]  # [N, 32, 32, 3]
         style_ref_mask = torch.ones(style_refs.shape[0], dtype=torch.bool)
         
         # Pad to max_style_refs if needed
@@ -155,6 +160,7 @@ class PackStyleDataset(Dataset):
                 dtype=torch.float32,
             )
             style_refs = torch.cat([style_refs, padding], dim=0)
+            support_content_refs = torch.cat([support_content_refs, padding.clone()], dim=0)
             style_ref_mask = torch.cat(
                 [
                     style_ref_mask,
@@ -163,7 +169,7 @@ class PackStyleDataset(Dataset):
                 dim=0,
             )
 
-        return style_refs, style_ref_mask
+        return style_refs, style_ref_mask, support_content_refs
 
     def __getitem__(self, idx: int) -> dict[str, object]:
         if idx < 0 or idx >= len(self):
@@ -178,12 +184,13 @@ class PackStyleDataset(Dataset):
         target_alpha = self.target_alpha[idx]  # [32, 32]
         
         # Sample style references from target pack
-        style_refs, style_ref_mask = self._sample_style_refs(filename)  # [max_refs, 32, 32, 3]
+        style_refs, style_ref_mask, support_content_refs = self._sample_style_refs(filename)  # [max_refs, 32, 32, 3]
         
         # Permute to [C, H, W] format
         content_rgb = content_rgb.permute(2, 0, 1)  # [3, 32, 32]
         target_rgb = target_rgb.permute(2, 0, 1)  # [3, 32, 32]
         style_refs = style_refs.permute(0, 3, 1, 2)  # [max_refs, 3, 32, 32]
+        support_content_refs = support_content_refs.permute(0, 3, 1, 2)  # [max_refs, 3, 32, 32]
         
         return {
             "filename": filename,
@@ -193,6 +200,7 @@ class PackStyleDataset(Dataset):
             "target_alpha": target_alpha,
             "style_refs": style_refs,
             "style_ref_mask": style_ref_mask,
+            "support_content_refs": support_content_refs,
             "pack_id": self.pack_id,
             "base_pack_id": self.base_pack_id,
             "style": self.style,
