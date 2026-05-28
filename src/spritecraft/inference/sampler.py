@@ -16,8 +16,8 @@ from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
 
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
-MIN_RECOLOR_SUPPORT_SCORE = 0.55
-RECOLOR_SUPPORT_MARGIN = 0.30
+MIN_RECOLOR_SUPPORT_SCORE = 0.40
+RECOLOR_SUPPORT_MARGIN = 0.35
 
 
 class PredictionBundleResult(TypedDict):
@@ -358,6 +358,8 @@ def sample_rgb(
     best_prediction: torch.Tensor | None = None
     best_score = float("-inf")
     recolor_score: float | None = None
+    recolor_net_prediction: torch.Tensor | None = None
+    recolor_net_score: float | None = None
     candidate_predictions: list[tuple[str, torch.Tensor]] = []
 
     for _ in range(candidate_count):
@@ -383,20 +385,31 @@ def sample_rgb(
 
     if recolor_model is not None:
         recolor_model_pred = recolor_model(content_rgb, style_refs, style_ref_mask=style_ref_mask)
-        candidate_predictions.append(("recolor_net", recolor_model_pred.squeeze(0).cpu()))
+        recolor_net_prediction = recolor_model_pred.squeeze(0).cpu()
+        candidate_predictions.append(("recolor_net", recolor_net_prediction))
 
     for candidate_name, prediction in candidate_predictions:
         score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
         if candidate_name == "support_recolor":
             recolor_score = score
+        if candidate_name == "recolor_net":
+            recolor_net_score = score
         if score > best_score or best_prediction is None:
             best_score = score
             best_prediction = prediction
 
     assert best_prediction is not None
-    # Prefer a support-pair recolor when it is a plausible style match. This
-    # keeps difficult near-zero-shot blocks usable instead of returning a noisy
-    # sample that only wins on loose support statistics.
+    # Prefer structure-preserving candidates (recolor or RecolorNet) over
+    # noisy diffusion samples when they are plausible style matches. This keeps
+    # difficult near-zero-shot blocks usable with vanilla-like structure.
+    if (
+        recolor_net_prediction is not None
+        and recolor_net_score is not None
+        and recolor_net_score >= MIN_RECOLOR_SUPPORT_SCORE
+        and recolor_net_score >= best_score - RECOLOR_SUPPORT_MARGIN
+    ):
+        return recolor_net_prediction
+
     if (
         recolor_candidate is not None
         and recolor_score is not None
