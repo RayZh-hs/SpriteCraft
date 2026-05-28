@@ -262,10 +262,15 @@ def _extract_style_color_stats(
     style_flat = style_refs.reshape(B, N, C, H * W)
 
     if style_ref_mask is not None:
-        mask = style_ref_mask.reshape(B, N, 1)
+        mask = style_ref_mask.to(dtype=torch.float32, device=style_flat.device)
+        while mask.dim() < style_flat.dim():
+            mask = mask.unsqueeze(-1)
+        N_mask = mask.shape[1]
+        if N_mask != N:
+            mask = mask[:, :N, ...]
         masked_sum = (style_flat * mask).sum(dim=1)
         count = mask.sum(dim=1).clamp_min(1)
-        mean = masked_sum / count  # [B, C, H*W]
+        mean = masked_sum / count
 
         diff_sq = (style_flat - mean.unsqueeze(1))
         masked_var = (diff_sq * mask).sum(dim=1) / count.clamp_min(1)
@@ -274,8 +279,8 @@ def _extract_style_color_stats(
         mean = style_flat.mean(dim=1)
         std = style_flat.var(dim=1, unbiased=False).clamp_min(1e-4).sqrt()
 
-    mean_spatial = mean.mean(dim=2)  # [B, 3]
-    std_spatial = std.mean(dim=2)  # [B, 3]
-    return torch.cat([mean_spatial, std_spatial], dim=1)  # [B, 6]
+    mean_spatial = mean.mean(dim=2)
+    std_spatial = std.mean(dim=2)
+    return torch.cat([mean_spatial, std_spatial], dim=1)
 
 
