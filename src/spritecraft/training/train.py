@@ -45,6 +45,7 @@ LOSS_COMPONENT_NAMES = (
     "content_detail_delta_loss",
     "content_contrast_loss",
     "content_hue_loss",
+    "content_color_moment_loss",
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 VAL_SCALAR_NAMES = (
@@ -57,6 +58,7 @@ VAL_SCALAR_NAMES = (
     "content_detail_delta_loss",
     "content_contrast_loss",
     "content_hue_loss",
+    "content_color_moment_loss",
 )
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
@@ -177,6 +179,7 @@ def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord
                 "content_detail_delta_loss": float(row.get("content_detail_delta_loss", 0.0)),
                 "content_contrast_loss": float(row.get("content_contrast_loss", 0.0)),
                 "content_hue_loss": float(row.get("content_hue_loss", 0.0)),
+                "content_color_moment_loss": float(row.get("content_color_moment_loss", 0.0)),
             }
             previous_step = step
 
@@ -257,6 +260,20 @@ def _luminance_gradient_map(rgb: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return grad_x, grad_y
 
 
+def _rgb_channel_gradient_loss(pred_rgb: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
+    """Per-channel gradient loss that penalizes color bleeding and blurring."""
+    total = torch.tensor(0.0, device=pred_rgb.device)
+    for c in range(3):
+        channel_pred = pred_rgb[:, c:c+1]
+        channel_target = target_rgb[:, c:c+1]
+        gx_pred = channel_pred[:, :, :, 1:] - channel_pred[:, :, :, :-1]
+        gy_pred = channel_pred[:, :, 1:, :] - channel_pred[:, :, :-1, :]
+        gx_target = channel_target[:, :, :, 1:] - channel_target[:, :, :, :-1]
+        gy_target = channel_target[:, :, 1:, :] - channel_target[:, :, :-1, :]
+        total = total + F.l1_loss(gx_pred, gx_target) + F.l1_loss(gy_pred, gy_target)
+    return total / 3.0
+
+
 def _compute_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
@@ -264,14 +281,16 @@ def _compute_loss(
     content_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Balance diffusion correctness with explicit edge preservation."""
+    """Balance diffusion correctness with explicit edge and color preservation."""
     noise_loss = F.mse_loss(pred_noise, true_noise)
     recon_loss = F.l1_loss(pred_x0, target_rgb)
     pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
     target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
-    gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+    luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+    channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
+    gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
     components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
-    total_loss = noise_loss + 0.5 * recon_loss + 0.15 * gradient_loss + 0.2 * components["content_loss"]
+    total_loss = noise_loss + 0.5 * recon_loss + 0.30 * gradient_loss + 0.35 * components["content_loss"]
     return {
         "loss": total_loss,
         "noise_loss": noise_loss,
@@ -653,8 +672,10 @@ def _run_validation(
         recon_loss = F.l1_loss(pred_rgb, target_rgb)
         pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_rgb)
         target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
-        gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
-        loss = recon_loss + 0.15 * gradient_loss + 0.2 * content_components["content_loss"]
+        luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+        channel_gradient_loss = _rgb_channel_gradient_loss(pred_rgb, target_rgb)
+        gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
+        loss = recon_loss + 0.30 * gradient_loss + 0.35 * content_components["content_loss"]
         sample_scalars = {
             "loss": float(loss.item()),
             "recon_loss": float(recon_loss.item()),
@@ -665,6 +686,7 @@ def _run_validation(
             "content_detail_delta_loss": float(content_components["content_detail_delta_loss"].item()),
             "content_contrast_loss": float(content_components["content_contrast_loss"].item()),
             "content_hue_loss": float(content_components["content_hue_loss"].item()),
+            "content_color_moment_loss": float(content_components["content_color_moment_loss"].item()),
         }
         for name in VAL_SCALAR_NAMES:
             scalar_totals[name] += sample_scalars[name]

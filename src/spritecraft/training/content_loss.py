@@ -6,14 +6,15 @@ import torch
 import torch.nn.functional as F
 
 STRUCTURE_LOSS_WEIGHT = 1.0
-CONTRAST_LOSS_WEIGHT = 1.75
-HUE_LOSS_WEIGHT = 0.5
+CONTRAST_LOSS_WEIGHT = 2.5
+HUE_LOSS_WEIGHT = 2.0
+COLOR_MOMENT_WEIGHT = 1.5
 CONTRAST_GATE_GAMMA = 2.0
-HUE_GATE_GAMMA = 0.5
+HUE_GATE_GAMMA = 0.7
 DETAIL_EMPHASIS_SCALE = 1.5
 DETAIL_TOP_FRACTION = 0.125
 LAPLACIAN_STRUCTURE_WEIGHT = 0.75
-EDGE_SHORTFALL_WEIGHT = 0.35
+EDGE_SHORTFALL_WEIGHT = 0.6
 
 
 def _luminance(rgb: torch.Tensor) -> torch.Tensor:
@@ -70,6 +71,29 @@ def _local_std(gray: torch.Tensor, kernel_size: int = 5) -> torch.Tensor:
     mean_sq = F.avg_pool2d(gray.square(), kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
     variance = (mean_sq - mean.square()).clamp_min(0.0)
     return torch.sqrt(variance + 1e-6)
+
+
+def _color_moment_loss(
+    pred_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> torch.Tensor:
+    """Penalize deviation in per-channel mean and standard deviation.
+
+    This provides a strong, reliable gradient for global color matching that
+    does not depend on spatial alignment and converges quickly.
+    """
+    B = pred_rgb.shape[0]
+    pred_flat = pred_rgb.reshape(B, 3, -1)
+    target_flat = target_rgb.reshape(B, 3, -1)
+
+    pred_mean = pred_flat.mean(dim=2)
+    target_mean = target_flat.mean(dim=2)
+    pred_std = pred_flat.std(dim=2, unbiased=False).clamp_min(1e-4)
+    target_std = target_flat.std(dim=2, unbiased=False).clamp_min(1e-4)
+
+    mean_loss = F.l1_loss(pred_mean, target_mean)
+    std_loss = F.l1_loss(pred_std, target_std)
+    return mean_loss + 0.5 * std_loss
 
 
 def _detail_emphasis(target_std: torch.Tensor) -> torch.Tensor:
@@ -158,6 +182,7 @@ def _build_content_state(
     pred_std = 0.5 * (_local_std(pred_gray, kernel_size=3) + _local_std(pred_gray, kernel_size=5))
     target_std = 0.5 * (_local_std(target_gray, kernel_size=3) + _local_std(target_gray, kernel_size=5))
     hue_loss, hue_gap, hue_gate, chroma_strength_loss = _hue_alignment_loss(pred_rgb, target_rgb)
+    color_moment_loss = _color_moment_loss(pred_rgb, target_rgb)
 
     # Gate each spatial location by the target's local contrast energy so flat
     # target regions are effectively ignored. A squared gate focuses the penalty
@@ -208,6 +233,7 @@ def _build_content_state(
         "hue_gap": hue_gap,
         "hue_gate": hue_gate,
         "chroma_strength_loss": chroma_strength_loss,
+        "color_moment_loss": color_moment_loss,
         "edge_shortfall": edge_shortfall,
         "weighted_edge_shortfall": weighted_edge_shortfall,
         "edge_shortfall_loss": edge_shortfall_loss,
@@ -241,7 +267,8 @@ def rgb_content_loss_components(
     total = (
         STRUCTURE_LOSS_WEIGHT * state["structure_loss"] +
         CONTRAST_LOSS_WEIGHT * state["contrast_loss"] +
-        HUE_LOSS_WEIGHT * state["hue_loss"]
+        HUE_LOSS_WEIGHT * state["hue_loss"] +
+        COLOR_MOMENT_WEIGHT * state["color_moment_loss"]
     )
     return {
         "content_structure_loss": state["structure_loss"],
@@ -249,6 +276,7 @@ def rgb_content_loss_components(
         "content_detail_delta_loss": state["detail_delta_loss"],
         "content_contrast_loss": state["contrast_loss"],
         "content_hue_loss": state["hue_loss"],
+        "content_color_moment_loss": state["color_moment_loss"],
         "content_loss": total,
     }
 
