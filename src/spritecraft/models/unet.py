@@ -7,14 +7,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _resolve_group_norm_groups(channels: int, max_groups: int = 8) -> int:
+    for g in range(max_groups, 0, -1):
+        if channels % g == 0:
+            return g
+    return 1
+
+
 class ResBlock(nn.Module):
     """Residual block with GroupNorm and SiLU activation."""
 
     def __init__(self, channels: int):
         super().__init__()
-        self.norm1 = nn.GroupNorm(8, channels)
+        num_groups = _resolve_group_norm_groups(channels)
+        self.norm1 = nn.GroupNorm(num_groups, channels)
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = nn.GroupNorm(8, channels)
+        self.norm2 = nn.GroupNorm(num_groups, channels)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
         self.activation = nn.SiLU()
 
@@ -38,7 +46,7 @@ class CrossAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.norm = nn.GroupNorm(8, dim)
+        self.norm = nn.GroupNorm(_resolve_group_norm_groups(dim), dim)
         self.q_proj = nn.Conv2d(dim, dim, kernel_size=1)
         self.k_proj = nn.Conv2d(context_dim, dim, kernel_size=1)
         self.v_proj = nn.Conv2d(context_dim, dim, kernel_size=1)

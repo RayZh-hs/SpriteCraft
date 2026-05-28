@@ -666,7 +666,7 @@ def _run_validation(
             style_ref_mask=style_ref_mask,
             support_content_refs=support_content_refs,
             num_steps=NUM_TIMESTEPS,
-            num_candidates=4,
+            num_candidates=2,
         ).unsqueeze(0).to(device)
         content_components = rgb_content_loss_components(pred_rgb, content_rgb, target_rgb)
         recon_loss = F.l1_loss(pred_rgb, target_rgb)
