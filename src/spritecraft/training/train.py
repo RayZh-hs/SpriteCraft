@@ -290,7 +290,7 @@ def _compute_loss(
     channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
     gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
     components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
-    total_loss = noise_loss + 0.5 * recon_loss + 0.30 * gradient_loss + 0.40 * components["content_loss"]
+    total_loss = noise_loss + 0.70 * recon_loss + 0.30 * gradient_loss + 0.30 * components["content_loss"]
     return {
         "loss": total_loss,
         "noise_loss": noise_loss,
@@ -524,9 +524,12 @@ def train_pack(
                 scalar_totals[name] += float(loss_components[name].detach().item())
 
         if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
         else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         scheduler.step()
 
@@ -675,7 +678,7 @@ def _run_validation(
         luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
         channel_gradient_loss = _rgb_channel_gradient_loss(pred_rgb, target_rgb)
         gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-        loss = recon_loss + 0.30 * gradient_loss + 0.40 * content_components["content_loss"]
+        loss = recon_loss + 0.30 * gradient_loss + 0.30 * content_components["content_loss"]
         sample_scalars = {
             "loss": float(loss.item()),
             "recon_loss": float(recon_loss.item()),
