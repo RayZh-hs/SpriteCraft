@@ -32,6 +32,11 @@ def main():
     train_parser.add_argument("--steps", type=int, default=10_000)
     train_parser.add_argument("--pack", type=str, default=None, help="Train specific pack (default: all)")
 
+    recolor_parser = subparsers.add_parser("train-recolor", help="Train the RecolorNet for structure-preserving color transfer")
+    recolor_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    recolor_parser.add_argument("--steps", type=int, default=5_000)
+    recolor_parser.add_argument("--pack", type=str, default=None, help="Train specific pack (default: all)")
+
     generate_parser = subparsers.add_parser("generate", help="Generate textures from a resource pack")
     generate_parser.add_argument("--pack", type=str, required=True)
     generate_parser.add_argument("--checkpoint", type=str, default="checkpoints")
@@ -55,6 +60,9 @@ def main():
     elif args.command == "train":
         from spritecraft.training import train
         train.run(args.checkpoint_dir, args.steps, args.pack)
+    elif args.command == "train-recolor":
+        from spritecraft.training import recolor_train
+        recolor_train.run_recolor(args.checkpoint_dir, args.steps, args.pack)
     elif args.command == "generate":
         from spritecraft.inference import generate
         generate.run(

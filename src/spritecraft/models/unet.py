@@ -136,6 +136,13 @@ class StyleAwareUNet(nn.Module):
             ResBlock(style_channels),
         )
 
+        # Color conditioning: inject explicit style color statistics
+        self.color_fc = nn.Sequential(
+            nn.Linear(6, 64),
+            nn.SiLU(),
+            nn.Linear(64, base_channels * 2),
+        )
+
         # Cross-attention: content queries attend to style keys/values
         self.cross_attn = CrossAttention(
             dim=base_channels * 2,
@@ -188,6 +195,7 @@ class StyleAwareUNet(nn.Module):
             content_source: [B, 3, H, W] vanilla content RGB
             style_refs: [B, N, 3, H, W] N reference textures from target pack
             t: [B] diffusion timesteps
+            style_ref_mask: [B, N] boolean mask for valid references
         
         Returns:
             [B, 3, H, W] predicted denoised RGB
@@ -203,8 +211,8 @@ class StyleAwareUNet(nn.Module):
         # Encode style references and preserve all support tokens rather than
         # collapsing them into an average feature map.
         N = style_refs.shape[1]
-        style_refs = style_refs.reshape(B * N, self.in_channels, H, W)
-        style_feat = self.style_encoder(style_refs)  # [B*N, style_C, 8, 8]
+        style_refs_flat = style_refs.reshape(B * N, self.in_channels, H, W)
+        style_feat = self.style_encoder(style_refs_flat)  # [B*N, style_C, 8, 8]
         style_feat = style_feat.view(B, N, self.style_channels, 8, 8)
         style_context = style_feat.permute(0, 2, 3, 1, 4).reshape(B, self.style_channels, 8, 8 * N)
 
@@ -213,6 +221,13 @@ class StyleAwareUNet(nn.Module):
             context_mask = style_ref_mask[:, :, None].expand(B, N, 64).reshape(B, N * 64)
 
         x8 = self.cross_attn(x8, style_context, context_mask=context_mask)
+
+        # Extract style color statistics and inject as conditioning
+        style_color_stats = _extract_style_color_stats(
+            style_refs, style_ref_mask=style_ref_mask
+        )
+        color_conditioning = self.color_fc(style_color_stats)
+        x8 = x8 + color_conditioning[:, :, None, None]
 
         # Add time embedding
         time_emb = self.time_embed(timestep_embedding(t, 64))
@@ -225,5 +240,34 @@ class StyleAwareUNet(nn.Module):
         x = self.merge32(x + x32)
         x = self.dec3(x)  # [B, 3, 32, 32]
         return x
+
+
+def _extract_style_color_stats(
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Extract per-channel mean and std from style reference textures.
+
+    Returns [B, 6] tensor with mean(R,G,B) and std(R,G,B) for each batch item.
+    """
+    B, N, C, H, W = style_refs.shape
+    style_flat = style_refs.reshape(B, N, C, H * W)
+
+    if style_ref_mask is not None:
+        mask = style_ref_mask.reshape(B, N, 1)
+        masked_sum = (style_flat * mask).sum(dim=1)
+        count = mask.sum(dim=1).clamp_min(1)
+        mean = masked_sum / count  # [B, C, H*W]
+
+        diff_sq = (style_flat - mean.unsqueeze(1))
+        masked_var = (diff_sq * mask).sum(dim=1) / count.clamp_min(1)
+        std = masked_var.clamp_min(1e-4).sqrt()
+    else:
+        mean = style_flat.mean(dim=1)
+        std = style_flat.var(dim=1, unbiased=False).clamp_min(1e-4).sqrt()
+
+    mean_spatial = mean.mean(dim=2)  # [B, 3]
+    std_spatial = std.mean(dim=2)  # [B, 3]
+    return torch.cat([mean_spatial, std_spatial], dim=1)  # [B, 6]
 
 

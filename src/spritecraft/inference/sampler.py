@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 from spritecraft.config import IMAGE_SIZE, MAX_SUPPORT_EXEMPLARS, NUM_TIMESTEPS, pack_checkpoint_dir
 from spritecraft.data.support_index import compute_texture_descriptor
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
+from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
 
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
@@ -76,6 +77,35 @@ def load_model(checkpoint_dir: str | Path, pack_id: str | None = None) -> tuple[
         ) from exc
     model.eval()
     return model, checkpoint_path
+
+
+def load_recolor_model(checkpoint_dir: str | Path, pack_id: str | None = None) -> tuple[RecolorNet, Path] | tuple[None, None]:
+    """Load the latest RecolorNet checkpoint for a pack, if available."""
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if pack_id is not None:
+        checkpoint_dir = pack_checkpoint_dir(checkpoint_dir, pack_id)
+
+    recolor_path = checkpoint_dir / "recolor_latest.pt"
+    if not recolor_path.exists():
+        return None, None
+
+    checkpoint = torch.load(recolor_path, map_location="cpu")
+    device = _select_device()
+    model = RecolorNet(
+        in_channels=3,
+        style_channels=64,
+        base_channels=64,
+        num_style_refs=MAX_SUPPORT_EXEMPLARS,
+    ).to(device)
+
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        print(f"Warning: RecolorNet checkpoint {recolor_path} is incompatible: {exc}")
+        return None, None
+    model.eval()
+    return model, recolor_path
 
 
 def _initial_sample(content_rgb: torch.Tensor, alphas_cumprod: torch.Tensor) -> torch.Tensor:
@@ -279,11 +309,12 @@ def sample_rgb(
     style_refs: torch.Tensor,
     style_ref_mask: torch.Tensor | None = None,
     support_content_refs: torch.Tensor | None = None,
+    recolor_model: RecolorNet | None = None,
     num_steps: int = NUM_TIMESTEPS,
     num_candidates: int = 1,
 ) -> torch.Tensor:
-    """Generate RGB texture using iterative denoising.
-    
+    """Generate RGB texture using iterative denoising and optional recolor.
+
     Args:
         model: trained StyleAwareUNet
         content_rgb: [1, 3, H, W] or [3, H, W] vanilla content
@@ -291,10 +322,12 @@ def sample_rgb(
         support_content_refs: optional vanilla-side matches for each support
             reference, used for a deterministic structure-preserving recolor
             candidate.
+        recolor_model: optional trained RecolorNet for learned structure-preserving
+            color transfer.
         num_steps: number of denoising steps
         num_candidates: number of stochastic candidates to sample before
             choosing the support-most-consistent result
-    
+
     Returns:
         [3, H, W] generated RGB texture
     """
@@ -347,6 +380,10 @@ def sample_rgb(
 
     if recolor_candidate is not None:
         candidate_predictions.append(("support_recolor", recolor_candidate.cpu()))
+
+    if recolor_model is not None:
+        recolor_model_pred = recolor_model(content_rgb, style_refs, style_ref_mask=style_ref_mask)
+        candidate_predictions.append(("recolor_net", recolor_model_pred.squeeze(0).cpu()))
 
     for candidate_name, prediction in candidate_predictions:
         score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)

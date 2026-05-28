@@ -19,7 +19,13 @@ from spritecraft.config import (
     pack_pair_index_path,
 )
 from spritecraft.data.support_index import compute_texture_descriptor, rank_support_candidates
-from spritecraft.inference.sampler import compute_metrics, load_model, sample_rgb, save_prediction_bundle
+from spritecraft.inference.sampler import (
+    compute_metrics,
+    load_model,
+    load_recolor_model,
+    sample_rgb,
+    save_prediction_bundle,
+)
 
 
 def _normalize_texture_id(texture_id: str) -> str:
@@ -142,6 +148,9 @@ def run(
     
     try:
         model, checkpoint_path = load_model(checkpoint, pack_id)
+        recolor_model, recolor_checkpoint_path = load_recolor_model(checkpoint, pack_id)
+        if recolor_model is not None:
+            print(f"Loaded RecolorNet checkpoint: {recolor_checkpoint_path}")
         output_dir = Path(output_dir) / pack_id
         output_dir.mkdir(parents=True, exist_ok=True)
         content_descriptors = _build_content_descriptors(train_filenames, val_filenames, dataset)
@@ -201,6 +210,7 @@ def run(
                 support_rgb_tensor,
                 style_ref_mask=style_ref_mask,
                 support_content_refs=support_content_tensor,
+                recolor_model=recolor_model,
                 num_candidates=4,
             )
 
