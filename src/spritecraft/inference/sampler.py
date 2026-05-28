@@ -16,8 +16,8 @@ from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
 
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
-MIN_RECOLOR_SUPPORT_SCORE = 0.40
-RECOLOR_SUPPORT_MARGIN = 0.35
+MIN_RECOLOR_SUPPORT_SCORE = 0.30
+RECOLOR_SUPPORT_MARGIN = 0.50
 
 
 class PredictionBundleResult(TypedDict):
