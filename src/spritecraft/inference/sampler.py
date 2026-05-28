@@ -16,8 +16,9 @@ from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
 
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
-MIN_RECOLOR_SUPPORT_SCORE = 0.30
-RECOLOR_SUPPORT_MARGIN = 0.50
+MIN_RECOLOR_SUPPORT_SCORE = 0.40
+RECOLOR_SUPPORT_MARGIN = 0.25
+MIN_DIFFUSION_SCORE = 0.50
 
 
 class PredictionBundleResult(TypedDict):
@@ -357,6 +358,8 @@ def sample_rgb(
     )
     best_prediction: torch.Tensor | None = None
     best_score = float("-inf")
+    best_diffusion_score: float | None = None
+    best_diffusion_prediction: torch.Tensor | None = None
     recolor_score: float | None = None
     recolor_net_prediction: torch.Tensor | None = None
     recolor_net_score: float | None = None
@@ -390,6 +393,9 @@ def sample_rgb(
 
     for candidate_name, prediction in candidate_predictions:
         score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
+        if candidate_name == "diffusion" and (best_diffusion_score is None or score > best_diffusion_score):
+            best_diffusion_score = score
+            best_diffusion_prediction = prediction
         if candidate_name == "support_recolor":
             recolor_score = score
         if candidate_name == "recolor_net":
@@ -399,9 +405,15 @@ def sample_rgb(
             best_prediction = prediction
 
     assert best_prediction is not None
-    # Prefer structure-preserving candidates (recolor or RecolorNet) over
-    # noisy diffusion samples when they are plausible style matches. This keeps
-    # difficult near-zero-shot blocks usable with vanilla-like structure.
+    # Tiered selection: prefer diffusion when it's good enough, fall back
+    # to structure-preserving candidates only when diffusion is poor.
+    if (
+        best_diffusion_score is not None
+        and best_diffusion_score >= MIN_DIFFUSION_SCORE
+        and best_diffusion_prediction is not None
+    ):
+        return best_diffusion_prediction.cpu()
+
     if (
         recolor_net_prediction is not None
         and recolor_net_score is not None
