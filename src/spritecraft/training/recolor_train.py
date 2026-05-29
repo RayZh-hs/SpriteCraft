@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from spritecraft.config import (
@@ -30,6 +30,11 @@ LOSS_COMPONENT_NAMES = (
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
+
+# Warmup steps as fraction of total training
+WARMUP_FRACTION = 0.05
+# EMA decay rate
+EMA_DECAY = 0.995
 
 
 def _select_device() -> torch.device:
@@ -59,20 +64,21 @@ def _save_checkpoint(
     checkpoint_path: Path,
     model: RecolorNet,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: SequentialLR | CosineAnnealingLR,
     step: int,
     target_steps: int,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "step": step,
-            "target_steps": target_steps,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        },
-        checkpoint_path,
-    )
+    checkpoint_data: dict[str, Any] = {
+        "step": step,
+        "target_steps": target_steps,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }
+    if ema_state_dict is not None:
+        checkpoint_data["ema_state_dict"] = ema_state_dict
+    torch.save(checkpoint_data, checkpoint_path)
 
 
 def _move_optimizer_state(optimizer: AdamW, device: torch.device) -> None:
@@ -86,12 +92,12 @@ def _maybe_load_checkpoint(
     checkpoint_path: Path,
     model: RecolorNet,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: SequentialLR | CosineAnnealingLR,
     device: torch.device,
     target_steps: int,
-) -> int:
+) -> tuple[int, dict[str, torch.Tensor] | None]:
     if not checkpoint_path.exists():
-        return 0
+        return 0, None
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     try:
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -103,7 +109,32 @@ def _maybe_load_checkpoint(
     _move_optimizer_state(optimizer, device)
     if checkpoint.get("target_steps") == target_steps:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    return int(checkpoint.get("step", 0))
+    ema_state_dict = checkpoint.get("ema_state_dict", None)
+    return int(checkpoint.get("step", 0)), ema_state_dict
+
+
+def _update_ema(
+    ema_state_dict: dict[str, torch.Tensor],
+    model: RecolorNet,
+    decay: float,
+) -> dict[str, torch.Tensor]:
+    """Update exponential moving average of model parameters."""
+    if not ema_state_dict:
+        ema_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    else:
+        for key in ema_state_dict:
+            ema_state_dict[key] = (
+                decay * ema_state_dict[key] + (1 - decay) * model.state_dict()[key].detach()
+            )
+    return ema_state_dict
+
+
+def _apply_ema_weights(model: RecolorNet, ema_state_dict: dict[str, torch.Tensor]) -> None:
+    model.load_state_dict(ema_state_dict)
+
+
+def _restore_training_weights(model: RecolorNet, training_state_dict: dict[str, torch.Tensor]) -> None:
+    model.load_state_dict(training_state_dict)
 
 
 def train_recolor_pack(
@@ -161,10 +192,13 @@ def train_recolor_pack(
     )
 
     optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(steps, 1), eta_min=1e-6)
+    warmup_steps = max(1, int(steps * WARMUP_FRACTION))
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(steps - warmup_steps, 1), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
     checkpoint_path = _latest_checkpoint_path(pack_checkpoint)
-    start_step = _maybe_load_checkpoint(checkpoint_path, model, optimizer, scheduler, device, steps)
+    start_step, ema_state_dict = _maybe_load_checkpoint(checkpoint_path, model, optimizer, scheduler, device, steps)
 
     metrics_path = _metrics_history_path(pack_checkpoint)
 
@@ -198,6 +232,9 @@ def train_recolor_pack(
         optimizer.step()
         scheduler.step()
 
+        # Update EMA after optimizer step
+        ema_state_dict = _update_ema(ema_state_dict or {}, model, EMA_DECAY)
+
         current_step = step + 1
         lr = float(scheduler.get_last_lr()[0])
 
@@ -212,10 +249,10 @@ def train_recolor_pack(
             )
 
         if current_step % save_interval == 0 or current_step == steps:
-            _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
+            _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps, ema_state_dict)
 
         if current_step % validation_interval == 0 or current_step == steps:
-            _run_recolor_validation(model, val_dataset, pack_checkpoint, current_step, device)
+            _run_recolor_validation(model, val_dataset, pack_checkpoint, current_step, device, ema_state_dict)
 
     return checkpoint_path
 
@@ -227,8 +264,15 @@ def _run_recolor_validation(
     checkpoint_dir: Path,
     step: int,
     device: torch.device,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> None:
     model.eval()
+    
+    training_state_dict = None
+    if ema_state_dict:
+        training_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+        _apply_ema_weights(model, ema_state_dict)
+    
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
 
     preview_dir = checkpoint_dir / "validation_recolor" / f"step_{step:06d}"
@@ -253,6 +297,8 @@ def _run_recolor_validation(
         canvas.paste(Image.fromarray(target_np), (IMAGE_SIZE * 2, 0))
         canvas.save(preview_dir / filename)
 
+    if training_state_dict is not None:
+        _restore_training_weights(model, training_state_dict)
     model.train()
 
 

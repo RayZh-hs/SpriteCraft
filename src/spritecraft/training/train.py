@@ -2,6 +2,7 @@
 
 import csv
 from contextlib import nullcontext
+import copy
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -12,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
 
 from spritecraft.config import (
@@ -62,6 +63,14 @@ VAL_SCALAR_NAMES = (
 )
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
+
+# Warmup steps as fraction of total training
+WARMUP_FRACTION = 0.05
+# Content loss ramp: start at this fraction, reach full weight at this step fraction
+CONTENT_LOSS_RAMP_START = 0.1
+CONTENT_LOSS_RAMP_END = 0.2  # reach full weight by 20% of training
+# EMA decay rate
+EMA_DECAY = 0.995
 
 
 def _stable_validation_seed(filename: str) -> int:
@@ -193,20 +202,21 @@ def _save_checkpoint(
     checkpoint_path: Path,
     model: StyleAwareUNet,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: SequentialLR | CosineAnnealingLR,
     step: int,
     target_steps: int,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> None:
-    torch.save(
-        {
-            "step": step,
-            "target_steps": target_steps,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-        },
-        checkpoint_path,
-    )
+    checkpoint_data: dict[str, Any] = {
+        "step": step,
+        "target_steps": target_steps,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+    }
+    if ema_state_dict is not None:
+        checkpoint_data["ema_state_dict"] = ema_state_dict
+    torch.save(checkpoint_data, checkpoint_path)
 
 
 def _move_optimizer_state(optimizer: AdamW, device: torch.device) -> None:
@@ -220,12 +230,12 @@ def _maybe_load_checkpoint(
     checkpoint_path: Path,
     model: StyleAwareUNet,
     optimizer: AdamW,
-    scheduler: CosineAnnealingLR,
+    scheduler: SequentialLR | CosineAnnealingLR,
     device: torch.device,
     target_steps: int,
-) -> int:
+) -> tuple[int, dict[str, torch.Tensor] | None]:
     if not checkpoint_path.exists():
-        return 0
+        return 0, None
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     try:
@@ -239,7 +249,8 @@ def _maybe_load_checkpoint(
     _move_optimizer_state(optimizer, device)
     if checkpoint.get("target_steps") == target_steps:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-    return int(checkpoint.get("step", 0))
+    ema_state_dict = checkpoint.get("ema_state_dict", None)
+    return int(checkpoint.get("step", 0)), ema_state_dict
 
 
 def _make_grad_scaler(device: torch.device) -> torch.amp.GradScaler | torch.cuda.amp.GradScaler:
@@ -274,12 +285,50 @@ def _rgb_channel_gradient_loss(pred_rgb: torch.Tensor, target_rgb: torch.Tensor)
     return total / 3.0
 
 
+def _update_ema(
+    ema_state_dict: dict[str, torch.Tensor],
+    model: StyleAwareUNet,
+    decay: float,
+) -> dict[str, torch.Tensor]:
+    """Update exponential moving average of model parameters."""
+    if not ema_state_dict:
+        ema_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    else:
+        for key in ema_state_dict:
+            ema_state_dict[key] = decay * ema_state_dict[key] + (1 - decay) * model.state_dict()[key].detach()
+    return ema_state_dict
+
+
+def _apply_ema_weights(model: StyleAwareUNet, ema_state_dict: dict[str, torch.Tensor]) -> None:
+    """Temporarily swap model weights with EMA weights for validation."""
+    model.load_state_dict(ema_state_dict)
+
+
+def _restore_training_weights(model: StyleAwareUNet, training_state_dict: dict[str, torch.Tensor]) -> None:
+    """Restore training weights after EMA validation."""
+    model.load_state_dict(training_state_dict)
+
+
+def _content_loss_weight_for_step(step: int, total_steps: int) -> float:
+    """Ramp content loss weight from 0.10 to 0.30 over the first CONTENT_LOSS_RAMP_END fraction."""
+    ramp_start = int(total_steps * CONTENT_LOSS_RAMP_START)
+    ramp_end = int(total_steps * CONTENT_LOSS_RAMP_END)
+    if step < ramp_start:
+        return 0.10
+    elif step >= ramp_end:
+        return 0.30
+    else:
+        progress = (step - ramp_start) / max(ramp_end - ramp_start, 1)
+        return 0.10 + (0.30 - 0.10) * progress
+
+
 def _compute_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
     pred_x0: torch.Tensor,
     content_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
+    content_loss_weight: float = 0.30,
 ) -> dict[str, torch.Tensor]:
     """Balance diffusion correctness with explicit edge and color preservation."""
     noise_loss = F.mse_loss(pred_noise, true_noise)
@@ -290,7 +339,7 @@ def _compute_loss(
     channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
     gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
     components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
-    total_loss = noise_loss + 0.70 * recon_loss + 0.30 * gradient_loss + 0.30 * components["content_loss"]
+    total_loss = noise_loss + 0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * components["content_loss"]
     return {
         "loss": total_loss,
         "noise_loss": noise_loss,
@@ -441,10 +490,13 @@ def train_pack(
     ).to(device)
     
     optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
-    scheduler = CosineAnnealingLR(optimizer, T_max=max(steps, 1), eta_min=1e-6)
+    warmup_steps = max(1, int(steps * WARMUP_FRACTION))
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(steps - warmup_steps, 1), eta_min=1e-6)
+    scheduler = SequentialLR(optimizer, [warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
     
     checkpoint_path = _latest_checkpoint_path(pack_checkpoint)
-    start_step = _maybe_load_checkpoint(checkpoint_path, model, optimizer, scheduler, device, steps)
+    start_step, ema_state_dict = _maybe_load_checkpoint(checkpoint_path, model, optimizer, scheduler, device, steps)
     
     metrics_path = _metrics_history_path(pack_checkpoint)
     metric_history = _load_metric_history(metrics_path, max_step=start_step)
@@ -488,6 +540,9 @@ def train_pack(
         optimizer.zero_grad(set_to_none=True)
         scalar_totals = _init_scalar_totals(LOSS_COMPONENT_NAMES + ("loss",))
 
+        current_step = step + 1
+        content_loss_weight = _content_loss_weight_for_step(step, steps)
+
         for _accum_idx in range(grad_accum_steps):
             try:
                 batch = next(train_iter)
@@ -513,7 +568,10 @@ def train_pack(
                     0.0,
                     1.0,
                 )
-                loss_components = _compute_loss(pred_noise, true_noise, pred_x0, content_rgb, target_rgb)
+                loss_components = _compute_loss(
+                    pred_noise, true_noise, pred_x0, content_rgb, target_rgb,
+                    content_loss_weight=content_loss_weight,
+                )
                 loss = loss_components["loss"] / grad_accum_steps
 
             if scaler.is_enabled():
@@ -533,7 +591,9 @@ def train_pack(
             optimizer.step()
         scheduler.step()
 
-        current_step = step + 1
+        # Update EMA after optimizer step
+        ema_state_dict = _update_ema(ema_state_dict or {}, model, EMA_DECAY)
+
         averaged_scalars = _average_scalar_totals(scalar_totals, grad_accum_steps)
         average_loss = averaged_scalars["loss"]
         lr = float(scheduler.get_last_lr()[0])
@@ -573,14 +633,17 @@ def train_pack(
             if pending_metric_history:
                 _append_metric_history(metrics_path, pending_metric_history)
                 pending_metric_history.clear()
-            _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps)
+            _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps, ema_state_dict)
             step_checkpoint = pack_checkpoint / f"step_{current_step:06d}.pt"
-            _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps)
+            _save_checkpoint(step_checkpoint, model, optimizer, scheduler, current_step, steps, ema_state_dict)
             last_saved_step = current_step
 
         if current_step % validation_interval == 0 or current_step == steps:
             if len(val_dataset) > 0:
-                preview_dir = _run_validation(model, val_dataset, pack_checkpoint, current_step, device, writer)
+                preview_dir = _run_validation(
+                    model, val_dataset, pack_checkpoint, current_step, device, writer,
+                    ema_state_dict=ema_state_dict,
+                )
                 if preview_dir is not None:
                     last_preview_dir = preview_dir
                     last_validation_step = current_step
@@ -624,6 +687,10 @@ def train_pack(
     if writer is not None:
         writer.close()
     
+    # Restore training weights after validation
+    if training_state_dict is not None:
+        _restore_training_weights(model, training_state_dict)
+    
     return checkpoint_path
 
 
@@ -635,9 +702,17 @@ def _run_validation(
     step: int,
     device: torch.device,
     writer: Any = None,
+    ema_state_dict: dict[str, torch.Tensor] | None = None,
 ) -> Path | None:
     """Run validation and save preview images."""
     model.eval()
+    
+    # Use EMA weights for validation if available
+    training_state_dict = None
+    if ema_state_dict:
+        training_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
+        _apply_ema_weights(model, ema_state_dict)
+    
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
     
     preview_dir = checkpoint_dir / "validation" / f"step_{step:06d}"
@@ -744,6 +819,10 @@ def _run_validation(
             from spritecraft.inference.evaluate import _tile_images
             tiled_debug = _tile_images(debug_images, columns=1)
             writer.add_image("validation/debug", np.array(tiled_debug), step, dataformats="HWC")
+    
+    # Restore training weights before returning to training mode
+    if training_state_dict is not None:
+        _restore_training_weights(model, training_state_dict)
     
     model.train()
     return preview_dir

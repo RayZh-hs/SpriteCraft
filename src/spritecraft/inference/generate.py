@@ -19,6 +19,7 @@ from spritecraft.config import (
     pack_pair_index_path,
 )
 from spritecraft.data.support_index import compute_texture_descriptor, rank_support_candidates
+from spritecraft.data.texture_classifier import classify_texture_complexity
 from spritecraft.inference.sampler import (
     compute_metrics,
     load_model,
@@ -204,7 +205,11 @@ def run(
             style_ref_mask = torch.ones(len(support_rgb_list), dtype=torch.bool)
             
             # Generate
-            prediction = sample_rgb(
+            content_image = (content_rgb.permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+            classifier_result = classify_texture_complexity(content_image, filename)
+            routing_hint = "diffusion" if classifier_result["use_diffusion"] else "recolor"
+
+            prediction, model_source, model_score = sample_rgb(
                 model,
                 content_rgb,
                 support_rgb_tensor,
@@ -212,6 +217,8 @@ def run(
                 support_content_refs=support_content_tensor,
                 recolor_model=recolor_model,
                 num_candidates=4,
+                routing_hint=routing_hint,
+                return_source=True,
             )
 
             # Compute metrics if target is available
@@ -241,12 +248,20 @@ def run(
                     "support_filenames": support_filenames,
                     "checkpoint_path": str(Path(checkpoint_path).resolve()),
                     "target_available": True,
+                    "classifier_verdict": routing_hint,
+                    "classifier_score": classifier_result["diffusion_score"],
+                    "classifier_label": classifier_result["complexity_label"],
+                    "classifier_entropy": classifier_result["entropy"],
                 },
                 extra_metrics=extra_metrics,
+                model_source=model_source,
+                model_score=model_score,
             )
             results.append((filename, result))
 
             print(f"Generated {filename} -> {result['produced_path']}")
+            print(f"  classifier: {classifier_result['complexity_label']} (score={classifier_result['diffusion_score']:.3f}) "
+                  f"-> routed as {routing_hint} | selected: {model_source} (score={model_score:.3f})")
             metrics = result["metrics"]
             if isinstance(metrics, dict) and "mae" in metrics:
                 print(f"  mae={metrics['mae']:.4f} pixel_accuracy={metrics['pixel_accuracy']:.4f}")

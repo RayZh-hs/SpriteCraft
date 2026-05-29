@@ -9,12 +9,13 @@ STRUCTURE_LOSS_WEIGHT = 1.0
 CONTRAST_LOSS_WEIGHT = 2.5
 HUE_LOSS_WEIGHT = 3.0
 COLOR_MOMENT_WEIGHT = 1.5
-CONTRAST_GATE_GAMMA = 2.0
+CONTRAST_GATE_GAMMA = 1.5  # Softer gate than 2.0; still focuses on detail but less aggressively
 HUE_GATE_GAMMA = 0.7
-DETAIL_EMPHASIS_SCALE = 1.5
+DETAIL_EMPHASIS_SCALE = 2.0  # Increased from 1.5 to better penalize complex texture regions
 DETAIL_TOP_FRACTION = 0.125
 LAPLACIAN_STRUCTURE_WEIGHT = 0.75
 EDGE_SHORTFALL_WEIGHT = 0.6
+GATE_FLOOR = 0.05  # Minimum gate value so all regions contribute some gradient
 
 
 def _luminance(rgb: torch.Tensor) -> torch.Tensor:
@@ -188,7 +189,7 @@ def _build_content_state(
     # target regions are effectively ignored. A squared gate focuses the penalty
     # on the highest-detail target regions instead of spreading it evenly.
     max_target_std = target_std.amax(dim=(2, 3), keepdim=True).clamp_min(1e-4)
-    gate = (target_std / max_target_std).clamp(0.0, 1.0).pow(CONTRAST_GATE_GAMMA)
+    gate = (target_std / max_target_std).clamp(GATE_FLOOR, 1.0).pow(CONTRAST_GATE_GAMMA)
     detail_emphasis = _detail_emphasis(target_std)
 
     # Only penalize under-contrast. Over-sharpening is already constrained by

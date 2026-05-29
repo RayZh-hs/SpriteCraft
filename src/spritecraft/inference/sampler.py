@@ -20,6 +20,11 @@ MIN_RECOLOR_SUPPORT_SCORE = 0.40
 RECOLOR_SUPPORT_MARGIN = 0.25
 MIN_DIFFUSION_SCORE = 0.50
 
+# How many diffusion samples to run when diffusion is explicitly requested
+DIFFUSION_CANDIDATE_COUNT = 4
+# How many diffusion samples to run when classifier is unsure (moderate complexity)
+MODERATE_CANDIDATE_COUNT = 2
+
 
 class PredictionBundleResult(TypedDict):
     bundle_dir: Path
@@ -29,6 +34,8 @@ class PredictionBundleResult(TypedDict):
     truth_path: Path | None
     comparison_path: Path
     metrics: dict[str, float | int | bool] | None
+    model_source: str
+    model_score: float
 
 
 def _select_device() -> torch.device:
@@ -313,7 +320,9 @@ def sample_rgb(
     recolor_model: RecolorNet | None = None,
     num_steps: int = NUM_TIMESTEPS,
     num_candidates: int = 1,
-) -> torch.Tensor:
+    routing_hint: str = "auto",
+    return_source: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, str, float]:
     """Generate RGB texture using iterative denoising and optional recolor.
 
     Args:
@@ -328,9 +337,12 @@ def sample_rgb(
         num_steps: number of denoising steps
         num_candidates: number of stochastic candidates to sample before
             choosing the support-most-consistent result
+        routing_hint: "diffusion", "recolor", or "auto" — classifier-guided
+            model selection. "recolor" skips expensive diffusion sampling.
+        return_source: if True, return (prediction, model_source, score)
 
     Returns:
-        [3, H, W] generated RGB texture
+        [3, H, W] generated RGB texture, or (prediction, model_source, score)
     """
     if content_rgb.dim() == 3:
         content_rgb = content_rgb.unsqueeze(0)
@@ -349,7 +361,17 @@ def sample_rgb(
     if support_content_refs is not None:
         support_content_refs = support_content_refs.to(device)
 
-    candidate_count = max(1, num_candidates)
+    # Determine effective candidate count based on routing hint
+    force_recolor = routing_hint == "recolor"
+    force_diffusion = routing_hint == "diffusion"
+
+    if force_recolor:
+        effective_diffusion_candidates = 0
+    elif force_diffusion:
+        effective_diffusion_candidates = max(1, num_candidates)
+    else:
+        effective_diffusion_candidates = max(1, num_candidates)
+
     recolor_candidate = _support_pair_recolor(
         content_rgb,
         style_refs,
@@ -365,7 +387,7 @@ def sample_rgb(
     recolor_net_score: float | None = None
     candidate_predictions: list[tuple[str, torch.Tensor]] = []
 
-    for _ in range(candidate_count):
+    for _ in range(effective_diffusion_candidates):
         prediction = _sample_once(
             model,
             content_rgb,
@@ -405,32 +427,60 @@ def sample_rgb(
             best_prediction = prediction
 
     assert best_prediction is not None
-    # Tiered selection: prefer diffusion when it's good enough, fall back
-    # to structure-preserving candidates only when diffusion is poor.
-    if (
+    chosen_source = "unknown"
+    chosen_score = best_score
+
+    # Tiered selection with routing hint awareness
+    if force_diffusion and best_diffusion_prediction is not None:
+        chosen_source = "diffusion"
+        chosen_score = best_diffusion_score if best_diffusion_score is not None else best_score
+        result = best_diffusion_prediction.cpu()
+    elif force_recolor:
+        if recolor_net_prediction is not None:
+            chosen_source = "recolor_net"
+            chosen_score = recolor_net_score if recolor_net_score is not None else best_score
+            result = recolor_net_prediction
+        elif recolor_candidate is not None:
+            chosen_source = "support_recolor"
+            chosen_score = recolor_score if recolor_score is not None else best_score
+            result = recolor_candidate.cpu()
+        else:
+            chosen_source = "best_fallback"
+            result = best_prediction
+    elif (
         best_diffusion_score is not None
         and best_diffusion_score >= MIN_DIFFUSION_SCORE
         and best_diffusion_prediction is not None
     ):
-        return best_diffusion_prediction.cpu()
-
-    if (
+        chosen_source = "diffusion"
+        chosen_score = best_diffusion_score
+        result = best_diffusion_prediction.cpu()
+    elif (
         recolor_net_prediction is not None
         and recolor_net_score is not None
         and recolor_net_score >= MIN_RECOLOR_SUPPORT_SCORE
         and recolor_net_score >= best_score - RECOLOR_SUPPORT_MARGIN
     ):
-        return recolor_net_prediction
-
-    if (
+        chosen_source = "recolor_net"
+        chosen_score = recolor_net_score
+        result = recolor_net_prediction
+    elif (
         recolor_candidate is not None
         and recolor_score is not None
         and recolor_score >= MIN_RECOLOR_SUPPORT_SCORE
         and recolor_score >= best_score - RECOLOR_SUPPORT_MARGIN
     ):
-        return recolor_candidate.cpu()
+        chosen_source = "support_recolor"
+        chosen_score = recolor_score
+        result = recolor_candidate.cpu()
+    else:
+        chosen_source = "best_overall"
+        chosen_score = best_score
+        result = best_prediction
 
-    return best_prediction
+    if return_source:
+        return result, chosen_source, chosen_score
+    return result
 
 
 def compute_metrics(prediction: torch.Tensor, truth: torch.Tensor) -> dict[str, float | int | bool]:
@@ -497,6 +547,8 @@ def save_prediction_bundle(
     truth_size: int | None = None,
     metadata: dict[str, str | int | float | bool | list[str]] | None = None,
     extra_metrics: dict[str, float | int | bool] | None = None,
+    model_source: str = "unknown",
+    model_score: float = 0.0,
 ) -> PredictionBundleResult:
     """Write a full sample/evaluation bundle to disk."""
     bundle_dir = Path(output_dir) / bundle_name
@@ -547,13 +599,19 @@ def save_prediction_bundle(
         metrics.update(extra_metrics)
 
     if metrics is not None:
+        metrics["model_source"] = model_source
+        metrics["model_score"] = model_score
         with open(bundle_dir / "metrics.json", "w", encoding="utf-8") as metrics_file:
             json.dump(metrics, metrics_file, indent=2)
 
     comparison_path = bundle_dir / "comparison.png"
+    # Annotate comparison with model source
+    comparison_labels[1] = f"generated [{model_source}]"
     _comparison_canvas(comparison_images, labels=comparison_labels).save(comparison_path)
 
     if metadata is not None:
+        metadata["model_source"] = model_source
+        metadata["model_score"] = model_score
         with open(bundle_dir / "metadata.json", "w", encoding="utf-8") as metadata_file:
             json.dump(metadata, metadata_file, indent=2)
 
@@ -565,4 +623,6 @@ def save_prediction_bundle(
         "truth_path": truth_path,
         "comparison_path": comparison_path,
         "metrics": metrics,
+        "model_source": model_source,
+        "model_score": model_score,
     }
