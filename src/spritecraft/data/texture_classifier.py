@@ -176,7 +176,10 @@ def classify_texture_complexity(
 
     # Additional filename heuristics
     if "stained" in family_name or "glass" in family_name:
+        # Stained glass and variants are hard for diffusion
         family_bonus -= 0.10
+    if "daylight" in family_name or "detector" in family_name:
+        family_bonus -= 0.15
     if "daylight" in family_name or "detector" in family_name:
         family_bonus -= 0.10
 
