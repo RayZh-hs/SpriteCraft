@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -30,6 +31,7 @@ LOSS_COMPONENT_NAMES = (
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
+TENSORBOARD_DIRNAME = "tensorboard"
 
 # Warmup steps as fraction of total training
 WARMUP_FRACTION = 0.05
@@ -125,10 +127,10 @@ def _update_ema(
     if not ema_state_dict:
         ema_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
     else:
+        model_sd = model.state_dict()
         for key in ema_state_dict:
-            model_param = model.state_dict()[key].detach()
             ema_state_dict[key] = (
-                decay * ema_state_dict[key].to(device) + (1 - decay) * model_param
+                decay * ema_state_dict[key].to(device) + (1 - decay) * model_sd[key].detach()
             )
     return ema_state_dict
 
@@ -139,6 +141,10 @@ def _apply_ema_weights(model: RecolorNet, ema_state_dict: dict[str, torch.Tensor
 
 def _restore_training_weights(model: RecolorNet, training_state_dict: dict[str, torch.Tensor]) -> None:
     model.load_state_dict(training_state_dict)
+
+
+def _tensorboard_log_dir(checkpoint_dir: Path, pack_id: str) -> Path:
+    return checkpoint_dir / TENSORBOARD_DIRNAME / pack_id
 
 
 def train_recolor_pack(
@@ -213,6 +219,13 @@ def train_recolor_pack(
     print(f"[Recolor:{pack_id}] Training on {len(train_dataset)} samples, {len(val_dataset)} val samples")
     print(f"[Recolor:{pack_id}] Device: {device}, Batch: {batch_size}, Steps: {steps}")
 
+    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir, pack_id) / "recolor"
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(log_dir=str(tensorboard_dir))
+    except ModuleNotFoundError:
+        writer = None
+
     model.train()
     for step in range(start_step, steps):
         optimizer.zero_grad(set_to_none=True)
@@ -242,6 +255,13 @@ def train_recolor_pack(
         current_step = step + 1
         lr = float(scheduler.get_last_lr()[0])
 
+        if writer is not None:
+            scalars = {k: float(v.item()) for k, v in loss_dict.items()}
+            writer.add_scalar("training/0_summary/loss", scalars["loss"], current_step)
+            writer.add_scalar("training/0_summary/learning_rate", lr, current_step)
+            for name in LOSS_COMPONENT_NAMES:
+                writer.add_scalar(f"training/1_details/{name}", scalars[name], current_step)
+
         if current_step == 1 or current_step % 50 == 0 or current_step == steps:
             scalars = {k: float(v.item()) for k, v in loss_dict.items()}
             print(
@@ -256,7 +276,10 @@ def train_recolor_pack(
             _save_checkpoint(checkpoint_path, model, optimizer, scheduler, current_step, steps, ema_state_dict)
 
         if current_step % validation_interval == 0 or current_step == steps:
-            _run_recolor_validation(model, val_dataset, pack_checkpoint, current_step, device, ema_state_dict)
+            _run_recolor_validation(model, val_dataset, pack_checkpoint, current_step, device, ema_state_dict, writer)
+
+    if writer is not None:
+        writer.close()
 
     return checkpoint_path
 
@@ -269,18 +292,30 @@ def _run_recolor_validation(
     step: int,
     device: torch.device,
     ema_state_dict: dict[str, torch.Tensor] | None = None,
+    writer: Any = None,
 ) -> None:
     model.eval()
-    
+
     training_state_dict = None
     if ema_state_dict:
         training_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
         _apply_ema_weights(model, ema_state_dict)
-    
+
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
 
     preview_dir = checkpoint_dir / "validation_recolor" / f"step_{step:06d}"
     preview_dir.mkdir(parents=True, exist_ok=True)
+
+    criterion = RecolorLoss(
+        recon_weight=1.0,
+        edge_weight=0.5,
+        color_weight=1.5,
+        content_identity_weight=0.05,
+    )
+
+    scalar_totals = {name: 0.0 for name in LOSS_COMPONENT_NAMES + ("loss",)}
+    count = 0
+    comparison_images: list[Image.Image] = []
 
     for batch in val_loader:
         content_rgb = batch["content_rgb"].to(device)
@@ -290,6 +325,11 @@ def _run_recolor_validation(
         filename = batch["filename"][0]
 
         pred = model(content_rgb, style_refs, style_ref_mask=style_ref_mask)
+        loss_dict = criterion(pred, content_rgb, target_rgb)
+
+        for name in scalar_totals:
+            scalar_totals[name] += float(loss_dict[name].item())
+        count += 1
 
         content_np = (content_rgb[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
         target_np = (target_rgb[0].permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
@@ -300,6 +340,21 @@ def _run_recolor_validation(
         canvas.paste(Image.fromarray(pred_np), (IMAGE_SIZE, 0))
         canvas.paste(Image.fromarray(target_np), (IMAGE_SIZE * 2, 0))
         canvas.save(preview_dir / filename)
+        comparison_images.append(canvas)
+
+    if count > 0:
+        averaged = {k: v / count for k, v in scalar_totals.items()}
+        print(f"[Recolor:{val_dataset.pack_id}] Validation step={step} loss={averaged['loss']:.4f}")
+
+    if writer is not None:
+        if count > 0:
+            writer.add_scalar("validation/0_summary/loss", averaged["loss"], step)
+            for name in LOSS_COMPONENT_NAMES:
+                writer.add_scalar(f"validation/1_details/{name}", averaged[name], step)
+        if comparison_images:
+            from spritecraft.inference.evaluate import _tile_images
+            tiled = _tile_images(comparison_images, columns=2)
+            writer.add_image("validation/0_summary/recolor", np.array(tiled), step, dataformats="HWC")
 
     if training_state_dict is not None:
         _restore_training_weights(model, training_state_dict)

@@ -2,7 +2,6 @@
 
 import csv
 from contextlib import nullcontext
-import copy
 import os
 from pathlib import Path
 from typing import Any, cast
@@ -18,7 +17,6 @@ from torch.utils.data import DataLoader
 
 from spritecraft.config import (
     CHECKPOINTS_DIR,
-    IMAGE_SIZE,
     MAX_SUPPORT_EXEMPLARS,
     MIN_SUPPORT_EXEMPLARS,
     NUM_TIMESTEPS,
@@ -30,10 +28,11 @@ from spritecraft.debug.utility import (
     utcnow_iso,
     write_json_atomic,
 )
-from spritecraft.inference.sampler import sample_rgb
+from spritecraft.inference.sampler import _sample_once, load_recolor_model, sample_rgb
 from spritecraft.models.diffusion import add_noise, get_alpha_schedule, get_beta_schedule, predict_x0_from_noise
+from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
-from spritecraft.training.content_loss import rgb_content_diagnostic_maps, rgb_content_loss_components
+from spritecraft.training.content_loss import rgb_content_loss_components
 
 MetricRecord = dict[str, Any]
 LOSS_COMPONENT_NAMES = (
@@ -297,9 +296,9 @@ def _update_ema(
     if not ema_state_dict:
         ema_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
     else:
+        model_sd = model.state_dict()
         for key in ema_state_dict:
-            model_param = model.state_dict()[key].detach()
-            ema_state_dict[key] = decay * ema_state_dict[key].to(device) + (1 - decay) * model_param
+            ema_state_dict[key] = decay * ema_state_dict[key].to(device) + (1 - decay) * model_sd[key].detach()
     return ema_state_dict
 
 
@@ -363,72 +362,50 @@ def _average_scalar_totals(totals: dict[str, float], divisor: float) -> dict[str
     return {name: value / divisor for name, value in totals.items()}
 
 
-def _normalize_map_to_rgb(map_tensor: torch.Tensor) -> Image.Image:
-    """Render a single-channel tensor as a grayscale RGB image."""
-    if map_tensor.dim() == 3:
-        map_tensor = map_tensor[0]
-    array = map_tensor.detach().cpu().float().numpy()
-    array = array - float(array.min())
-    max_value = float(array.max())
-    if max_value > 0:
-        array = array / max_value
-    image = (array * 255.0).clip(0, 255).astype(np.uint8)
-    return Image.fromarray(image, mode="L").convert("RGB")
-
-
-def _make_labeled_tile(label: str, image: Image.Image, label_height: int = 10) -> Image.Image:
-    tile = Image.new("RGB", (image.width, image.height + label_height), color=(255, 255, 255))
-    tile.paste(image, (0, label_height))
-    draw = ImageDraw.Draw(tile)
-    draw.text((1, 0), label, fill=(0, 0, 0))
-    return tile
-
-
-def _build_diagnostic_panel(
+def _build_output_panel(
     content_rgb: torch.Tensor,
-    pred_rgb: torch.Tensor,
+    output_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
+    label: str,
+    border_color: tuple[int, int, int] | None = None,
 ) -> Image.Image:
-    """Create a compact panel that exposes why the content loss is active."""
-    diagnostics = rgb_content_diagnostic_maps(
-        pred_rgb.unsqueeze(0),
-        content_rgb.unsqueeze(0),
-        target_rgb.unsqueeze(0),
-    )
+    def _to_img(t: torch.Tensor) -> Image.Image:
+        arr = (t.detach().cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+        if arr.ndim == 3 and arr.shape[0] == 3:
+            arr = arr.transpose(1, 2, 0)
+        return Image.fromarray(arr)
 
-    def rgb_tile(label: str, rgb_tensor: torch.Tensor) -> Image.Image:
-        rgb_np = (rgb_tensor.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        return _make_labeled_tile(label, Image.fromarray(rgb_np))
+    content_img = _to_img(content_rgb)
+    output_img = _to_img(output_rgb)
+    target_img = _to_img(target_rgb)
 
-    map_tiles = [
-        _make_labeled_tile("pred_std", _normalize_map_to_rgb(diagnostics["pred_local_std"][0])),
-        _make_labeled_tile("target_std", _normalize_map_to_rgb(diagnostics["target_local_std"][0])),
-        _make_labeled_tile("under_ctr", _normalize_map_to_rgb(diagnostics["weighted_under_contrast"][0])),
-        _make_labeled_tile("hue_gap", _normalize_map_to_rgb(diagnostics["hue_gap"][0])),
-        _make_labeled_tile("edge_short", _normalize_map_to_rgb(diagnostics["weighted_edge_shortfall"][0])),
-        _make_labeled_tile("pred_det", _normalize_map_to_rgb(diagnostics["pred_detail_delta"][0])),
-        _make_labeled_tile("target_det", _normalize_map_to_rgb(diagnostics["target_detail_delta"][0])),
-        _make_labeled_tile("detail_gap", _normalize_map_to_rgb(diagnostics["detail_delta_gap"][0])),
-        _make_labeled_tile("lap_gap", _normalize_map_to_rgb(diagnostics["laplacian_delta_gap"][0])),
-        _make_labeled_tile("pred_grad", _normalize_map_to_rgb(diagnostics["pred_grad_delta_mag"][0])),
-        _make_labeled_tile("target_grad", _normalize_map_to_rgb(diagnostics["target_grad_delta_mag"][0])),
-        _make_labeled_tile("grad_gap", _normalize_map_to_rgb(diagnostics["grad_delta_gap"][0])),
-    ]
-    rgb_tiles = [
-        rgb_tile("content", content_rgb),
-        rgb_tile("pred", pred_rgb),
-        rgb_tile("target", target_rgb),
-    ]
-    all_tiles = rgb_tiles + map_tiles
-    columns = 3
-    tile_width = all_tiles[0].width
-    tile_height = all_tiles[0].height
-    rows = (len(all_tiles) + columns - 1) // columns
-    canvas = Image.new("RGB", (tile_width * columns, tile_height * rows), color=(255, 255, 255))
-    for index, tile in enumerate(all_tiles):
-        x = (index % columns) * tile_width
-        y = (index // columns) * tile_height
-        canvas.paste(tile, (x, y))
+    label_height = 12
+    gap = 2
+    img_size = content_img.width
+    canvas_w = 3 * img_size + 2 * gap
+    canvas_h = img_size + label_height
+    canvas = Image.new("RGB", (canvas_w, canvas_h), color=(255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+
+    draw.text((1, 0), "content", fill=(0, 0, 0))
+    canvas.paste(content_img, (0, label_height))
+
+    x_out = img_size + gap
+    draw.text((x_out + 1, 0), label, fill=(0, 0, 0))
+    canvas.paste(output_img, (x_out, label_height))
+
+    x_target = 2 * (img_size + gap)
+    draw.text((x_target + 1, 0), "target", fill=(0, 0, 0))
+    canvas.paste(target_img, (x_target, label_height))
+
+    if border_color is not None:
+        for b in range(3):
+            draw.rectangle(
+                [(x_out - b, label_height - b),
+                 (x_out + img_size - 1 + b, label_height + img_size - 1 + b)],
+                outline=border_color,
+            )
+
     return canvas
 
 
@@ -437,6 +414,7 @@ def train_pack(
     checkpoint_dir: Path,
     steps: int = 10_000,
     device: torch.device | None = None,
+    recolor_checkpoint_dir: Path | None = None,
 ) -> Path:
     """Train a single per-pack model."""
     if device is None:
@@ -515,7 +493,7 @@ def train_pack(
     alphas, alphas_cumprod = get_alpha_schedule(betas)
     alphas_cumprod = alphas_cumprod.to(device)
 
-    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir) / pack_id
+    tensorboard_dir = _tensorboard_log_dir(checkpoint_dir) / pack_id / "std"
     try:
         from torch.utils.tensorboard import SummaryWriter
         writer = SummaryWriter(log_dir=str(tensorboard_dir))
@@ -612,10 +590,10 @@ def train_pack(
         pending_metric_history.append(metric_record)
 
         if writer is not None:
-            writer.add_scalar("train/loss", average_loss, current_step)
-            writer.add_scalar("train/learning_rate", lr, current_step)
+            writer.add_scalar("training/0_summary/loss", average_loss, current_step)
+            writer.add_scalar("training/0_summary/learning_rate", lr, current_step)
             for name in LOSS_COMPONENT_NAMES:
-                writer.add_scalar(f"train/{name}", averaged_scalars[name], current_step)
+                writer.add_scalar(f"training/1_details/{name}", averaged_scalars[name], current_step)
 
         if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
             _append_metric_history(metrics_path, pending_metric_history)
@@ -647,6 +625,7 @@ def train_pack(
                 preview_dir = _run_validation(
                     model, val_dataset, pack_checkpoint, current_step, device, writer,
                     ema_state_dict=ema_state_dict,
+                    recolor_checkpoint_dir=recolor_checkpoint_dir,
                 )
                 if preview_dir is not None:
                     last_preview_dir = preview_dir
@@ -703,27 +682,32 @@ def _run_validation(
     device: torch.device,
     writer: Any = None,
     ema_state_dict: dict[str, torch.Tensor] | None = None,
+    recolor_checkpoint_dir: Path | None = None,
 ) -> Path | None:
     """Run validation and save preview images."""
     model.eval()
-    
-    # Use EMA weights for validation if available
+
     training_state_dict = None
     if ema_state_dict:
         training_state_dict = {k: v.clone() for k, v in model.state_dict().items()}
         _apply_ema_weights(model, ema_state_dict)
-    
+
+    recolor_model: RecolorNet | None = None
+    if recolor_checkpoint_dir is not None:
+        recolor_model, _ = load_recolor_model(recolor_checkpoint_dir, val_dataset.pack_id)
+
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)
-    
+
     preview_dir = checkpoint_dir / "validation" / f"step_{step:06d}"
     preview_dir.mkdir(parents=True, exist_ok=True)
-    
+
     scalar_totals = _init_scalar_totals(VAL_SCALAR_NAMES)
     count = 0
-    summary_images: list[Image.Image] = []
-    debug_images: list[Image.Image] = []
+    recolor_images: list[Image.Image] = []
+    diffusion_images: list[Image.Image] = []
+    selected_images: list[Image.Image] = []
     loss_breakdown_rows: list[dict[str, float | str]] = []
-    
+
     for batch in val_loader:
         content_rgb = batch["content_rgb"].to(device)
         target_rgb = batch["target_rgb"].to(device)
@@ -737,15 +721,31 @@ def _run_validation(
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(validation_seed)
 
-        pred_rgb = sample_rgb(
+        pure_recolor: torch.Tensor | None = None
+        if recolor_model is not None:
+            pure_recolor = recolor_model(
+                content_rgb, style_refs, style_ref_mask=style_ref_mask
+            ).squeeze(0)
+
+        pure_diff = _sample_once(
+            model, content_rgb, style_refs, style_ref_mask=style_ref_mask
+        )
+
+        selected, chosen_source, chosen_score = sample_rgb(
             model,
             content_rgb,
             style_refs,
             style_ref_mask=style_ref_mask,
             support_content_refs=support_content_refs,
+            recolor_model=recolor_model,
             num_steps=NUM_TIMESTEPS,
             num_candidates=2,
-        ).unsqueeze(0).to(device)
+            return_source=True,
+        )
+
+        selected = selected.unsqueeze(0).to(device)
+        pred_rgb = selected
+
         content_components = rgb_content_loss_components(pred_rgb, content_rgb, target_rgb)
         recon_loss = F.l1_loss(pred_rgb, target_rgb)
         pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_rgb)
@@ -770,31 +770,36 @@ def _run_validation(
             scalar_totals[name] += sample_scalars[name]
         count += 1
         loss_breakdown_rows.append({"filename": filename, **sample_scalars})
-        
-        # Save preview
-        _save_preview(
-            preview_dir,
-            filename,
-            content_rgb[0],
-            target_rgb[0],
-            pred_rgb[0],
-            step,
+
+        stem = Path(filename).stem
+        is_diffusion = "diffusion" in chosen_source
+        is_recolor = "recolor" in chosen_source
+
+        if pure_recolor is not None:
+            recolor_panel = _build_output_panel(
+                content_rgb[0], pure_recolor, target_rgb[0], "recolor",
+            )
+            recolor_panel.save(preview_dir / f"{stem}_recolor.png")
+            recolor_images.append(recolor_panel)
+
+        diff_panel = _build_output_panel(
+            content_rgb[0], pure_diff, target_rgb[0], "diffusion",
         )
-        debug_panel = _build_diagnostic_panel(content_rgb[0], pred_rgb[0], target_rgb[0])
-        debug_panel.save(preview_dir / f"{Path(filename).stem}_debug.png")
-        if writer is not None and len(debug_images) < 4:
-            debug_images.append(debug_panel)
-        
-        # Collect images for tensorboard summary
-        content_np = (content_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        target_np = (target_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        pred_np = (pred_rgb[0].permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-        canvas = Image.new("RGB", (IMAGE_SIZE * 3, IMAGE_SIZE))
-        canvas.paste(Image.fromarray(content_np), (0, 0))
-        canvas.paste(Image.fromarray(pred_np), (IMAGE_SIZE, 0))
-        canvas.paste(Image.fromarray(target_np), (IMAGE_SIZE * 2, 0))
-        summary_images.append(canvas)
-    
+        diff_panel.save(preview_dir / f"{stem}_diffusion.png")
+        diffusion_images.append(diff_panel)
+
+        sel_border = None
+        if is_diffusion:
+            sel_border = (34, 170, 34)
+        elif is_recolor:
+            sel_border = (34, 68, 204)
+        sel_panel = _build_output_panel(
+            content_rgb[0], selected[0], target_rgb[0],
+            f"selected [{chosen_source}]", border_color=sel_border,
+        )
+        sel_panel.save(preview_dir / f"{stem}_selected.png")
+        selected_images.append(sel_panel)
+
     averaged_scalars = _average_scalar_totals(scalar_totals, count)
     avg_loss = averaged_scalars["loss"]
     print(f"[{val_dataset.pack_id}] Validation step={step} loss={avg_loss:.4f}")
@@ -804,67 +809,39 @@ def _run_validation(
         csv_writer = csv.DictWriter(handle, fieldnames=("filename",) + VAL_SCALAR_NAMES)
         csv_writer.writeheader()
         csv_writer.writerows(cast(Any, loss_breakdown_rows))
-    
-    # Log validation images to tensorboard
+
     if writer is not None:
+        from spritecraft.inference.evaluate import _tile_images
+        writer.add_scalar("validation/0_summary/loss", avg_loss, step)
         for name in VAL_SCALAR_NAMES:
-            writer.add_scalar(f"validation/{name}", averaged_scalars[name], step)
-        if summary_images:
-            # Create a tiled summary image
-            from spritecraft.inference.evaluate import _tile_images
-            tiled = _tile_images(summary_images, columns=2)
-            tiled_np = np.array(tiled)
-            writer.add_image("validation/summary", tiled_np, step, dataformats="HWC")
-        if debug_images:
-            from spritecraft.inference.evaluate import _tile_images
-            tiled_debug = _tile_images(debug_images, columns=1)
-            writer.add_image("validation/debug", np.array(tiled_debug), step, dataformats="HWC")
-    
-    # Restore training weights before returning to training mode
+            if name != "loss":
+                writer.add_scalar(f"validation/1_details/{name}", averaged_scalars[name], step)
+        if recolor_images:
+            tiled = _tile_images(recolor_images, columns=2)
+            writer.add_image("validation/0_summary/recolor", np.array(tiled), step, dataformats="HWC")
+        if diffusion_images:
+            tiled = _tile_images(diffusion_images, columns=2)
+            writer.add_image("validation/0_summary/diffusion", np.array(tiled), step, dataformats="HWC")
+        if selected_images:
+            tiled = _tile_images(selected_images, columns=2)
+            writer.add_image("validation/0_summary/selected", np.array(tiled), step, dataformats="HWC")
+
     if training_state_dict is not None:
         _restore_training_weights(model, training_state_dict)
-    
+
     model.train()
     return preview_dir
 
 
-def _save_preview(
-    preview_dir: Path,
-    filename: str,
-    content_rgb: torch.Tensor,
-    target_rgb: torch.Tensor,
-    pred_rgb: torch.Tensor,
-    step: int,
-) -> None:
-    """Save a side-by-side preview image."""
-    # Convert tensors to PIL images
-    content_np = (content_rgb.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-    target_np = (target_rgb.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-    pred_np = (pred_rgb.permute(1, 2, 0).cpu().float().numpy() * 255).astype(np.uint8)
-    
-    content_img = Image.fromarray(content_np)
-    target_img = Image.fromarray(target_np)
-    pred_img = Image.fromarray(pred_np)
-    
-    # Create side-by-side canvas
-    canvas = Image.new("RGB", (IMAGE_SIZE * 3, IMAGE_SIZE))
-    canvas.paste(content_img, (0, 0))
-    canvas.paste(pred_img, (IMAGE_SIZE, 0))
-    canvas.paste(target_img, (IMAGE_SIZE * 2, 0))
-    
-    canvas.save(preview_dir / f"{filename}")
-
-
-def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 10_000, pack_id: str | None = None):
+def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 10_000, pack_id: str | None = None, recolor_checkpoint_dir: str | Path | None = None):
     """Run training loop for one or all packs."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    recolor_cp_dir = Path(recolor_checkpoint_dir) if recolor_checkpoint_dir is not None else None
     
     if pack_id is not None:
-        # Train specific pack
-        train_pack(pack_id, checkpoint_dir, steps)
+        train_pack(pack_id, checkpoint_dir, steps, recolor_checkpoint_dir=recolor_cp_dir)
     else:
-        # Train all available packs
         available_packs = get_available_pack_ids()
         if not available_packs:
             raise ValueError("No preprocessed pack datasets found. Run preprocessing first.")
@@ -872,7 +849,7 @@ def run(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 10_000, pack_
         print(f"Training {len(available_packs)} pack(s): {available_packs}")
         for pack_id in available_packs:
             try:
-                train_pack(pack_id, checkpoint_dir, steps)
+                train_pack(pack_id, checkpoint_dir, steps, recolor_checkpoint_dir=recolor_cp_dir)
             except Exception as exc:
                 print(f"Error training {pack_id}: {exc}")
                 continue

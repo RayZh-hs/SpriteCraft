@@ -27,15 +27,17 @@ def main():
     preprocess_parser.add_argument("--manifest", type=str, default=None)
     preprocess_parser.add_argument("--min-shared-packs", type=int, default=MIN_SHARED_PACKS)
 
-    train_parser = subparsers.add_parser("train", help="Train the model")
+    train_parser = subparsers.add_parser("train", help="Train the model(s)")
     train_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     train_parser.add_argument("--steps", type=int, default=10_000)
     train_parser.add_argument("--pack", type=str, default=None, help="Train specific pack (default: all)")
-
-    recolor_parser = subparsers.add_parser("train-recolor", help="Train the RecolorNet for structure-preserving color transfer")
-    recolor_parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
-    recolor_parser.add_argument("--steps", type=int, default=5_000)
-    recolor_parser.add_argument("--pack", type=str, default=None, help="Train specific pack (default: all)")
+    train_parser.add_argument(
+        "--mode",
+        type=str,
+        choices=("recolor_first", "std_only", "recolor_only"),
+        default="recolor_first",
+        help="Training mode (default: recolor_first)",
+    )
 
     generate_parser = subparsers.add_parser("generate", help="Generate textures from a resource pack")
     generate_parser.add_argument("--pack", type=str, required=True)
@@ -58,11 +60,23 @@ def main():
             min_shared_packs=args.min_shared_packs,
         )
     elif args.command == "train":
-        from spritecraft.training import train
-        train.run(args.checkpoint_dir, args.steps, args.pack)
-    elif args.command == "train-recolor":
-        from spritecraft.training import recolor_train
-        recolor_train.run_recolor(args.checkpoint_dir, args.steps, args.pack)
+        from spritecraft.training import recolor_train, train
+        if args.mode == "recolor_only":
+            recolor_train.run_recolor(args.checkpoint_dir, args.steps, args.pack)
+        elif args.mode == "std_only":
+            train.run(args.checkpoint_dir, args.steps, args.pack)
+        else:  # recolor_first
+            if args.pack is not None:
+                recolor_train.run_recolor(args.checkpoint_dir, args.steps, args.pack)
+                train.run(args.checkpoint_dir, args.steps, args.pack, recolor_checkpoint_dir=args.checkpoint_dir)
+            else:
+                from spritecraft.data.dataset import get_available_pack_ids
+                packs = get_available_pack_ids()
+                for pid in packs:
+                    print(f"\n=== Pack {pid}: RecolorNet ===")
+                    recolor_train.run_recolor(args.checkpoint_dir, args.steps, pid)
+                    print(f"\n=== Pack {pid}: StyleAwareUNet ===")
+                    train.run(args.checkpoint_dir, args.steps, pid, recolor_checkpoint_dir=args.checkpoint_dir)
     elif args.command == "generate":
         from spritecraft.inference import generate
         generate.run(
