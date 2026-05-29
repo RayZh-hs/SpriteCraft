@@ -687,10 +687,6 @@ def train_pack(
     if writer is not None:
         writer.close()
     
-    # Restore training weights after validation
-    if training_state_dict is not None:
-        _restore_training_weights(model, training_state_dict)
-    
     return checkpoint_path
 
 
