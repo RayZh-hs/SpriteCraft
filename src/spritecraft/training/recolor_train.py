@@ -110,6 +110,8 @@ def _maybe_load_checkpoint(
     if checkpoint.get("target_steps") == target_steps:
         scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
     ema_state_dict = checkpoint.get("ema_state_dict", None)
+    if ema_state_dict is not None:
+        ema_state_dict = {k: v.to(device) for k, v in ema_state_dict.items()}
     return int(checkpoint.get("step", 0)), ema_state_dict
 
 
@@ -119,12 +121,14 @@ def _update_ema(
     decay: float,
 ) -> dict[str, torch.Tensor]:
     """Update exponential moving average of model parameters."""
+    device = next(model.parameters()).device
     if not ema_state_dict:
         ema_state_dict = {k: v.detach().clone() for k, v in model.state_dict().items()}
     else:
         for key in ema_state_dict:
+            model_param = model.state_dict()[key].detach()
             ema_state_dict[key] = (
-                decay * ema_state_dict[key] + (1 - decay) * model.state_dict()[key].detach()
+                decay * ema_state_dict[key].to(device) + (1 - decay) * model_param
             )
     return ema_state_dict
 
