@@ -1,235 +1,167 @@
-"""Texture complexity classifier for model selection.
+"""Post-hoc diffusion output quality evaluator for model selection.
 
-Pre-classifies textures as diffusion-friendly (standard, homogeneous)
-vs recolor-required (complex, structured) to avoid wasteful diffusion
-attempts on textures where diffusion is known to produce poor results.
+Instead of pre-classifying textures, this module evaluates the actual
+diffusion output against the vanilla content image to decide whether
+the result is satisfactory or whether we should fall back to RecolorNet.
+
+Bad diffusion outputs exhibit: structural divergence, edge loss, detail
+mismatch, excessive noise. These traits are detected and scored.
 """
 
 from __future__ import annotations
 
-import math
-import os
-
 import numpy as np
 
-from spritecraft.data.support_index import infer_texture_family
 
-# Thresholds calibrated on 32x32 pixel-art textures.
-# Values derived from analyzing descriptor distributions across families.
-ENTROPY_MAX = math.log(16)  # max possible entropy for 16-bin histogram
-HIGH_FREQ_ENERGY_THRESHOLD = 0.12  # radial bands 3+4 combined, above this = fine detail
-GRADIENT_MAG_THRESHOLD = 0.15      # mean gradient magnitude cutoff
-ENTROPY_THRESHOLD = 1.0            # entropy above this suggests high complexity
-STD_THRESHOLD = 0.18               # grayscale std above this = busy pattern
-
-# Textures in these families typically benefit from diffusion
-DIFFUSION_FAVORED_FAMILIES = frozenset({
-    "ore", "wood", "stone", "soil", "brick", "ceramic", "glass",
-})
-
-# Known complex textures that should always use recolor
-RECOLOR_ONLY_PATTERNS = frozenset({
-    "bookshelf", "tnt_side", "tnt_top", "tnt_bottom",
-})
-
-# Texture families normally unfavored for diffusion
-RECOLOR_FAVORED_FAMILIES = frozenset({
-    "foliage",
-})
+def _to_gray(rgb: np.ndarray) -> np.ndarray:
+    """Convert [H, W, 3] float RGB to luminance."""
+    return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
 
 
-def _box_mean(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
-    """Compute box-filtered mean using simple sliding window (no scipy dependency)."""
+def _gradient_magnitude(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Forward differences, returns grad_x[H,W-1], grad_y[H-1,W], grad_mag[H,W]."""
+    gx = gray[:, 1:] - gray[:, :-1]
+    gy = gray[1:, :] - gray[:-1, :]
+    mag = np.sqrt(
+        np.pad(gx, ((0, 0), (0, 1))) ** 2 + np.pad(gy, ((0, 1), (0, 0))) ** 2
+    ) + 1e-8
+    return gx, gy, mag
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """L2-normalized dot product."""
+    an = a / (np.linalg.norm(a) + 1e-8)
+    bn = b / (np.linalg.norm(b) + 1e-8)
+    return float(np.dot(an, bn))
+
+
+def _high_pass_residual(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
+    """Detail proxy: gray minus 3x3 box blur."""
     h, w = gray.shape
     pad = ksize // 2
     padded = np.pad(gray, ((pad, pad), (pad, pad)), mode="edge")
-    # Use strided views for efficiency
     shape = (h, w, ksize, ksize)
     strides = (padded.strides[0], padded.strides[1], padded.strides[0], padded.strides[1])
     windows = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
-    return windows.mean(axis=(2, 3))
+    blurred = windows.mean(axis=(2, 3))
+    return gray - blurred
 
 
-def classify_texture_complexity(
-    image_array: np.ndarray,
-    filename: str = "",
-) -> dict[str, float | str | bool]:
-    """Analyze a vanilla content texture and return a classification verdict.
+def evaluate_diffusion_output(
+    diffusion_rgb: np.ndarray,
+    content_rgb: np.ndarray,
+) -> dict[str, float]:
+    """Score whether a diffusion output is structurally sound vs the content.
 
     Args:
-        image_array: uint8 RGB image array [H, W, 3]
-        filename: texture filename for family heuristics
+        diffusion_rgb: [H, W, 3] uint8 diffusion-generated image
+        content_rgb:   [H, W, 3] uint8 vanilla content image
 
     Returns:
-        dict with keys:
-            - diffusion_score: float [0, 1], higher = better for diffusion
-            - use_diffusion: bool, recommended model choice
-            - use_recolor: bool, alternative recommended
-            - entropy: float, luminance entropy
-            - high_freq_energy: float, FFT high-band energy
-            - grad_mag_mean: float, mean gradient magnitude
-            - grad_std: float, std dev of gradient magnitude
-            - local_std_mean: float, mean local std
-            - texture_family: str, inferred family
-            - complexity_label: str, "simple" | "moderate" | "complex"
+        Dict with quality score (0-1, higher=better) and diagnostic traits.
+        key "use_diffusion": bool, True if diffusion output is acceptable.
     """
-    # Compute full descriptor for feature extraction
-    rgb = image_array.astype(np.float32) / 255.0
-    gray = np.dot(rgb, np.array([0.299, 0.587, 0.114], dtype=np.float32))
-    grad_y, grad_x = np.gradient(gray)
-    grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2) + 1e-6
+    d = diffusion_rgb.astype(np.float32) / 255.0
+    c = content_rgb.astype(np.float32) / 255.0
 
-    # 1. Entropy (from 16-bin luminance histogram)
-    gray_bins = np.clip((gray * 15).astype(np.int32), 0, 15)
-    gray_hist = np.bincount(gray_bins.reshape(-1), minlength=16).astype(np.float32)
-    gray_prob = gray_hist / (gray_hist.sum() + 1e-6)
-    entropy = float(-np.sum(gray_prob * np.log(gray_prob + 1e-6)))
+    d_gray = _to_gray(d)
+    c_gray = _to_gray(c)
 
-    # 2. FFT radial energy (high-frequency = complex detail)
-    freq_spectrum = np.abs(np.fft.fftshift(np.fft.fft2(gray)))
-    freq_spectrum /= freq_spectrum.max() + 1e-6
-    height, width = gray.shape
-    yy, xx = np.indices((height, width), dtype=np.float32)
-    cy = (height - 1) / 2.0
-    cx = (width - 1) / 2.0
-    radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
-    max_radius = max(radius.max(), 1.0)
+    # === 1. Gradient alignment ===
+    # How well does the output preserve the content's edge structure?
+    _, _, d_mag = _gradient_magnitude(d_gray)
+    _, _, c_mag = _gradient_magnitude(c_gray)
+    grad_alignment = _cosine_similarity(d_mag.flatten(), c_mag.flatten())
 
-    high_freq_mask = (radius / max_radius >= 0.5) & (radius / max_radius <= 1.01)
-    high_freq_energy = float(freq_spectrum[high_freq_mask].mean()) if high_freq_mask.any() else 0.0
-    mid_freq_mask = (radius / max_radius >= 0.25) & (radius / max_radius < 0.5)
-    mid_freq_energy = float(freq_spectrum[mid_freq_mask].mean()) if mid_freq_mask.any() else 0.0
+    # === 2. Edge energy ratio ===
+    # Significant edge loss = smeared/blurred output (bad sign for diffusion).
+    # Significant edge gain = random noise (also bad).
+    d_edge = d_mag.mean()
+    c_edge = c_mag.mean()
+    if c_edge > 1e-6:
+        edge_ratio = d_edge / c_edge
+        # Penalize both edge loss (< 0.5x) and edge explosion (> 2.0x)
+        if edge_ratio < 0.5:
+            edge_fidelity = edge_ratio / 0.5  # 0→0, 0.5→1
+        elif edge_ratio > 2.0:
+            edge_fidelity = max(0.0, (4.0 - edge_ratio) / 2.0)  # 2→1, 4→0
+        else:
+            edge_fidelity = 1.0
+    else:
+        edge_fidelity = 1.0
 
-    # 3. Gradient statistics
-    grad_mag_mean = float(np.mean(grad_mag))
-    grad_mag_std = float(np.std(grad_mag))
+    # === 3. Detail coherence ===
+    # Does the high-pass residual pattern match? Complex textures (bookshelf,
+    # TNT) produce randomized diffusion details that don't match content.
+    d_detail = _high_pass_residual(d_gray)
+    c_detail = _high_pass_residual(c_gray)
+    detail_coherence = _cosine_similarity(d_detail.flatten(), c_detail.flatten())
 
-    # 4. Local standard deviation (windowed contrast)
-    local_mean = _box_mean(gray, ksize=3)
-    local_sq_mean = _box_mean(gray ** 2, ksize=3)
-    local_var = np.maximum(local_sq_mean - local_mean ** 2, 0)
-    local_std = np.sqrt(local_var + 1e-6)
-    local_std_mean = float(local_std.mean())
-    local_std_max = float(local_std.max())
+    # === 4. Entropy delta ===
+    # Large entropy increase = noise injection. Large drop = washed out.
+    c_hist = np.histogram(c_gray, bins=16, range=(0, 1))[0].astype(np.float32)
+    d_hist = np.histogram(d_gray, bins=16, range=(0, 1))[0].astype(np.float32)
+    c_prob = c_hist / (c_hist.sum() + 1e-8)
+    d_prob = d_hist / (d_hist.sum() + 1e-8)
+    c_entropy = float(-np.sum(c_prob * np.log(c_prob + 1e-8)))
+    d_entropy = float(-np.sum(d_prob * np.log(d_prob + 1e-8)))
+    ent_delta = d_entropy - c_entropy
+    # Penalize entropy gain > 0.5 (noise) or loss > 1.0 (washed out)
+    if ent_delta > 0.5:
+        ent_score = max(0.0, 1.0 - (ent_delta - 0.5))
+    elif ent_delta < -1.0:
+        ent_score = max(0.0, 1.0 + (ent_delta + 1.0) * 0.5)
+    else:
+        ent_score = 1.0
 
-    # 5. Texture family
-    texture_family = infer_texture_family(filename) if filename else "generic"
+    # === 5. Structural simplicity (from content) ===
+    # Measure how structured the content is. If content is very simple
+    # (low entropy, low edge energy, smooth), then strong gradient
+    # alignment is expected and the bar is higher.
+    c_entropy_norm = c_entropy / np.log(16)  # [0,1]
+    c_edge_norm = min(c_edge / 0.25, 1.0)    # normalize
+    content_complexity = 0.5 * (c_entropy_norm + c_edge_norm)
 
-    # === COMPUTE DIFFUSION SUITABILITY SCORE ===
-
-    # Entropy penalty: high entropy = complex = bad for diffusion
-    entropy_penalty = 0.0
-    if entropy > ENTROPY_THRESHOLD:
-        excess = min(entropy - ENTROPY_THRESHOLD, ENTROPY_MAX - ENTROPY_THRESHOLD)
-        entropy_penalty = 0.30 * (excess / (ENTROPY_MAX - ENTROPY_THRESHOLD)) ** 0.7
-
-    # High-frequency penalty: lots of fine detail = hard for diffusion
-    hf_penalty = 0.0
-    if high_freq_energy > HIGH_FREQ_ENERGY_THRESHOLD:
-        excess = high_freq_energy - HIGH_FREQ_ENERGY_THRESHOLD
-        hf_penalty = 0.25 * min(excess / 0.15, 1.0)
-
-    # Mid-frequency penalty (structure/texture patterns like tiled ores, planks)
-    mf_penalty = mid_freq_energy * 0.10
-
-    # Gradient penalty: many edges = complex structure
-    grad_penalty = 0.0
-    if grad_mag_mean > GRADIENT_MAG_THRESHOLD:
-        excess = grad_mag_mean - GRADIENT_MAG_THRESHOLD
-        grad_penalty = 0.20 * min(excess / 0.10, 1.0)
-
-    # Gradient variability penalty: uneven detail distribution
-    grad_var_penalty = min(grad_mag_std * 1.2, 0.15)
-
-    # Local std penalty: busy regions
-    std_penalty = 0.0
-    if local_std_mean > STD_THRESHOLD:
-        excess = local_std_mean - STD_THRESHOLD
-        std_penalty = 0.10 * min(excess / 0.12, 1.0)
-
-    # Base score from content features
-    base_features_score = (1.0
-        - entropy_penalty
-        - hf_penalty
-        - mf_penalty
-        - grad_penalty
-        - grad_var_penalty
-        - std_penalty
+    # === Composite quality score ===
+    # Weight components to emphasize structural preservation.
+    # Gradient alignment is most important — it directly measures
+    # whether the output "respects" the content's structure.
+    quality = (
+        0.35 * grad_alignment
+        + 0.25 * edge_fidelity
+        + 0.20 * detail_coherence
+        + 0.15 * ent_score
+        + 0.05  # baseline offset for very simple content
     )
 
-    # === FAMILY-BASED ADJUSTMENTS ===
-
-    family_name = os.path.splitext(os.path.basename(filename))[0].lower().replace("-", "_").replace(" ", "_") if filename else ""
-    family_bonus = 0.0
-
-    # Hard override: known complex patterns always use recolor
-    if any(pattern in family_name for pattern in RECOLOR_ONLY_PATTERNS):
-        family_bonus = -0.80
-
-    elif texture_family in RECOLOR_FAVORED_FAMILIES:
-        family_bonus = -0.25
-    elif texture_family in DIFFUSION_FAVORED_FAMILIES:
-        family_bonus = 0.10
-    elif texture_family == "generic":
-        if entropy > ENTROPY_THRESHOLD * 0.8:
-            family_bonus = -0.15
-
-    # Additional filename heuristics
-    if "stained" in family_name or "glass" in family_name:
-        # Stained glass and variants are hard for diffusion
-        family_bonus -= 0.10
-    if "daylight" in family_name or "detector" in family_name:
-        family_bonus -= 0.15
-    if "daylight" in family_name or "detector" in family_name:
-        family_bonus -= 0.10
-
-    diffusion_score = max(0.0, min(1.0, base_features_score + family_bonus))
-
-    # === CLASSIFICATION ===
-
-    DIFFUSION_THRESHOLD = 0.45
-
-    use_diffusion = diffusion_score >= DIFFUSION_THRESHOLD
-    use_recolor = not use_diffusion
-
-    if use_diffusion:
-        complexity_label = "simple" if diffusion_score > 0.75 else "moderate"
+    # Adjust threshold by content complexity:
+    # - Simple content (ores, stone): need high quality (≥ 0.65) to accept diffusion
+    # - Complex content (leaves, bookshelf): accept lower quality (≥ 0.50) since
+    #   diffusion is expected to struggle, but still check minimum bar
+    if content_complexity < 0.3:
+        # Simple content: bar is higher
+        threshold = 0.60
+    elif content_complexity < 0.5:
+        threshold = 0.55
     else:
-        complexity_label = "complex"
+        # Complex content: accept lower quality from diffusion, fallback to recolor
+        threshold = 0.45
+
+    use_diffusion = quality >= threshold
 
     return {
-        "diffusion_score": round(diffusion_score, 4),
+        "quality_score": round(quality, 4),
         "use_diffusion": use_diffusion,
-        "use_recolor": use_recolor,
-        "entropy": round(entropy, 4),
-        "high_freq_energy": round(high_freq_energy, 4),
-        "mid_freq_energy": round(mid_freq_energy, 4),
-        "grad_mag_mean": round(grad_mag_mean, 4),
-        "grad_std": round(grad_mag_std, 4),
-        "local_std_mean": round(local_std_mean, 4),
-        "local_std_max": round(local_std_max, 4),
-        "texture_family": texture_family,
-        "complexity_label": complexity_label,
+        "use_recolor": not use_diffusion,
+        "grad_alignment": round(grad_alignment, 4),
+        "edge_fidelity": round(edge_fidelity, 4),
+        "detail_coherence": round(detail_coherence, 4),
+        "entropy_score": round(ent_score, 4),
+        "content_complexity": round(content_complexity, 4),
+        "content_entropy": round(c_entropy, 4),
+        "diff_entropy": round(d_entropy, 4),
+        "content_edge": round(c_edge, 6),
+        "diff_edge": round(d_edge, 6),
+        "entropy_delta": round(ent_delta, 4),
+        "threshold": threshold,
     }
-
-
-def batch_classify(
-    image_arrays: np.ndarray,
-    filenames: list[str],
-) -> list[dict[str, float | str | bool]]:
-    """Classify a batch of textures.
-
-    Args:
-        image_arrays: [N, H, W, 3] uint8 RGB array
-        filenames: list of N filenames
-
-    Returns:
-        list of classification dicts
-    """
-    results = []
-    for i, filename in enumerate(filenames):
-        img = image_arrays[i] if image_arrays.ndim == 4 else image_arrays
-        result = classify_texture_complexity(img, filename)
-        results.append(result)
-    return results
-

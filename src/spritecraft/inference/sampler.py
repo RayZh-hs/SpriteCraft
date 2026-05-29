@@ -11,19 +11,15 @@ from PIL import Image, ImageDraw
 
 from spritecraft.config import IMAGE_SIZE, MAX_SUPPORT_EXEMPLARS, NUM_TIMESTEPS, pack_checkpoint_dir
 from spritecraft.data.support_index import compute_texture_descriptor
+from spritecraft.data.texture_classifier import evaluate_diffusion_output
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
 from spritecraft.models.recolor import RecolorNet
 from spritecraft.models.unet import StyleAwareUNet
 
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
-MIN_RECOLOR_SUPPORT_SCORE = 0.40
-RECOLOR_SUPPORT_MARGIN = 0.25
-MIN_DIFFUSION_SCORE = 0.50
-
-# How many diffusion samples to run when diffusion is explicitly requested
-DIFFUSION_CANDIDATE_COUNT = 4
-# How many diffusion samples to run when classifier is unsure (moderate complexity)
-MODERATE_CANDIDATE_COUNT = 2
+# Minimum structural quality for diffusion to be considered viable.
+# Below this, the output is visually garbled/smeared and should be rejected.
+MIN_STRUCTURAL_QUALITY = 0.45
 
 
 class PredictionBundleResult(TypedDict):
@@ -320,25 +316,21 @@ def sample_rgb(
     recolor_model: RecolorNet | None = None,
     num_steps: int = NUM_TIMESTEPS,
     num_candidates: int = 1,
-    routing_hint: str = "auto",
     return_source: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, str, float]:
-    """Generate RGB texture using iterative denoising and optional recolor.
+    """Generate RGB texture. Runs diffusion, evaluates output quality against
+    content structure AND target style, compares with RecolorNet, and selects
+    the best output. No hardcoded routing — the decision is made by comparing
+    actual output quality of both models.
 
     Args:
         model: trained StyleAwareUNet
         content_rgb: [1, 3, H, W] or [3, H, W] vanilla content
         style_refs: [N, 3, H, W] or [1, N, 3, H, W] style reference textures
         support_content_refs: optional vanilla-side matches for each support
-            reference, used for a deterministic structure-preserving recolor
-            candidate.
-        recolor_model: optional trained RecolorNet for learned structure-preserving
-            color transfer.
+        recolor_model: optional trained RecolorNet for fallback color transfer
         num_steps: number of denoising steps
-        num_candidates: number of stochastic candidates to sample before
-            choosing the support-most-consistent result
-        routing_hint: "diffusion", "recolor", or "auto" — classifier-guided
-            model selection. "recolor" skips expensive diffusion sampling.
+        num_candidates: number of stochastic diffusion candidates
         return_source: if True, return (prediction, model_source, score)
 
     Returns:
@@ -361,33 +353,33 @@ def sample_rgb(
     if support_content_refs is not None:
         support_content_refs = support_content_refs.to(device)
 
-    # Determine effective candidate count based on routing hint
-    force_recolor = routing_hint == "recolor"
-    force_diffusion = routing_hint == "diffusion"
-
-    if force_recolor:
-        effective_diffusion_candidates = 0
-    elif force_diffusion:
-        effective_diffusion_candidates = max(1, num_candidates)
-    else:
-        effective_diffusion_candidates = max(1, num_candidates)
-
+    # Precompute deterministic recolor (cheap)
     recolor_candidate = _support_pair_recolor(
         content_rgb,
         style_refs,
         style_ref_mask=style_ref_mask,
         support_content_refs=support_content_refs,
     )
-    best_prediction: torch.Tensor | None = None
-    best_score = float("-inf")
-    best_diffusion_score: float | None = None
-    best_diffusion_prediction: torch.Tensor | None = None
-    recolor_score: float | None = None
-    recolor_net_prediction: torch.Tensor | None = None
-    recolor_net_score: float | None = None
-    candidate_predictions: list[tuple[str, torch.Tensor]] = []
 
-    for _ in range(effective_diffusion_candidates):
+    # Helper: compute structural quality of a candidate vs content.
+    # prediction must be [3, H, W] CPU float tensor in [0, 1].
+    content_np = (content_rgb.squeeze(0).permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+
+    def _structural_quality(prediction: torch.Tensor) -> float:
+        pred_np = (prediction.permute(1, 2, 0).cpu().float().numpy() * 255).clip(0, 255).astype(np.uint8)
+        return evaluate_diffusion_output(pred_np, content_np)["quality_score"]
+
+    def _style_quality(prediction: torch.Tensor) -> float:
+        score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
+        return max(0.0, min(1.0, score))
+
+    # === PHASE 1: Generate diffusion candidates ===
+    effective_candidates = max(1, num_candidates)
+    best_diffusion_pred = None
+    best_diffusion_style = float("-inf")
+    best_diffusion_struct = 0.0
+
+    for _ in range(effective_candidates):
         prediction = _sample_once(
             model,
             content_rgb,
@@ -395,91 +387,84 @@ def sample_rgb(
             style_ref_mask=style_ref_mask,
             num_steps=num_steps,
         )
-        candidate_predictions.append(("diffusion", prediction))
-        if recolor_candidate is not None:
-            for amount in DETAIL_INJECTION_AMOUNTS:
-                candidate_predictions.append(
-                    (
-                        f"detail_{amount:.2f}",
-                        _inject_detail(prediction.to(device), recolor_candidate, amount).cpu(),
-                    )
-                )
+        struct = _structural_quality(prediction)
+        style = _style_quality(prediction)
+        if style > best_diffusion_style or best_diffusion_pred is None:
+            best_diffusion_pred = prediction
+            best_diffusion_style = style
+            best_diffusion_struct = struct
+
+    assert best_diffusion_pred is not None
+
+    # Try detail injection to improve structural quality
+    best_pred = best_diffusion_pred
+    best_struct = best_diffusion_struct
+    best_style = best_diffusion_style
+    best_source = "diffusion"
 
     if recolor_candidate is not None:
-        candidate_predictions.append(("support_recolor", recolor_candidate.cpu()))
+        for amount in DETAIL_INJECTION_AMOUNTS:
+            injected = _inject_detail(
+                best_diffusion_pred.to(device), recolor_candidate, amount
+            ).cpu()
+            injected_struct = _structural_quality(injected)
+            injected_style = _style_quality(injected)
+            if injected_struct > best_struct and injected_style > 0.95 * best_style:
+                best_pred = injected
+                best_struct = injected_struct
+                best_style = injected_style
+                best_source = f"diffusion+detail_{amount:.2f}"
+
+    # Determine diffusion viability: structural quality must meet minimum bar
+    diffusion_viable = best_struct >= MIN_STRUCTURAL_QUALITY
+
+    # === PHASE 2: Generate RecolorNet candidate ===
+    recolor_style = float("-inf")
+    recolor_pred = None
 
     if recolor_model is not None:
-        recolor_model_pred = recolor_model(content_rgb, style_refs, style_ref_mask=style_ref_mask)
-        recolor_net_prediction = recolor_model_pred.squeeze(0).cpu()
-        candidate_predictions.append(("recolor_net", recolor_net_prediction))
+        recolor_rgb = recolor_model(
+            content_rgb, style_refs, style_ref_mask=style_ref_mask
+        ).squeeze(0)
+        recolor_pred = recolor_rgb.cpu()
+        recolor_style = _style_quality(recolor_pred)
 
-    for candidate_name, prediction in candidate_predictions:
-        score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
-        if candidate_name == "diffusion" and (best_diffusion_score is None or score > best_diffusion_score):
-            best_diffusion_score = score
-            best_diffusion_prediction = prediction
-        if candidate_name == "support_recolor":
-            recolor_score = score
-        if candidate_name == "recolor_net":
-            recolor_net_score = score
-        if score > best_score or best_prediction is None:
-            best_score = score
-            best_prediction = prediction
-
-    assert best_prediction is not None
-    chosen_source = "unknown"
-    chosen_score = best_score
-
-    # Tiered selection with routing hint awareness
-    if force_diffusion and best_diffusion_prediction is not None:
-        chosen_source = "diffusion"
-        chosen_score = best_diffusion_score if best_diffusion_score is not None else best_score
-        result = best_diffusion_prediction.cpu()
-    elif force_recolor:
-        if recolor_net_prediction is not None:
+    # Decision: prefer diffusion when it's structurally viable AND has
+    # good style consistency. Fall back to recolor when diffusion is either
+    # garbled structure or has significantly worse style.
+    if diffusion_viable:
+        if recolor_pred is None or best_style >= recolor_style:
+            # Diffusion wins on style or recolor not available
+            result = best_pred
+            chosen_source = best_source
+            chosen_score = best_style
+        elif recolor_style > best_style + 0.05:
+            # Recolor clearly wins on style
+            result = recolor_pred
             chosen_source = "recolor_net"
-            chosen_score = recolor_net_score if recolor_net_score is not None else best_score
-            result = recolor_net_prediction
-        elif recolor_candidate is not None:
-            chosen_source = "support_recolor"
-            chosen_score = recolor_score if recolor_score is not None else best_score
-            result = recolor_candidate.cpu()
+            chosen_score = recolor_style
         else:
-            chosen_source = "best_fallback"
-            result = best_prediction
-    elif (
-        best_diffusion_score is not None
-        and best_diffusion_score >= MIN_DIFFUSION_SCORE
-        and best_diffusion_prediction is not None
-    ):
-        chosen_source = "diffusion"
-        chosen_score = best_diffusion_score
-        result = best_diffusion_prediction.cpu()
-    elif (
-        recolor_net_prediction is not None
-        and recolor_net_score is not None
-        and recolor_net_score >= MIN_RECOLOR_SUPPORT_SCORE
-        and recolor_net_score >= best_score - RECOLOR_SUPPORT_MARGIN
-    ):
-        chosen_source = "recolor_net"
-        chosen_score = recolor_net_score
-        result = recolor_net_prediction
-    elif (
-        recolor_candidate is not None
-        and recolor_score is not None
-        and recolor_score >= MIN_RECOLOR_SUPPORT_SCORE
-        and recolor_score >= best_score - RECOLOR_SUPPORT_MARGIN
-    ):
-        chosen_source = "support_recolor"
-        chosen_score = recolor_score
-        result = recolor_candidate.cpu()
+            # Both viable and similar style — prefer diffusion
+            result = best_pred
+            chosen_source = best_source
+            chosen_score = best_style
     else:
-        chosen_source = "best_overall"
-        chosen_score = best_score
-        result = best_prediction
+        # Diffusion structurally poor — fall back to recolor
+        if recolor_pred is not None:
+            result = recolor_pred
+            chosen_source = "recolor_net"
+            chosen_score = recolor_style if recolor_style > float("-inf") else best_style
+        elif recolor_candidate is not None:
+            result = recolor_candidate.cpu()
+            chosen_source = "support_recolor"
+            chosen_score = _style_quality(recolor_candidate.cpu())
+        else:
+            result = best_pred
+            chosen_source = best_source
+            chosen_score = best_style
 
     if return_source:
-        return result, chosen_source, chosen_score
+        return result, chosen_source, float(chosen_score)
     return result
 
 
