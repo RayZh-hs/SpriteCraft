@@ -97,20 +97,20 @@ def evaluate_diffusion_output(
     c_detail = _high_pass_residual(c_gray)
     detail_coherence = _cosine_similarity(d_detail.flatten(), c_detail.flatten())
 
-    # === 3.5. Noise/artifact detection via excess high-pass energy ===
-    # If diffusion injects significantly more high-frequency energy than
-    # the content contains, it is adding grain/noise rather than detail.
+    # === 3.5. Detail energy fidelity (symmetric: detects both blur and noise) ===
     d_detail_energy = float(np.abs(d_detail).mean())
     c_detail_energy = float(np.abs(c_detail).mean())
     if c_detail_energy > 1e-8:
         detail_energy_ratio = d_detail_energy / (c_detail_energy + 1e-8)
-        if detail_energy_ratio > 1.3:
-            noise_fidelity = max(0.0, 1.0 - (detail_energy_ratio - 1.3))
+        if detail_energy_ratio < 0.3:
+            detail_fidelity = detail_energy_ratio / 0.3  # blur penalty: 0→0, 0.3→1
+        elif detail_energy_ratio > 1.3:
+            detail_fidelity = max(0.0, 1.0 - (detail_energy_ratio - 1.3))  # noise penalty
         else:
-            noise_fidelity = 1.0
+            detail_fidelity = 1.0
     else:
         detail_energy_ratio = 1.0
-        noise_fidelity = 1.0
+        detail_fidelity = 1.0
 
     # === 4. Entropy delta ===
     # Large entropy increase = noise injection. Large drop = washed out.
@@ -144,21 +144,21 @@ def evaluate_diffusion_output(
     quality = (
         0.30 * grad_alignment
         + 0.20 * edge_fidelity
-        + 0.15 * detail_coherence
-        + 0.15 * noise_fidelity
+        + 0.18 * detail_coherence
+        + 0.17 * detail_fidelity
         + 0.10 * ent_score
-        + 0.10  # baseline offset for very simple content
+        + 0.03  # modest baseline to keep scores anchored
     )
 
     # Adjust threshold by content complexity:
     # - Simple content (ores, stone): need high quality to accept diffusion
     # - Complex content (leaves, bookshelf): more lenient but still strict
     if content_complexity < 0.3:
-        threshold = 0.65
-    elif content_complexity < 0.5:
         threshold = 0.60
-    else:
+    elif content_complexity < 0.5:
         threshold = 0.55
+    else:
+        threshold = 0.50
 
     use_diffusion = quality >= threshold
 
@@ -169,7 +169,7 @@ def evaluate_diffusion_output(
         "grad_alignment": round(grad_alignment, 4),
         "edge_fidelity": round(edge_fidelity, 4),
         "detail_coherence": round(detail_coherence, 4),
-        "noise_fidelity": round(noise_fidelity, 4),
+        "detail_fidelity": round(detail_fidelity, 4),
         "detail_energy_ratio": round(detail_energy_ratio, 4),
         "entropy_score": round(ent_score, 4),
         "content_complexity": round(content_complexity, 4),

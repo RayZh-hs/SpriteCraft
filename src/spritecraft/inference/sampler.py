@@ -19,9 +19,9 @@ from spritecraft.models.unet import StyleAwareUNet
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
 # Minimum structural quality for diffusion to be considered viable.
 # Below this, the output is visually garbled/smeared and should be rejected.
-MIN_STRUCTURAL_QUALITY = 0.55
+MIN_STRUCTURAL_QUALITY = 0.60
 # Structural quality above which diffusion is confidently preferred over recolor.
-GOOD_STRUCTURAL_QUALITY = 0.75
+GOOD_STRUCTURAL_QUALITY = 0.80
 
 
 class PredictionBundleResult(TypedDict):
@@ -391,7 +391,8 @@ def sample_rgb(
         )
         struct = _structural_quality(prediction)
         style = _style_quality(prediction)
-        if style > best_diffusion_style or best_diffusion_pred is None:
+        combined = struct + style
+        if best_diffusion_pred is None or combined > (best_diffusion_struct + best_diffusion_style):
             best_diffusion_pred = prediction
             best_diffusion_style = style
             best_diffusion_struct = struct

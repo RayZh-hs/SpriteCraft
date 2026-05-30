@@ -65,9 +65,8 @@ TENSORBOARD_DIRNAME = "tensorboard"
 
 # Warmup steps as fraction of total training
 WARMUP_FRACTION = 0.05
-# Content loss ramp: start at this fraction, reach full weight at this step fraction
-CONTENT_LOSS_RAMP_START = 0.1
-CONTENT_LOSS_RAMP_END = 0.2  # reach full weight by 20% of training
+# Content loss weight (constant; x0-dependent losses are SNR-weighted)
+CONTENT_LOSS_WEIGHT = 0.20
 # EMA decay rate
 EMA_DECAY = 0.995
 
@@ -312,28 +311,21 @@ def _restore_training_weights(model: StyleAwareUNet, training_state_dict: dict[s
     model.load_state_dict(training_state_dict)
 
 
-def _content_loss_weight_for_step(step: int, total_steps: int) -> float:
-    """Ramp content loss weight from 0.10 to 0.30 over the first CONTENT_LOSS_RAMP_END fraction."""
-    ramp_start = int(total_steps * CONTENT_LOSS_RAMP_START)
-    ramp_end = int(total_steps * CONTENT_LOSS_RAMP_END)
-    if step < ramp_start:
-        return 0.10
-    elif step >= ramp_end:
-        return 0.30
-    else:
-        progress = (step - ramp_start) / max(ramp_end - ramp_start, 1)
-        return 0.10 + (0.30 - 0.10) * progress
-
-
 def _compute_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
     pred_x0: torch.Tensor,
     content_rgb: torch.Tensor,
     target_rgb: torch.Tensor,
-    content_loss_weight: float = 0.30,
+    content_loss_weight: float = 0.20,
+    x0_weight: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Balance diffusion correctness with explicit edge and color preservation."""
+    """Balance diffusion correctness with explicit edge and color preservation.
+
+    x0-dependent losses are scaled by the SNR (alpha_cumprod[t]) so that at
+    high noise levels where x0 prediction is uncertain, the model focuses on
+    noise prediction rather than unreliable reconstruction targets.
+    """
     noise_loss = F.mse_loss(pred_noise, true_noise)
     recon_loss = F.l1_loss(pred_x0, target_rgb)
     pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
@@ -342,7 +334,11 @@ def _compute_loss(
     channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
     gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
     components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
-    total_loss = noise_loss + 0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * components["content_loss"]
+    if x0_weight is not None:
+        w = x0_weight.detach().mean()
+    else:
+        w = 1.0
+    total_loss = noise_loss + w * (0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * components["content_loss"])
     return {
         "loss": total_loss,
         "noise_loss": noise_loss,
@@ -523,7 +519,6 @@ def train_pack(
         scalar_totals = _init_scalar_totals(LOSS_COMPONENT_NAMES + ("loss",))
 
         current_step = step + 1
-        content_loss_weight = _content_loss_weight_for_step(step, steps)
 
         for _accum_idx in range(grad_accum_steps):
             try:
@@ -543,6 +538,8 @@ def train_pack(
             # Add noise
             noisy_target, true_noise = add_noise(target_rgb, t, alphas_cumprod)
 
+            x0_weight = alphas_cumprod[t - 1].view(target_rgb.shape[0], 1, 1, 1)
+
             with autocast_context():
                 pred_noise = model(noisy_target, content_rgb, style_refs, t, style_ref_mask=style_ref_mask)
                 pred_x0 = torch.clamp(
@@ -552,7 +549,8 @@ def train_pack(
                 )
                 loss_components = _compute_loss(
                     pred_noise, true_noise, pred_x0, content_rgb, target_rgb,
-                    content_loss_weight=content_loss_weight,
+                    content_loss_weight=CONTENT_LOSS_WEIGHT,
+                    x0_weight=x0_weight,
                 )
                 loss = loss_components["loss"] / grad_accum_steps
 
