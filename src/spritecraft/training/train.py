@@ -590,10 +590,10 @@ def train_pack(
         pending_metric_history.append(metric_record)
 
         if writer is not None:
-            writer.add_scalar("training/0_summary/loss", average_loss, current_step)
-            writer.add_scalar("training/0_summary/learning_rate", lr, current_step)
+            writer.add_scalar("training (summary)/loss", average_loss, current_step)
+            writer.add_scalar("training (summary)/learning_rate", lr, current_step)
             for name in LOSS_COMPONENT_NAMES:
-                writer.add_scalar(f"training/1_details/{name}", averaged_scalars[name], current_step)
+                writer.add_scalar(f"training (details)/{name}", averaged_scalars[name], current_step)
 
         if current_step == 1 or current_step % history_flush_interval == 0 or current_step == steps:
             _append_metric_history(metrics_path, pending_metric_history)
@@ -812,19 +812,19 @@ def _run_validation(
 
     if writer is not None:
         from spritecraft.inference.evaluate import _tile_images
-        writer.add_scalar("validation/0_summary/loss", avg_loss, step)
+        writer.add_scalar("validation (summary)/loss", avg_loss, step)
         for name in VAL_SCALAR_NAMES:
             if name != "loss":
-                writer.add_scalar(f"validation/1_details/{name}", averaged_scalars[name], step)
+                writer.add_scalar(f"validation (details)/{name}", averaged_scalars[name], step)
         if recolor_images:
             tiled = _tile_images(recolor_images, columns=2)
-            writer.add_image("validation/0_summary/recolor", np.array(tiled), step, dataformats="HWC")
+            writer.add_image("validation (summary)/recolor", np.array(tiled), step, dataformats="HWC")
         if diffusion_images:
             tiled = _tile_images(diffusion_images, columns=2)
-            writer.add_image("validation/0_summary/diffusion", np.array(tiled), step, dataformats="HWC")
+            writer.add_image("validation (summary)/diffusion", np.array(tiled), step, dataformats="HWC")
         if selected_images:
             tiled = _tile_images(selected_images, columns=2)
-            writer.add_image("validation/0_summary/selected", np.array(tiled), step, dataformats="HWC")
+            writer.add_image("validation (summary)/selected", np.array(tiled), step, dataformats="HWC")
 
     if training_state_dict is not None:
         _restore_training_weights(model, training_state_dict)

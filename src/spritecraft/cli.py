@@ -66,15 +66,16 @@ def main():
         elif args.mode == "std_only":
             train.run(args.checkpoint_dir, args.steps, args.pack)
         else:  # recolor_first
+            recolor_steps = max(2_000, args.steps // 4)
             if args.pack is not None:
-                recolor_train.run_recolor(args.checkpoint_dir, args.steps, args.pack)
+                recolor_train.run_recolor(args.checkpoint_dir, recolor_steps, args.pack)
                 train.run(args.checkpoint_dir, args.steps, args.pack, recolor_checkpoint_dir=args.checkpoint_dir)
             else:
                 from spritecraft.data.dataset import get_available_pack_ids
                 packs = get_available_pack_ids()
                 for pid in packs:
                     print(f"\n=== Pack {pid}: RecolorNet ===")
-                    recolor_train.run_recolor(args.checkpoint_dir, args.steps, pid)
+                    recolor_train.run_recolor(args.checkpoint_dir, recolor_steps, pid)
                     print(f"\n=== Pack {pid}: StyleAwareUNet ===")
                     train.run(args.checkpoint_dir, args.steps, pid, recolor_checkpoint_dir=args.checkpoint_dir)
     elif args.command == "generate":

@@ -150,7 +150,7 @@ def _tensorboard_log_dir(checkpoint_dir: Path, pack_id: str) -> Path:
 def train_recolor_pack(
     pack_id: str,
     checkpoint_dir: Path,
-    steps: int = 5_000,
+    steps: int = 2_500,
     device: torch.device | None = None,
     save_interval: int = 500,
     validation_interval: int = 500,
@@ -198,10 +198,10 @@ def train_recolor_pack(
         recon_weight=1.0,
         edge_weight=0.5,
         color_weight=1.5,
-        content_identity_weight=0.05,
+        content_identity_weight=0.10,
     )
 
-    optimizer = AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
+    optimizer = AdamW(model.parameters(), lr=3e-4, weight_decay=0.03)
     warmup_steps = max(1, int(steps * WARMUP_FRACTION))
     warmup_scheduler = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=max(steps - warmup_steps, 1), eta_min=1e-6)
@@ -257,10 +257,10 @@ def train_recolor_pack(
 
         if writer is not None:
             scalars = {k: float(v.item()) for k, v in loss_dict.items()}
-            writer.add_scalar("training/0_summary/loss", scalars["loss"], current_step)
-            writer.add_scalar("training/0_summary/learning_rate", lr, current_step)
+            writer.add_scalar("training (summary)/recolor_loss", scalars["loss"], current_step)
+            writer.add_scalar("training (summary)/recolor_learning_rate", lr, current_step)
             for name in LOSS_COMPONENT_NAMES:
-                writer.add_scalar(f"training/1_details/{name}", scalars[name], current_step)
+                writer.add_scalar(f"training (details)/recolor_{name}", scalars[name], current_step)
 
         if current_step == 1 or current_step % 50 == 0 or current_step == steps:
             scalars = {k: float(v.item()) for k, v in loss_dict.items()}
@@ -310,7 +310,7 @@ def _run_recolor_validation(
         recon_weight=1.0,
         edge_weight=0.5,
         color_weight=1.5,
-        content_identity_weight=0.05,
+        content_identity_weight=0.10,
     )
 
     scalar_totals = {name: 0.0 for name in LOSS_COMPONENT_NAMES + ("loss",)}
@@ -348,20 +348,20 @@ def _run_recolor_validation(
 
     if writer is not None:
         if count > 0:
-            writer.add_scalar("validation/0_summary/loss", averaged["loss"], step)
+            writer.add_scalar("validation (summary)/recolor_loss", averaged["loss"], step)
             for name in LOSS_COMPONENT_NAMES:
-                writer.add_scalar(f"validation/1_details/{name}", averaged[name], step)
+                writer.add_scalar(f"validation (details)/recolor_{name}", averaged[name], step)
         if comparison_images:
             from spritecraft.inference.evaluate import _tile_images
             tiled = _tile_images(comparison_images, columns=2)
-            writer.add_image("validation/0_summary/recolor", np.array(tiled), step, dataformats="HWC")
+            writer.add_image("validation (summary)/recolor", np.array(tiled), step, dataformats="HWC")
 
     if training_state_dict is not None:
         _restore_training_weights(model, training_state_dict)
     model.train()
 
 
-def run_recolor(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 5_000, pack_id: str | None = None):
+def run_recolor(checkpoint_dir: str | Path = CHECKPOINTS_DIR, steps: int = 2_500, pack_id: str | None = None):
     """Train RecolorNet for one or all packs."""
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)

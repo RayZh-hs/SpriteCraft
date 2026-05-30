@@ -61,6 +61,7 @@ class RecolorNet(nn.Module):
 
         self.bottleneck = nn.Sequential(
             ResBlock(base_channels),
+            nn.Dropout2d(0.1),
             ResBlock(base_channels),
         )
 

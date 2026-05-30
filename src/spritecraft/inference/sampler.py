@@ -19,7 +19,9 @@ from spritecraft.models.unet import StyleAwareUNet
 DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
 # Minimum structural quality for diffusion to be considered viable.
 # Below this, the output is visually garbled/smeared and should be rejected.
-MIN_STRUCTURAL_QUALITY = 0.45
+MIN_STRUCTURAL_QUALITY = 0.55
+# Structural quality above which diffusion is confidently preferred over recolor.
+GOOD_STRUCTURAL_QUALITY = 0.75
 
 
 class PredictionBundleResult(TypedDict):
@@ -417,6 +419,7 @@ def sample_rgb(
 
     # Determine diffusion viability: structural quality must meet minimum bar
     diffusion_viable = best_struct >= MIN_STRUCTURAL_QUALITY
+    diffusion_confident = best_struct >= GOOD_STRUCTURAL_QUALITY
 
     # === PHASE 2: Generate RecolorNet candidate ===
     recolor_style = float("-inf")
@@ -429,39 +432,41 @@ def sample_rgb(
         recolor_pred = recolor_rgb.cpu()
         recolor_style = _style_quality(recolor_pred)
 
-    # Decision: prefer diffusion when it's structurally viable AND has
-    # good style consistency. Fall back to recolor when diffusion is either
-    # garbled structure or has significantly worse style.
-    if diffusion_viable:
-        if recolor_pred is None or best_style >= recolor_style:
-            # Diffusion wins on style or recolor not available
-            result = best_pred
-            chosen_source = best_source
-            chosen_score = best_style
-        elif recolor_style > best_style + 0.05:
-            # Recolor clearly wins on style
+    # Decision: when diffusion has confident structure, prefer it unless
+    # recolor is clearly better on style. When diffusion is borderline,
+    # prefer the structurally perfect recolor unless diffusion is clearly
+    # better on style. When diffusion is garbage, always fall back.
+    CLEAR_MARGIN = 0.10
+
+    if recolor_pred is None:
+        result = best_pred
+        chosen_source = best_source
+        chosen_score = best_style
+    elif diffusion_confident:
+        # Diffusion has strong structure — prefer it unless recolor clearly wins
+        if recolor_style > best_style + CLEAR_MARGIN:
             result = recolor_pred
             chosen_source = "recolor_net"
             chosen_score = recolor_style
         else:
-            # Both viable and similar style — prefer diffusion
             result = best_pred
             chosen_source = best_source
             chosen_score = best_style
-    else:
-        # Diffusion structurally poor — fall back to recolor
-        if recolor_pred is not None:
+    elif diffusion_viable:
+        # Borderline structure — prefer recolor unless diffusion clearly wins
+        if best_style > recolor_style + CLEAR_MARGIN:
+            result = best_pred
+            chosen_source = best_source
+            chosen_score = best_style
+        else:
             result = recolor_pred
             chosen_source = "recolor_net"
-            chosen_score = recolor_style if recolor_style > float("-inf") else best_style
-        elif recolor_candidate is not None:
-            result = recolor_candidate.cpu()
-            chosen_source = "support_recolor"
-            chosen_score = _style_quality(recolor_candidate.cpu())
-        else:
-            result = best_pred
-            chosen_source = best_source
-            chosen_score = best_style
+            chosen_score = recolor_style
+    else:
+        # Diffusion structurally poor — fall back to recolor
+        result = recolor_pred
+        chosen_source = "recolor_net"
+        chosen_score = recolor_style
 
     if return_source:
         return result, chosen_source, float(chosen_score)

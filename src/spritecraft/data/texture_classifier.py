@@ -97,6 +97,21 @@ def evaluate_diffusion_output(
     c_detail = _high_pass_residual(c_gray)
     detail_coherence = _cosine_similarity(d_detail.flatten(), c_detail.flatten())
 
+    # === 3.5. Noise/artifact detection via excess high-pass energy ===
+    # If diffusion injects significantly more high-frequency energy than
+    # the content contains, it is adding grain/noise rather than detail.
+    d_detail_energy = float(np.abs(d_detail).mean())
+    c_detail_energy = float(np.abs(c_detail).mean())
+    if c_detail_energy > 1e-8:
+        detail_energy_ratio = d_detail_energy / (c_detail_energy + 1e-8)
+        if detail_energy_ratio > 1.3:
+            noise_fidelity = max(0.0, 1.0 - (detail_energy_ratio - 1.3))
+        else:
+            noise_fidelity = 1.0
+    else:
+        detail_energy_ratio = 1.0
+        noise_fidelity = 1.0
+
     # === 4. Entropy delta ===
     # Large entropy increase = noise injection. Large drop = washed out.
     c_hist = np.histogram(c_gray, bins=16, range=(0, 1))[0].astype(np.float32)
@@ -127,25 +142,23 @@ def evaluate_diffusion_output(
     # Gradient alignment is most important — it directly measures
     # whether the output "respects" the content's structure.
     quality = (
-        0.35 * grad_alignment
-        + 0.25 * edge_fidelity
-        + 0.20 * detail_coherence
-        + 0.15 * ent_score
-        + 0.05  # baseline offset for very simple content
+        0.30 * grad_alignment
+        + 0.20 * edge_fidelity
+        + 0.15 * detail_coherence
+        + 0.15 * noise_fidelity
+        + 0.10 * ent_score
+        + 0.10  # baseline offset for very simple content
     )
 
     # Adjust threshold by content complexity:
-    # - Simple content (ores, stone): need high quality (≥ 0.65) to accept diffusion
-    # - Complex content (leaves, bookshelf): accept lower quality (≥ 0.50) since
-    #   diffusion is expected to struggle, but still check minimum bar
+    # - Simple content (ores, stone): need high quality to accept diffusion
+    # - Complex content (leaves, bookshelf): more lenient but still strict
     if content_complexity < 0.3:
-        # Simple content: bar is higher
-        threshold = 0.60
+        threshold = 0.65
     elif content_complexity < 0.5:
-        threshold = 0.55
+        threshold = 0.60
     else:
-        # Complex content: accept lower quality from diffusion, fallback to recolor
-        threshold = 0.45
+        threshold = 0.55
 
     use_diffusion = quality >= threshold
 
@@ -156,6 +169,8 @@ def evaluate_diffusion_output(
         "grad_alignment": round(grad_alignment, 4),
         "edge_fidelity": round(edge_fidelity, 4),
         "detail_coherence": round(detail_coherence, 4),
+        "noise_fidelity": round(noise_fidelity, 4),
+        "detail_energy_ratio": round(detail_energy_ratio, 4),
         "entropy_score": round(ent_score, 4),
         "content_complexity": round(content_complexity, 4),
         "content_entropy": round(c_entropy, 4),
