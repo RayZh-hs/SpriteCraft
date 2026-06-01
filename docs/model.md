@@ -85,7 +85,8 @@ Key design decisions:
 1. **Diffusion first**: sample 2 stochastic candidates. If the best diffusion score ≥ 0.50 (support descriptor cosine similarity minus sharpness penalty), use it.
 2. **RecolorNet fallback**: if available and score ≥ 0.40 within 0.25 margin, use the learned recolor.
 3. **Deterministic recolor**: support-pair affine color migration or style-stat recolor as last resort.
-4. **Detail injection**: for each diffusion candidate, blend with recolor output at amounts [0.35, 0.65] — preserves color palette while borrowing structural detail from the recolor.
+4. **Detail injection**: for the best diffusion candidate, try support-pair detail fusion at amounts [0.35, 0.65]. The fusion starts from the original diffusion prediction and only injects missing high-frequency residuals from the deterministic recolor where local layouts still agree, avoiding the global blur caused by rebuilding the image from a blurred diffusion base.
+5. **Source-relative style check**: candidate style is scored not only against support descriptors, but also by how closely its change-from-vanilla matches the support pack's typical change magnitude. This penalizes recolor outputs that stay too close to vanilla on stylized packs.
 
 ## What Is Implemented
 

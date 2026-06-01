@@ -13,6 +13,11 @@ from __future__ import annotations
 import numpy as np
 
 
+HIGH_PATTERN_EDGE = 0.09
+HIGH_PATTERN_DETAIL = 0.05
+HIGH_PATTERN_COMPLEXITY = 0.50
+
+
 def _to_gray(rgb: np.ndarray) -> np.ndarray:
     """Convert [H, W, 3] float RGB to luminance."""
     return 0.299 * rgb[:, :, 0] + 0.587 * rgb[:, :, 1] + 0.114 * rgb[:, :, 2]
@@ -45,6 +50,27 @@ def _high_pass_residual(gray: np.ndarray, ksize: int = 3) -> np.ndarray:
     windows = np.lib.stride_tricks.as_strided(padded, shape=shape, strides=strides)
     blurred = windows.mean(axis=(2, 3))
     return gray - blurred
+
+
+def _ratio_window_score(
+    ratio: float,
+    *,
+    low: float,
+    high: float,
+    min_ratio: float,
+    max_ratio: float,
+) -> float:
+    """Score a ratio against a preferred window with linear falloff."""
+    if min_ratio >= low or max_ratio <= high:
+        raise ValueError("Expected min_ratio < low < high < max_ratio")
+
+    if ratio < min_ratio or ratio > max_ratio:
+        return 0.0
+    if ratio < low:
+        return (ratio - min_ratio) / (low - min_ratio)
+    if ratio > high:
+        return (max_ratio - ratio) / (max_ratio - high)
+    return 1.0
 
 
 def evaluate_diffusion_output(
@@ -136,6 +162,39 @@ def evaluate_diffusion_output(
     c_entropy_norm = c_entropy / np.log(16)  # [0,1]
     c_edge_norm = min(c_edge / 0.25, 1.0)    # normalize
     content_complexity = 0.5 * (c_entropy_norm + c_edge_norm)
+    high_pattern_content = (
+        content_complexity >= HIGH_PATTERN_COMPLEXITY
+        and c_edge >= HIGH_PATTERN_EDGE
+        and c_detail_energy >= HIGH_PATTERN_DETAIL
+    )
+
+    high_pattern_gate = 1.0
+    pattern_edge_fidelity = 1.0
+    pattern_detail_fidelity = 1.0
+    if high_pattern_content:
+        # Textures with strong line art / repeated bands (for example TNT sides)
+        # should not pass on "roughly enough edges" alone. They need aligned
+        # detail and a tighter edge/detail energy match.
+        pattern_edge_fidelity = _ratio_window_score(
+            edge_ratio,
+            low=0.78,
+            high=1.18,
+            min_ratio=0.55,
+            max_ratio=1.45,
+        )
+        pattern_detail_fidelity = _ratio_window_score(
+            detail_energy_ratio,
+            low=0.80,
+            high=1.16,
+            min_ratio=0.55,
+            max_ratio=1.35,
+        )
+        positive_detail_gate = max(0.0, min(1.0, detail_coherence / 0.35))
+        high_pattern_gate = min(
+            pattern_edge_fidelity,
+            pattern_detail_fidelity,
+            positive_detail_gate,
+        )
 
     # === Composite quality score ===
     # Weight components to emphasize structural preservation.
@@ -149,6 +208,8 @@ def evaluate_diffusion_output(
         + 0.10 * ent_score
         + 0.03  # modest baseline to keep scores anchored
     )
+    if high_pattern_content:
+        quality *= 0.55 + 0.45 * high_pattern_gate
 
     # Adjust threshold by content complexity:
     # - Simple content (ores, stone): need high quality to accept diffusion
@@ -159,8 +220,10 @@ def evaluate_diffusion_output(
         threshold = 0.55
     else:
         threshold = 0.50
+    if high_pattern_content:
+        threshold = max(threshold, 0.68)
 
-    use_diffusion = quality >= threshold
+    use_diffusion = quality >= threshold and (not high_pattern_content or detail_coherence > 0.0)
 
     return {
         "quality_score": round(quality, 4),
@@ -173,6 +236,10 @@ def evaluate_diffusion_output(
         "detail_energy_ratio": round(detail_energy_ratio, 4),
         "entropy_score": round(ent_score, 4),
         "content_complexity": round(content_complexity, 4),
+        "high_pattern_content": high_pattern_content,
+        "high_pattern_gate": round(high_pattern_gate, 4),
+        "pattern_edge_fidelity": round(pattern_edge_fidelity, 4),
+        "pattern_detail_fidelity": round(pattern_detail_fidelity, 4),
         "content_entropy": round(c_entropy, 4),
         "diff_entropy": round(d_entropy, 4),
         "content_edge": round(c_edge, 6),

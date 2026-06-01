@@ -218,15 +218,110 @@ def _local_blur(rgb_tensor: torch.Tensor) -> torch.Tensor:
     return torch.nn.functional.avg_pool2d(padded, kernel_size=3, stride=1).squeeze(0)
 
 
+def _detail_residual(rgb_tensor: torch.Tensor) -> torch.Tensor:
+    """Extract a small high-frequency residual from an RGB tensor."""
+    return rgb_tensor - _local_blur(rgb_tensor)
+
+
+def _ratio_match_score(
+    candidate_value: float,
+    reference_value: float,
+    *,
+    min_ratio: float,
+    max_ratio: float,
+) -> float:
+    """Score how well a candidate matches a support-derived change magnitude."""
+    if reference_value <= 1e-5:
+        return 1.0
+
+    ratio = candidate_value / reference_value
+    if ratio < min_ratio:
+        return max(0.0, min(1.0, ratio / min_ratio))
+    if ratio > max_ratio:
+        fade_span = max_ratio
+        return max(0.0, min(1.0, 1.0 - (ratio - max_ratio) / fade_span))
+    return 1.0
+
+
+def _support_change_score(
+    prediction_rgb: torch.Tensor,
+    content_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+    support_content_refs: torch.Tensor | None = None,
+) -> float:
+    """Reward candidates whose change magnitude matches the support pack.
+
+    Recolor-heavy fallbacks can score well on raw support similarity while
+    staying too close to vanilla. This source-relative term compares the
+    prediction's change from content against how much the support pack
+    typically changes its vanilla counterparts.
+    """
+    if support_content_refs is None:
+        return 1.0
+
+    content = content_rgb[0] if content_rgb.dim() == 4 else content_rgb
+    content = content.to(device=prediction_rgb.device, dtype=prediction_rgb.dtype)
+    active_style_refs = _active_reference_tensors(style_refs, style_ref_mask).to(
+        device=prediction_rgb.device,
+        dtype=prediction_rgb.dtype,
+    )
+    active_source_refs = _active_reference_tensors(support_content_refs, style_ref_mask).to(
+        device=prediction_rgb.device,
+        dtype=prediction_rgb.dtype,
+    )
+    if active_style_refs.shape[0] == 0 or active_style_refs.shape[0] != active_source_refs.shape[0]:
+        return 1.0
+
+    candidate_change = float((prediction_rgb - content).abs().mean().item())
+    support_change = float((active_style_refs - active_source_refs).abs().mean().item())
+
+    candidate_detail_change = float((_detail_residual(prediction_rgb) - _detail_residual(content)).abs().mean().item())
+    support_detail_change = float(
+        np.mean(
+            [
+                (_detail_residual(style_ref) - _detail_residual(source_ref)).abs().mean().item()
+                for source_ref, style_ref in zip(active_source_refs, active_style_refs, strict=True)
+            ]
+        )
+    )
+
+    low_freq_score = _ratio_match_score(candidate_change, support_change, min_ratio=0.55, max_ratio=1.9)
+    detail_score = _ratio_match_score(candidate_detail_change, support_detail_change, min_ratio=0.50, max_ratio=1.75)
+    return 0.55 * low_freq_score + 0.45 * detail_score
+
+
 def _inject_detail(
     prediction_rgb: torch.Tensor,
     detail_source_rgb: torch.Tensor,
     amount: float,
 ) -> torch.Tensor:
-    """Preserve generated color while borrowing high-frequency structure from a stable source."""
+    """Preserve diffusion detail and only fill in structure it is missing.
+
+    The old blend rebuilt the output from a blurred diffusion base plus source
+    detail, which softened already-good diffusion samples. This version starts
+    from the original diffusion prediction and adds only the residual gap where
+    the source has stronger detail and the low-frequency layouts still agree.
+    """
     prediction_low = _local_blur(prediction_rgb)
-    source_detail = detail_source_rgb - _local_blur(detail_source_rgb)
-    return (prediction_low + amount * source_detail).clamp(0.0, 1.0)
+    source_low = _local_blur(detail_source_rgb)
+    prediction_detail = prediction_rgb - prediction_low
+    source_detail = detail_source_rgb - source_low
+    missing_detail = source_detail - prediction_detail
+
+    prediction_strength = prediction_detail.abs().mean(dim=0, keepdim=True)
+    source_strength = source_detail.abs().mean(dim=0, keepdim=True)
+    detail_need = ((source_strength - prediction_strength) / source_strength.clamp_min(1e-4)).clamp(0.0, 1.0)
+
+    low_freq_gap = (prediction_low - source_low).abs().mean(dim=0, keepdim=True)
+    layout_agreement = (1.0 - low_freq_gap / 0.35).clamp(0.0, 1.0)
+
+    detail_alignment = (prediction_detail * source_detail).mean(dim=0, keepdim=True)
+    alignment_gate = torch.where(detail_alignment >= 0, 1.0, 0.35).to(prediction_rgb.dtype)
+
+    inject_mask = detail_need * layout_agreement * alignment_gate
+    fused = prediction_rgb + amount * inject_mask * missing_detail
+    return fused.clamp(0.0, 1.0)
 
 
 def _support_descriptor_score(
@@ -269,6 +364,34 @@ def _support_descriptor_score(
     high_pass_shortfall = max(0.0, support_high_pass - prediction_high_pass) / (support_high_pass + 1e-6)
     sharpness_penalty = 0.2 * edge_shortfall + 0.1 * high_pass_shortfall
     return descriptor_score - sharpness_penalty
+
+
+def _support_style_score(
+    prediction_rgb: torch.Tensor,
+    content_rgb: torch.Tensor,
+    style_refs: torch.Tensor,
+    style_ref_mask: torch.Tensor | None = None,
+    support_content_refs: torch.Tensor | None = None,
+) -> float:
+    """Blend support-descriptor style with source-relative change agreement."""
+    descriptor_score = max(
+        0.0,
+        min(1.0, _support_descriptor_score(prediction_rgb, style_refs, style_ref_mask=style_ref_mask)),
+    )
+    change_score = max(
+        0.0,
+        min(
+            1.0,
+            _support_change_score(
+                prediction_rgb,
+                content_rgb,
+                style_refs,
+                style_ref_mask=style_ref_mask,
+                support_content_refs=support_content_refs,
+            ),
+        ),
+    )
+    return 0.65 * descriptor_score + 0.35 * change_score
 
 
 @torch.no_grad()
@@ -372,8 +495,13 @@ def sample_rgb(
         return evaluate_diffusion_output(pred_np, content_np)["quality_score"]
 
     def _style_quality(prediction: torch.Tensor) -> float:
-        score = _support_descriptor_score(prediction, style_refs, style_ref_mask=style_ref_mask)
-        return max(0.0, min(1.0, score))
+        return _support_style_score(
+            prediction,
+            content_rgb,
+            style_refs,
+            style_ref_mask=style_ref_mask,
+            support_content_refs=support_content_refs,
+        )
 
     # === PHASE 1: Generate diffusion candidates ===
     effective_candidates = max(1, num_candidates)
@@ -404,6 +532,7 @@ def sample_rgb(
     best_struct = best_diffusion_struct
     best_style = best_diffusion_style
     best_source = "diffusion"
+    diffusion_edge, diffusion_high_pass = _sharpness_stats(best_diffusion_pred)
 
     if recolor_candidate is not None:
         for amount in DETAIL_INJECTION_AMOUNTS:
@@ -412,7 +541,15 @@ def sample_rgb(
             ).cpu()
             injected_struct = _structural_quality(injected)
             injected_style = _style_quality(injected)
-            if injected_struct > best_struct and injected_style > 0.95 * best_style:
+            injected_edge, injected_high_pass = _sharpness_stats(injected)
+            injected_combined = injected_struct + injected_style
+            best_combined = best_struct + best_style
+            if (
+                injected_struct >= best_struct
+                and injected_combined > best_combined + 0.01
+                and injected_edge >= 0.97 * diffusion_edge
+                and injected_high_pass >= 0.97 * diffusion_high_pass
+            ):
                 best_pred = injected
                 best_struct = injected_struct
                 best_style = injected_style
