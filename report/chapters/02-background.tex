@@ -1,26 +1,24 @@
 \chapter{Background}
 \label{chap:background}
 
-\section{Texture Translation}
+\section{Neural Style Transfer}
 
-Neural style transfer popularized the separation of image content and style using learned visual representations \citep{gatys2016image}.
-SpriteCraft differs from general photographic style transfer because its outputs are small game textures rather than natural images.
-The desired result must be visually plausible both as a single icon and as a repeating tile in the game world.
+Pioneered by Gatys et al.~\citep{gatys2016image}, neural style transfer separates image representations into content and style components using the feature activations of pre-trained convolutional networks. Subsequent work introduced feed-forward generator networks for real-time stylization \citep{johnson2016perceptual} and conditional adversarial frameworks for paired image-to-image translation \citep{isola2017image}. SpriteCraft occupies an intermediate position: the input--output pairing is supervised (vanilla to target pack), but the style is defined by a small set of reference exemplars rather than a global style representation. Unlike photographic style transfer, the output domain consists of small, tileable game textures where pixel-level structure carries semantic meaning.
 
 \section{Diffusion Models}
 
-Denoising diffusion probabilistic models learn to reverse a gradual noising process \citep{ho2020denoising}.
-SpriteCraft uses a compact diffusion model that predicts noise at each timestep and recovers a clean texture estimate during sampling.
-The small \(32 \times 32\) resolution keeps training and inference tractable, but it makes detail placement and contrast preservation especially important.
+Denoising diffusion probabilistic models (DDPMs) \citep{ho2020denoising} learn to reverse a gradual Gaussian noising process, generating samples by iteratively denoising pure noise through a learned Markov chain. Subsequent refinements introduced improved noise schedules \citep{nichol2021improved}, classifier-free guidance \citep{dhariwal2021diffusion}, and latent-space diffusion for high-resolution synthesis \citep{rombach2022high}. The continuous-time formulation of Song et al.~\citep{song2021scorebased} unifies DDPMs with score-based generative models.
 
-\section{Encoder-Decoder Networks}
+For conditional generation, diffusion models can incorporate conditioning signals through cross-attention, concatenation, or feature modulation. Palette \citep{saharia2022palette} demonstrated that a single diffusion framework can unify diverse image-to-image tasks including colorization, inpainting, and uncropping. SpriteCraft adopts epsilon-prediction DDPM with a compact 40-timestep cosine schedule, conditioning on vanilla content, style references, and diffusion timestep through a combination of early fusion, cross-attention, and sinusoidal time embeddings. The $32\times32$ resolution keeps training tractable but magnifies the importance of detail placement and contrast preservation.
 
-U-Net style encoder-decoder networks are a standard choice for dense prediction because they combine coarse contextual features with high-resolution skip connections \citep{ronneberger2015unet}.
-SpriteCraft uses this pattern in both the diffusion model and the recoloring fallback.
-The diffusion model conditions on content, timestep, and ranked style references; the recoloring model emphasizes deterministic structure preservation.
+\section{U-Net Architecture}
+
+U-Net \citep{ronneberger2015unet} combines a contracting encoder path with an expanding decoder path, using skip connections to preserve fine spatial information that would otherwise be lost through bottleneck compression. This architecture has become standard for dense prediction tasks including image segmentation, image-to-image translation, and diffusion-based generation \citep{dhariwal2021diffusion}. SpriteCraft employs ResBlock-based \citep{he2016deep} encoder-decoder stacks in both models: the StyleAwareUNet for iterative denoising, and the RecolorNet for deterministic structure-preserving color transfer. The diffusion U-Net additionally incorporates multi-head cross-attention \citep{vaswani2017attention} at the bottleneck, allowing content queries to attend across tokenized style reference features.
+
+\section{Pixel Art and Low-Resolution Image Synthesis}
+
+Low-resolution image synthesis presents unique challenges distinct from photographic generation. Pixel art textures typically contain large color contrasts, discrete palette boundaries, and structural motifs (mortar lines, ore flecks, wood grain) whose placement carries semantic meaning. Recent work on pixel art processing includes specialized upscaling approaches \citep{hou2021coordinates} and palette-based generation methods. In the Minecraft ecosystem, community-developed tools such as procedural texture generators and color-mapping scripts exist, but they lack the ability to learn per-pack style representations from exemplars. SpriteCraft bridges this gap: by framing the problem as supervised pair-wise style transfer with learned reference selection, the system can adapt to arbitrary pack styles without manual rule definition.
 
 \section{Optimization}
 
-The training loops use AdamW, which decouples weight decay from adaptive gradient updates \citep{loshchilov2019decoupled}.
-The current diffusion objective combines noise prediction with reconstruction, gradient, and content-aware losses.
-This gives the report a natural structure for separating optimization behavior from perceptual output quality.
+The training loops use AdamW \citep{loshchilov2019decoupled}, which decouples weight decay from adaptive gradient updates. Both models employ a learning rate schedule combining linear warmup (first 5\% of steps, from $0.1\times$ to $1.0\times$ base LR) with cosine annealing to a minimum of $10^{-6}$. Exponential moving average (EMA) with decay 0.995 is maintained for both models and used during validation. Gradient clipping at $\ell_2$ norm 1.0 and automatic mixed precision (bfloat16) are applied throughout diffusion training.

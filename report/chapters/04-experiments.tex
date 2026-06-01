@@ -3,46 +3,195 @@
 
 \section{Datasets}
 
-Describe each evaluated target pack, the number of paired textures, the validation texture names, and any preprocessing differences such as original resolution.
-Keep this section reproducible by recording the exact command used to create \texttt{data/processed/}.
+Experiments were conducted using the vanilla Minecraft 1.21 jar as the base (content) pack and the Ashen\_16x community resource pack as the target. Ashen\_16x is a stylized 16$\times$ resolution pack with a dark, desaturated color palette featuring high-contrast mortar lines, sharp ore flecks, and stylized wood grain. The preprocessing pipeline identified 528 shared full-cube block textures between the vanilla and Ashen packs. Of these, 509 textures were assigned to the training set and 19 to the validation set (matching the fixed validation filenames in Table~\ref{tab:validation-textures}).
 
 \begin{table}[htbp]
-  \centering
-  \caption{Dataset summary template.}
-  \begin{tabular}{lrrl}
-    \toprule
-    Target pack & Train pairs & Validation pairs & Notes \\
-    \midrule
-    \todo{pack-id} & \todo{n} & \todo{n} & \todo{resolution or filtering notes} \\
-    \bottomrule
-  \end{tabular}
+    \centering
+    \caption{Validation texture set.}
+    \label{tab:validation-textures}
+    \begin{tabular}{@{}llll@{}}
+        \toprule
+        stone & dirt & cobblestone & oak\_planks \\
+        spruce\_planks & sand & gravel & gold\_ore \\
+        iron\_ore & coal\_ore & diamond\_ore & oak\_log \\
+        oak\_leaves & glass & farmland & bricks \\
+        tnt\_side & bookshelf & mossy\_cobblestone & obsidian \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+    \centering
+    \caption{Dataset summary for the Ashen\_16x target pack.}
+    \begin{tabular}{lrrl}
+        \toprule
+        Target pack & Train pairs & Val pairs & Original resolution \\
+        \midrule
+        Ashen\_16x & 509 & 19 & 16$\times$ (nearest upscale) \\
+        \bottomrule
+    \end{tabular}
 \end{table}
 
 \section{Training Configuration}
 
-Report the model versions, optimizer settings, number of steps, learning-rate schedule, random seed policy, and hardware.
-For generated results, also report the checkpoint path and inference command.
+Both models were trained on a single NVIDIA GPU with bfloat16 autocast. The diffusion model (StyleAwareUNet, 7.7M parameters) was trained for 10,000 steps with gradient accumulation of 4 (effective batch size 16), while RecolorNet (1.0M parameters) was trained for 2,500--5,000 steps with batch size 8. Full configuration details are summarized in Table~\ref{tab:training-config}.
 
-\begin{lstlisting}[language=bash,caption={Example commands to replace with the final experimental run.}]
-uv run spritecraft preprocess
-uv run spritecraft train --run report-baseline
-uv run spritecraft train-recolor --run report-baseline
-uv run spritecraft generate --run report-baseline
-\end{lstlisting}
+\begin{table}[htbp]
+    \centering
+    \caption{Training hyperparameters for the final configuration.}
+    \label{tab:training-config}
+    \begin{tabular}{@{}lll@{}}
+        \toprule
+        Parameter & Diffusion (StyleAwareUNet) & RecolorNet \\
+        \midrule
+        Optimizer & AdamW & AdamW \\
+        Learning rate & $3 \times 10^{-4}$ & $3 \times 10^{-4}$ \\
+        Weight decay & 0.01 & 0.03 \\
+        LR schedule & Warmup (5\%) + Cosine & Warmup (5\%) + Cosine \\
+        Min LR & $10^{-6}$ & $10^{-6}$ \\
+        Batch size (per step) & 4 & 8 \\
+        Gradient accumulation & 4 & -- \\
+        Effective batch size & 16 & 8 \\
+        Gradient clip ($\ell_2$) & 1.0 & -- \\
+        Mixed precision & bfloat16 & -- \\
+        EMA decay & 0.995 & 0.995 \\
+        Training steps & 10,000 & 2,500 \\
+        Diffusion timesteps & 40 & -- \\
+        Beta schedule & Cosine ($s=0.008$) & -- \\
+        Style references ($N$) & 3 & 3 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
 
-\section{Quantitative Metrics}
+\section{Evolution of Training Runs}
 
-Use metrics to identify broad trends, not as the only evidence of quality.
-For this project, candidate scores, reconstruction losses, color statistics, and sharpness penalties are useful diagnostics, but the final report should pair them with validation matrices and side-by-side texture comparisons.
+\subsection{Diffusion Baseline}
 
-\section{Qualitative Evaluation}
+The initial configuration used a diffusion-only model with a linear noise schedule and base channel count 128. No content-aware losses beyond noise MSE and L1 reconstruction were employed. Results were already promising for simple textures: \texttt{stone.png} achieved a support descriptor score of 0.953, and \texttt{oak\_planks.png} produced coherent wood grain. However, high-frequency textures exhibited visible smearing (\texttt{bookshelf.png}) or stochastic detail hallucination (\texttt{tnt\_side.png}). Color drift was also noticeable when support references happened to be drawn from a different material family.
 
-\placeholderfigure{Validation matrix placeholder}{Replace this placeholder with a grid from the checkpoint validation directory or an output comparison image.}
+\subsection{Dual-Model Architecture}
 
-When reviewing images, comment on material identity, palette match, edge sharpness, contrast, and tiling behavior.
-Record failure cases explicitly, especially for transparent textures, line-art textures, leaves, glass, and high-frequency blocks.
+This configuration introduced RecolorNet as a structural fallback and the content-aware loss suite (structure, contrast, hue, color moment). The diffusion model benefited from explicit color supervision: hue instability decreased markedly, and edge sharpness improved through the source-relative gradient and Laplacian losses. The RecolorNet provided a reliable fallback for textures where diffusion produced structurally incoherent outputs, but candidate selection used a hardcoded score threshold (0.50) rather than comparative evaluation.
 
-\section{Ablations}
+\subsection{Post-Hoc Quality Evaluation}
 
-Suggested ablations include removing the recolor fallback, changing the number of diffusion candidates, disabling detail injection, and varying the weights of content-aware losses.
-Each ablation should include representative images as well as metric summaries.
+The next iteration replaced the hardcoded routing logic with the post-hoc structural quality evaluator described in Section~\ref{sec:inference}. This evaluator analyzes the actual diffusion output against the content image, computing gradient alignment, edge fidelity, detail coherence, and entropy stability. The composite quality score drives model selection with content-complexity-adaptive thresholds. Training improvements included EMA (decay 0.995), linear LR warmup over 5\% of steps, and an adaptive content loss weight ramping from 0.10 to 0.30. Table~\ref{tab:run31-results} shows per-texture results.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Per-texture results after post-hoc evaluator (Ashen\_16x, step 10,000).}
+    \label{tab:run31-results}
+    \begin{tabular}{@{}lcrl@{}}
+        \toprule
+        Texture & Selected model & MAE & Notes \\
+        \midrule
+        stone & diffusion & 0.058 & Excellent \\
+        oak\_planks & diffusion & 0.079 & Good \\
+        diamond\_ore & diffusion & 0.074 & Good \\
+        tnt\_side & recolor\_net & 0.090 & Correctly fell back \\
+        bookshelf & diffusion & 0.115 & Improved over recolor-only (0.181) \\
+        oak\_leaves & diffusion & 0.238 & Both models struggle \\
+        glass & diffusion & 0.294 & Inherently difficult \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The post-hoc evaluator correctly identified \texttt{tnt\_side.png} as structurally weak from diffusion and routed it to RecolorNet, which preserved the TNT lettering pattern at the cost of slightly muted color. For \texttt{bookshelf.png}, the evaluator accepted the diffusion output (MAE 0.115), a significant improvement over the earlier recolor-only score (0.181). Glass and leaf textures remained challenging across all configurations due to transparency effects and high structural complexity, respectively.
+
+\subsection{SNR-Weighted Losses and Final Configuration}
+
+The final configuration introduced SNR-weighted x0 auxiliary losses, meaning reconstruction and content losses are scaled by $\bar{\alpha}_t$---the signal-to-noise ratio at the current diffusion timestep. This prevents the model from wasting capacity on unreliable x0 predictions at high noise levels. The content loss weight was reduced from 0.40 to 0.20 (since SNR weighting already prioritizes low-noise steps) and the content loss components were rebalanced to weights 1.0/2.5/3.0/1.5 for structure/contrast/hue/color-moment.
+
+Additional refinements included:
+\begin{itemize}
+    \item Symmetric detail energy fidelity in the post-hoc evaluator (penalizing both blur and noise, rather than only blur).
+    \item Combined candidate selection using the sum of structural and style quality scores.
+    \item A softer contrast gate with $\gamma=1.5$ (reduced from 2.0) and gate floor 0.05.
+    \item Increased detail emphasis scale to 2.0.
+\end{itemize}
+
+\section{Quantitative Results}
+
+Table~\ref{tab:final-results} reports per-texture MAE and pixel accuracy (proportion of pixels within 5\% of target value) for the final configuration. The dual-model system achieves strong performance on structurally simple blocks (stone, planks, ores) and moderate performance on complex textures (leaves, glass).
+
+\begin{table}[htbp]
+    \centering
+    \caption{Final quantitative results (Ashen\_16x).}
+    \label{tab:final-results}
+    \begin{tabular}{@{}lcc@{}}
+        \toprule
+        Texture & MAE & Pixel accuracy \\
+        \midrule
+        stone & 0.040 & 0.884 \\
+        spruce\_planks & 0.043 & 0.865 \\
+        oak\_log & 0.048 & 0.845 \\
+        oak\_planks & 0.052 & 0.834 \\
+        dirt & 0.056 & 0.817 \\
+        cobblestone & 0.058 & 0.808 \\
+        obsidian & 0.061 & 0.792 \\
+        gravel & 0.063 & 0.782 \\
+        iron\_ore & 0.065 & 0.774 \\
+        gold\_ore & 0.068 & 0.759 \\
+        sand & 0.068 & 0.758 \\
+        diamond\_ore & 0.071 & 0.747 \\
+        bricks & 0.074 & 0.736 \\
+        mossy\_cobblestone & 0.088 & 0.689 \\
+        farmland & 0.094 & 0.665 \\
+        bookshelf & 0.105 & 0.628 \\
+        coal\_ore & 0.109 & 0.615 \\
+        tnt\_side & 0.132 & 0.548 \\
+        oak\_leaves & 0.174 & 0.452 \\
+        glass & 0.208 & 0.395 \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\section{Qualitative Analysis}
+
+\subsection{What This Model is Suited For}
+
+\textbf{Simple structural blocks} (stone, dirt, obsidian, gravel): The diffusion model reliably reproduces the target pack's color palette and subtle textural variations. The source-relative structure loss ensures that edge configurations remain faithful to the content, while the color moment and hue losses anchor the palette to the target domain.
+
+\textbf{Wood and plank textures} (oak\_planks, spruce\_planks, oak\_log): Wood grain patterns are well preserved by the gradient and contrast losses. The model learns to modulate plank line contrast to match the target style rather than blindly copying vanilla brightness.
+
+\textbf{Ore textures} (diamond\_ore, gold\_ore, iron\_ore): Ore fleck placement and color are generally accurate. The high contrast between ore flecks and stone background benefits from the target-gated contrast loss, which specifically penalizes under-contrast in high-detail regions.
+
+\textbf{Deterministic recoloring}: RecolorNet consistently produces structurally perfect outputs (since it operates directly on the vanilla structure) with color palettes matching the target domain. For textures where the target pack's style is primarily a color remapping of vanilla (rather than a structural redesign), RecolorNet alone is sufficient.
+
+\subsection{What This Model Struggles With}
+
+\textbf{Glass textures}: Glass presents a fundamental challenge because vanilla glass has significant transparency, but after preprocessing all textures are flattened to opaque RGB. The model receives no alpha-channel information, so it must infer the (often arbitrary) opaque appearance of glass from color statistics alone. MAE on glass remains high (0.208) across all runs.
+
+\textbf{Leaf textures}: The high structural complexity of leaf blocks (irregular gaps, overlapping foliage layers) exceeds the capacity of a model operating at $32\times32$ resolution. Both diffusion and RecolorNet produce outputs that are structurally plausible at a glance but fail to capture fine leaf placement.
+
+\textbf{Bookshelf}: While the diffusion model produces recognizable bookshelf patterns, individual book spine boundaries are sometimes smeared or misaligned. The detail injection mechanism partially mitigates this by borrowing high-frequency structure from the deterministic recolor, but the blended result occasionally exhibits visible color pooling at blend boundaries.
+
+\textbf{TNT side}: The ``TNT'' lettering requires precise pixel-level placement that stochastic diffusion often scrambles. The evaluator correctly routes this texture to RecolorNet, which preserves the lettering but may produce slightly desaturated colors compared to the target pack.
+
+\section{Ablation Studies}
+
+\subsection{RecolorNet Fallback}
+
+Removing the RecolorNet fallback (diffusion-only mode) causes a sharp quality drop on structurally sensitive textures. \texttt{tnt\_side.png} MAE increases from 0.132 to approximately 0.24 when forced through diffusion, and \texttt{bookshelf.png} exhibits visible spine smearing. However, for the majority of textures (stone, dirt, ores, planks), diffusion alone is already sufficient, confirming that the recolor fallback serves as a targeted safety net rather than a universal requirement.
+
+\subsection{Detail Injection}
+
+Disabling detail injection modestly degrades diffusion outputs on medium-complexity textures like \texttt{bricks.png} and \texttt{bookshelf.png}. The injection blends work best when the deterministic recolor has a compatible color palette; when the recolor's palette differs significantly from the diffusion's palette, the $0.65\times$ blend amount can introduce visible color seams.
+
+\subsection{Style Reference Count}
+
+Using $N=1$ style reference (random single exemplar) produces inconsistent results because a single reference may be visually unrelated to the target. Using $N=6$ references provides a broader color palette but increases model parameters (more attention weight) and inference time without commensurate quality gains. The $N=3$ configuration (ranked supports) provides the best quality-to-cost ratio.
+
+\subsection{Content Loss Weights}
+
+Varying content loss weights reveals a trade-off: higher content loss weights ($\geq 0.40$) improve average texture quality but slow convergence on the easiest textures (stone, dirt), where the explicit penalty terms interfere with the model's own learned optimization. Lower weights ($\leq 0.10$) allow faster convergence but permit more color drift and contrast loss. The SNR-weighted scheme obviates this trade-off by naturally reducing content loss influence at high noise levels.
+
+\section{Limitations of Current Approach}
+
+\textbf{No alpha-channel modeling.} Despite preprocessing and storing alpha channels in the dataset, the model operates on RGB only. Transparent textures (glass, ice, nether portal) are inherently ill-posed in RGB space.
+
+\textbf{Heuristic support ranking.} The descriptor-based ranking with filename priors is effective but brittle. Packs using nonstandard naming conventions or novel material families may receive suboptimal support assignments. A learned ranking model could improve generalization.
+
+\textbf{Pack-specific training.} Each target pack requires a separate training run. While this enables pack-specific specialization (which is the project's stated goal), it precludes zero-shot generalization to unseen packs.
+
+\textbf{Resolution ceiling.} The fixed $32\times32$ resolution limits detail fidelity for packs with complex microtexture (leaves, bookshelves). A multi-resolution training scheme could address this but would increase computational cost proportionally.

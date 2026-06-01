@@ -1,47 +1,172 @@
 \chapter{Methodology}
-\label{chap:methodology}
+\label{chap:method}
 
 \section{Data Pipeline}
 
-Preprocessing extracts block textures from base and target resource packs, filters to full-cube block textures, resizes images to \(32 \times 32\), and writes per-pack datasets.
-Each training sample pairs one vanilla texture with the matching texture from one target pack.
-The pipeline also records metadata for style-reference sampling and validation.
+The preprocessing pipeline extracts block textures from base (vanilla) and target resource packs, resolves Minecraft blockstate models to identify full-cube block textures, resizes images to a canonical $32 \times 32$ resolution, and writes per-pack paired datasets. The pipeline operates on \texttt{.zip} or \texttt{.jar} archives placed in a raw packs directory.
 
-\section{Model Overview}
+\subsection{Full-Cube Texture Filtering}
 
-The current system uses two complementary models:
+Not all block textures in a Minecraft resource pack are suitable for training. Many blocks use non-cube models (fences, stairs, slabs, torches), animated textures, or overlay composites. To filter to valid full-cube block textures, the pipeline reads each block's \texttt{blockstate.json} file, resolves model references through parent inheritance chains, and checks whether the resolved model contains a $16 \times 16 \times 16$ cuboid element with all six faces textured. Only textures referenced by such full-cube models are retained. This filtering step is critical: including non-cube textures would introduce structural mismatches between content and target pairs, undermining the learned mapping.
 
+\subsection{Resolution Handling}
+
+Resource packs target three canonical resolutions: $16\times$, $32\times$, and $64\times$ (pixels per block face). The pipeline standardizes all textures to $32\times32$:
 \begin{itemize}
-  \item \textbf{StyleAwareUNet}: a diffusion model that fuses noisy target state with vanilla content, encodes multiple target-pack style references, and applies cross-attention at the bottleneck.
-  \item \textbf{RecolorNet}: a lightweight U-Net that predicts a residual over the vanilla content texture and acts as a fallback when diffusion candidates are structurally weak.
+    \item $16\times$ images are upscaled using nearest-neighbor interpolation to preserve crisp pixel edges.
+    \item $32\times$ images are used as-is.
+    \item $64\times$ images are downscaled using box (area) filtering rather than Lanczos, to keep texel edges crisper and avoid ringing artifacts.
 \end{itemize}
 
-\placeholderfigure{SpriteCraft generation overview}{Replace this placeholder with a pipeline diagram showing vanilla content input, style references, diffusion candidates, recolor fallback, and final candidate selection.}
+Images are filtered by aspect ratio (square only), file format (\texttt{.png}), and mode (RGBA, RGB, P, or L). Textures with accompanying \texttt{.mcmeta} animation files or \texttt{\_overlay} suffixes are excluded.
 
-\section{Conditioning}
+\subsection{Dataset Construction}
 
-The diffusion model receives the current noisy target image, the vanilla content image, three ranked style references from the same target pack, a validity mask for padded references, and the diffusion timestep.
-Reference ranking uses content descriptors and filename-family priors so that visually relevant materials are more likely to guide generation.
+For each non-base target pack, the pipeline identifies textures whose filenames appear in both the base pack and the target pack (shared textures). These are split into training and validation sets using a fixed validation filename set of 20 canonical block textures (\texttt{stone.png}, \texttt{oak\_planks.png}, \texttt{diamond\_ore.png}, etc.). The remaining shared textures form the training set. Each target pack also contributes all of its textures (not just shared ones) to a style reference pool for sampling during training and inference.
+
+The final per-pack dataset is stored as a compressed NumPy archive (\texttt{dataset.npz}) containing content and target RGB arrays for both splits, plus the full style reference pool. Metadata including filenames, base pack ID, and style labels are recorded in a companion \texttt{pair\_index.json}.
+
+\section{Model Architecture}
+
+SpriteCraft employs a dual-model architecture: a style-conditioned diffusion model for stochastic generation and a lightweight recoloring network for deterministic structure-preserving color transfer.
+
+\subsection{StyleAwareUNet}
+
+The primary model is a compact U-Net ($\sim$7.7M parameters) that predicts diffusion noise $\epsilon_\theta(x_t, c, s, t)$ given the noisy target $x_t$, vanilla content $c$, style references $s$, and diffusion timestep $t$. The architecture comprises:
+
+\textbf{Input fusion.} The noisy target and vanilla content share spatial structure (both are $3 \times 32 \times 32$ RGB tensors). They are encoded through separate $3\times3$ convolutional projections then summed before entering the encoder stack. This early fusion lets the denoiser access both the current noisy state and the vanilla structure at every spatial scale.
+
+\textbf{Encoder.} The encoder compresses the $32\times32$ representation through two strided convolutional downsampling stages to $8\times8$: $32 \rightarrow 16 \rightarrow 8$. Each stage consists of a stride-2 convolution followed by a ResBlock with GroupNorm and SiLU activation. Channel counts double at the first downsampling ($128 \rightarrow 256$) and remain at 256 thereafter.
+
+\textbf{Style encoding and cross-attention.} Each of the $N=3$ style reference textures passes through a shared style encoder that reduces it to a $64 \times 8 \times 8$ feature map. Rather than mean-pooling across references (which would destroy distinctive per-reference motifs), the style features are concatenated spatially into a single $64 \times 8 \times 8N$ context tensor. At the bottleneck, content features query this style context through multi-head cross-attention ($h=4$, zero-initialized output projection). A boolean validity mask ensures that padded (absent) references do not contribute to attention weights.
+
+\textbf{Timestep conditioning.} Diffusion timesteps are encoded through sinusoidal embeddings (dimension 64) followed by a two-layer MLP ($64 \rightarrow 256 \rightarrow 256$, SiLU activation), then added to the bottleneck representation.
+
+\textbf{Decoder.} The decoder reconstructs the $32\times32$ output through two transposed convolution stages ($8 \rightarrow 16 \rightarrow 32$) with ResBlocks. Spatial skip connections from the encoder at $32\times32$ and $16\times16$ preserve fine edge structure. The final $1\times1$ convolution produces a 3-channel noise prediction.
+
+\subsection{RecolorNet}
+
+The RecolorNet ($\sim$1.0M parameters) is a lightweight U-Net designed for structure-preserving color transfer. It takes the vanilla content texture and style references as input and predicts a residual added to the content, producing a recolored output in $[0,1]$. The architecture follows a simpler U-Net pattern with fewer channels (base 64) and no diffusion components:
+
+\begin{itemize}
+    \item The content encoder compresses the vanilla input to $64 \times 8 \times 8$ through two downsampling stages.
+    \item The style encoder (shared architecture with the diffusion U-Net's style encoder) processes reference textures, whose features are averaged with a validity mask and projected to the content feature space.
+    \item Style conditioning is injected additively at the bottleneck.
+    \item A decoder with transposed convolutions upscales to $32\times32$, with a direct skip connection to the raw content RGB at the final merge stage.
+    \item The output convolution is zero-initialized, making the initial prediction a pure copy of the content.
+\end{itemize}
+
+\section{Conditioning and Style Reference Ranking}
+
+Style reference selection is critical: given a target texture to generate, the model should be conditioned on exemplars from the same pack that are visually relevant to the task. SpriteCraft employs a heuristic ranking system based on two components:
+
+\textbf{Content descriptors.} Each texture is represented by a normalized descriptor vector combining gradient orientation histograms (8 bins), per-channel color histograms (4 bins $\times$ 3 channels), radial FFT energy features (4 bands), and statistical moments (mean, standard deviation, gradient energy, entropy). Descriptors are L2-normalized for cosine-similarity comparison.
+
+\textbf{Filename priors.} Texture filenames carry semantic information. Families (wood, foliage, ore, brick, glass, soil, stone, ceramic) and surface roles (top, bottom, side, end, core) are inferred from lexical token matching against predefined rules. Shared material tokens between candidate and target receive a similarity bonus; extraneous color tokens (e.g., ``red'' in ``red\_sand'' when the target is ``sand'') receive a penalty.
+
+The final ranking sorts candidates by composite score: descriptor cosine similarity plus token-based bonuses minus mis-match penalties. Training and inference both use the top-$N$ ranked candidates as style references, with $N=3$ in the current configuration.
 
 \section{Training Objective}
 
-The diffusion loss combines noise prediction with auxiliary reconstruction and content-aware penalties:
+\subsection{Diffusion Training}
+
+The StyleAwareUNet is trained to predict the noise $\epsilon$ that was added to a clean target $x_0$ at timestep $t$:
 
 \begin{equation}
-  \mathcal{L}_{total}
-  =
-  \mathcal{L}_{noise}
-  + 0.70\mathcal{L}_{recon}
-  + 0.30\mathcal{L}_{gradient}
-  + 0.30\mathcal{L}_{content}.
+    \mathcal{L}_{\text{noise}} = \mathbb{E}_{x_0, c, s, t, \epsilon}\left[ \|\epsilon - \epsilon_\theta(x_t, c, s, t)\|_2^2 \right]
 \end{equation}
 
-The content term includes structure, contrast, hue, and color-moment components.
-The important design choice is that structure comparisons are source-relative, while contrast and hue penalties are target-gated.
-This focuses the model on changes that matter for the target style without forcing flat or low-chroma regions to carry unnecessary detail.
+where $x_t = \sqrt{\bar{\alpha}_t}\,x_0 + \sqrt{1 - \bar{\alpha}_t}\,\epsilon$ and $\bar{\alpha}_t$ follows a cosine schedule ($s=0.008$, $\beta_{\max}=0.999$) with $T=40$ timesteps. The cosine schedule ensures near-zero terminal signal-to-noise ratio, preventing the model from exploiting residual clean signal at the terminal timestep.
 
-\section{Inference}
+From the predicted noise, the clean target estimate $\hat{x}_0$ is recovered via:
 
-Sampling starts from Gaussian noise and applies 40 reverse diffusion steps.
-The system samples multiple diffusion candidates, scores them against style support descriptors, optionally compares against a learned recolor candidate, and falls back to deterministic recoloring when necessary.
-The report should include qualitative examples whenever discussing this selection logic because scalar scores can miss tileability and material identity failures.
+\begin{equation}
+    \hat{x}_0 = \frac{x_t - \sqrt{1 - \bar{\alpha}_t}\,\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}
+\end{equation}
+
+Auxiliary losses are computed on $\hat{x}_0$ and weighted by the signal-to-noise ratio $\bar{\alpha}_t$ so that at high noise levels (where $\hat{x}_0$ is unreliable), the model focuses on noise prediction rather than reconstruction:
+
+\begin{equation}
+    \mathcal{L}_{\text{total}} = \mathcal{L}_{\text{noise}} + \bar{\alpha}_t \cdot \left(0.70\,\mathcal{L}_{\text{recon}} + 0.30\,\mathcal{L}_{\text{gradient}} + 0.20\,\mathcal{L}_{\text{content}}\right)
+\end{equation}
+
+where $\mathcal{L}_{\text{recon}}$ is L1 reconstruction loss on $\hat{x}_0$ and $\mathcal{L}_{\text{gradient}}$ combines luminance forward-difference L1 (preserving edge sharpness) with per-channel RGB gradient L1 at weight 0.5 (penalizing color bleeding).
+
+\subsection{Content-Aware Losses}
+
+Content-aware losses support the diffusion objective by directly supervising structural and color fidelity. All structural comparisons are \emph{source-relative}: they measure deltas from the vanilla content rather than absolute target values, so the model learns to predict only what changes:
+
+\begin{equation}
+    \mathcal{L}_{\text{content}} = 1.0\,\mathcal{L}_{\text{structure}} + 2.5\,\mathcal{L}_{\text{contrast}} + 3.0\,\mathcal{L}_{\text{hue}} + 1.5\,\mathcal{L}_{\text{color\_moment}}
+\end{equation}
+
+\textbf{Structure loss} combines three source-relative delta terms:
+\begin{itemize}
+    \item Gradient delta: L1 between prediction's gradient change and target's gradient change.
+    \item Detail delta (weight 0.5): L1 on high-pass residuals relative to content.
+    \item Laplacian delta (weight 0.75): L1 on 4-neighbor Laplacian response deltas.
+\end{itemize}
+
+\textbf{Contrast loss} applies a target-gated, one-sided under-contrast penalty. Local luminance standard deviation $\sigma$ is estimated via windowed pooling (kernel sizes 3 and 5, averaged). A spatial gate $g = (\sigma_{\text{target}} / \max(\sigma_{\text{target}}))^\gamma$ with $\gamma=1.5$ focuses the penalty on high-detail regions. Critically, only under-contrast is penalized ($\text{ReLU}(\sigma_{\text{target}} - \sigma_{\text{pred}})$); over-sharpening is already constrained by reconstruction and structure losses. An edge shortfall term ($\beta=0.6$) additionally penalizes gradient magnitudes that fall below the target's.
+
+\textbf{Hue loss} operates in opponent-chroma space to avoid HSV discontinuities. Chroma vectors $(R-G,\; B - 0.5(R+G))$ are L2-normalized to unit direction. Angular misalignment is gated by the target's chroma magnitude ($\gamma=0.7$), so flat gray regions are ignored. A chroma strength term (weight 0.25) aligns saturation levels.
+
+\textbf{Color moment loss} matches per-channel mean and standard deviation between prediction and target (weight 0.5 on std). This non-spatial term provides a strong, reliable global color gradient that converges quickly.
+
+A detail emphasis factor ($\gamma=2.0$) upweights all spatial losses for textures whose targets contain concentrated detail (top 12.5\% of local std values). A gate floor of 0.05 ensures all regions contribute at least minimal gradient.
+
+\subsection{RecolorNet Training}
+
+RecolorNet is trained with a simpler objective combining four terms:
+
+\begin{equation}
+    \mathcal{L}_{\text{recolor}} = \mathcal{L}_{\text{recon}} + 0.5\,\mathcal{L}_{\text{edge}} + 1.5\,\mathcal{L}_{\text{color}} + 0.1\,\mathcal{L}_{\text{identity}}
+\end{equation}
+
+Reconstruction L1 drives the prediction toward the target. Edge L1 matches the luminance edge map between prediction and content, enforcing structure preservation. Color moment L1 matches per-channel mean and standard deviation to the target. Content identity L1 anchors the prediction to the content, preventing the model from drifting into implausible outputs when style evidence is weak.
+
+\subsection{Optimization Details}
+
+Both models use AdamW with learning rate $3 \times 10^{-4}$ and weight decay 0.01 (RecolorNet uses 0.03). The learning rate follows a linear warmup of 5\% of total steps (start factor 0.1), then cosine annealing to $10^{-6}$. The diffusion model uses gradient accumulation (4$\times$ on CUDA, batch size 4 effective 16), gradient clipping ($\ell_2 = 1.0$), and bfloat16 mixed precision. Exponential moving average (EMA, decay 0.995) is maintained for both models. Validation uses EMA weights. Training is per target pack, with default steps of 10,000 for the diffusion model and 2,500 for RecolorNet.
+
+\section{Inference and Ensemble Rules}
+\label{sec:inference}
+
+Inference follows a tiered procedure that generates multiple candidates and selects the best based on measured output quality rather than hardcoded routing:
+
+\subsection{Diffusion Sampling}
+
+The reverse process starts from pure Gaussian noise and applies 40 DDPM steps with $x_0$ clipping to $[0,1]$:
+
+\begin{equation}
+    x_{t-1} = \frac{\sqrt{\bar{\alpha}_{t-1}}\beta_t}{1-\bar{\alpha}_t}\hat{x}_0 + \frac{\sqrt{\alpha_t}(1-\bar{\alpha}_{t-1})}{1-\bar{\alpha}_t}x_t + \sigma_t z
+\end{equation}
+
+where $\hat{x}_0 = \text{clamp}(\frac{x_t - \sqrt{1-\bar{\alpha}_t}\epsilon_\theta}{\sqrt{\bar{\alpha}_t}}, 0, 1)$ and $\sigma_t^2 = \beta_t\frac{1-\bar{\alpha}_{t-1}}{1-\bar{\alpha}_t}$ for $t>1$, zero otherwise.
+
+\subsection{Candidate Selection}
+
+Generation produces $N=2$ stochastic diffusion candidates plus optional RecolorNet and deterministic recolor candidates. Each candidate is scored along two axes:
+
+\begin{itemize}
+    \item \textbf{Structural quality}: a post-hoc evaluator computes gradient alignment, edge fidelity (penalizing both loss and explosion), detail coherence (cosine similarity of high-pass residuals), detail energy fidelity (symmetric: penalizing blur below $0.3\times$ and noise above $1.3\times$ content energy), and entropy stability. The weighted composite score (0--1, with 0.03 baseline) is compared against a content-complexity-adaptive threshold.
+    \item \textbf{Style quality}: the candidate's descriptor is compared via cosine similarity to the mean descriptor of active support references, with a sharpness penalty for candidates that are noticeably softer than the support set (0.2$\times$ edge shortfall + 0.1$\times$ high-pass shortfall).
+\end{itemize}
+
+The selection logic proceeds in three tiers:
+
+\paragraph{Tier 1: Diffusion viability.} If the best diffusion candidate has structural quality $\geq 0.80$, it is confidently preferred. If quality is $\geq 0.60$ (viable), a clear margin of 0.10 in style score must favor the alternative to override.
+
+\paragraph{Tier 2: Detail injection.} When a deterministic recolor is available, it is blended with the diffusion prediction at two amounts (0.35 and 0.65). The injection preserves the diffusion's color palette while borrowing high-frequency structure from the recolor. A blended candidate replaces the diffusion prediction only if it improves structural quality without degrading style by more than 5\%.
+
+\paragraph{Tier 3: Recolor fallback.} When structural quality is below 0.60, the diffusion output is rejected and the RecolorNet output is used. The deterministic recolor serves as a final fallback when RecolorNet is unavailable.
+
+\subsection{Color Transfer Methods}
+
+Two deterministic color transfer methods serve as baselines and fallback candidates:
+
+\textbf{Support-pair affine recolor.} When vanilla-side references are available for the style references (the same texture names appear in both packs), per-channel affine transforms are fitted: $\text{target}_{\text{ch}} = \text{scale}_{\text{ch}} \times \text{source}_{\text{ch}} + \text{bias}_{\text{ch}}$. The scale is clamped to $[0.2, 3.0]$. The fitted transform is applied to the vanilla content.
+
+\textbf{Style-stat recolor.} When support pairs are unavailable, a simpler transformation matches per-channel mean and standard deviation of the style references to the content.
+
+These deterministic methods serve as the final safety net when both diffusion and RecolorNet produce unsatisfactory outputs.

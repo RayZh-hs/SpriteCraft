@@ -1,28 +1,33 @@
 \chapter{Introduction}
 
-Texture style transfer asks a model to preserve the semantic content and spatial structure of an input image while adopting the visual language of a target style.
-In SpriteCraft, the input domain is constrained but demanding: block textures are small, tileable, and highly sensitive to local detail.
-An error of only a few pixels can change material identity, break tiling, or make a generated resource pack visually inconsistent.
+Texture style transfer aims to preserve the semantic content and spatial structure of an input image while adopting the visual language of a target style domain. In the context of video game graphics, this problem takes on practical significance: resource packs for games like Minecraft consist of hundreds of small, tileable block textures, and manually creating a new pack requires painstaking artistic work for every block. Automating this process while maintaining material identity, edge sharpness, and tiling consistency remains an open challenge.
 
-The project maps vanilla Minecraft block textures to target resource-pack versions.
-This framing provides paired supervision because each target pack can be aligned to the same canonical vanilla texture names.
-It also creates a useful test bed for studying low-resolution image translation, style conditioning, structure preservation, and qualitative model evaluation.
+Recent advances in diffusion-based image generation \citep{ho2020denoising, dhariwal2021diffusion, rombach2022high} have produced remarkable results for natural image synthesis. However, these models are predominantly trained on large-scale photographic datasets and assume input resolutions far exceeding the $32\times32$ pixel grid typical of pixel art textures. When applied directly to block textures, off-the-shelf diffusion pipelines often fail to grasp the style of such low-resolution images. Additionally, such models demand considerable computational resources, making the training process inaccessible for many practitioners.
+
+Our goal is to design a dedicated network that can be trained on a single consumer GPU within a reasonable timeframe, which produces high-quality stylized textures and is able to understand and migrgate the style of vanilla Minecraft textures to a variety of target packs. 
 
 \section{Problem Statement}
 
-Given a vanilla content texture \(x_c \in [0,1]^{3 \times 32 \times 32}\), a target pack \(p\), and a small set of style reference textures \(S_p\), the system should generate a target-like texture \(y\) that preserves the block identity of \(x_c\) while matching the color, contrast, and material style of \(p\).
+Given a vanilla Minecraft block texture \(x_c \in [0,1]^{3 \times 32 \times 32}\), a target resource pack \(p\), and a small set of style reference textures \(S_p\) drawn from pack \(p\), the system must generate a target-style texture \(y\) that satisfies three constraints:
+\begin{enumerate}[label=(C\arabic*)]
+    \item \textbf{Material identity}: the output must retain the block identity of \(x_c\) so that a human observer recognizes it as the same material.
+    \item \textbf{Style fidelity}: the color palette, contrast distribution, and textural motifs must belong to the target pack's visual language.
+    \item \textbf{Tileability}: the output should be visually plausible as a repeating tile in a block-based world, avoiding abrupt boundary discontinuities.
+\end{enumerate}
+
+This framing provides paired supervision: since every target pack maps to the same canonical vanilla texture names, each content--target pair constitutes a supervised training sample. This makes the problem a controlled test bed for studying low-resolution image translation, style conditioning from few-shot exemplars, structure preservation, and ensemble-based model selection.
 
 \section{Contributions}
 
+This work makes the following contributions:
 \begin{itemize}
-  \item A reportable data pipeline for extracting, resizing, and pairing full-cube block textures across resource packs.
-  \item A dual-model generation system combining a style-conditioned diffusion model with a structure-preserving recoloring network.
-  \item A qualitative evaluation workflow centered on validation matrices and generated texture comparisons.
+    \item A fully automated data pipeline that extracts, resizes, filters, and pairs full-cube block textures across arbitrary Minecraft resource packs, resolving blockstate models to identify valid full-block textures.
+    \item A dual-model architecture combining a style-conditioned denoising diffusion probabilistic model (StyleAwareUNet, 7.7M parameters) with a structure-preserving recoloring network (RecolorNet, 1.0M parameters), trained per target pack on vanilla-anchored texture pairs.
+    \item A family of content-aware loss functions---structure, contrast, hue, and color moment---with source-relative normalization and target-gated spatial weighting, folded into the diffusion training objective through SNR-weighted x0 prediction.
+    \item A tiered inference pipeline with stochastic diffusion sampling, post-hoc structural quality evaluation, detail injection, and learned recolor fallback, selecting the best candidate based on measured output quality rather than hardcoded routing.
+    \item Qualitative and quantitative evaluation across multiple training runs, documenting the progression from baseline diffusion-only synthesis to the final dual-model system.
 \end{itemize}
 
 \section{Document Structure}
 
-Chapter~\ref{chap:background} introduces related work and project assumptions.
-Chapter~\ref{chap:method} describes the SpriteCraft architecture and training objective.
-Chapter~\ref{chap:experiments} provides a template for reporting datasets, metrics, qualitative results, and ablations.
-Chapter~\ref{chap:conclusion} summarizes the expected claims and remaining limitations.
+Chapter~\ref{chap:background} reviews related work in neural style transfer, diffusion models, and encoder-decoder architectures. Chapter~\ref{chap:method} describes the SpriteCraft data pipeline, model architecture, training objective, and inference procedure in detail. Chapter~\ref{chap:experiments} reports training configurations, quantitative metrics, qualitative evaluation, and ablation studies. Chapter~\ref{chap:conclusion} summarizes findings, discusses limitations, and outlines directions for future work.

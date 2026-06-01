@@ -1,16 +1,97 @@
-\chapter{Reproducibility Notes}
+\chapter{Reproduction Instructions}
 
-Use this appendix for command logs, configuration tables, selected generated examples, and links to checkpoints.
-Keep large artifacts such as checkpoints and generated bundles outside the report directory; reference their paths instead.
+\section{Environment Setup}
+
+The SpriteCraft codebase requires Python 3.13 or later and PyTorch 2.0 or later. Dependencies are managed with \texttt{uv}:
+
+\begin{lstlisting}[language=bash]
+git clone https://github.com/RayZh-hs/SpriteCraft
+cd SpriteCraft
+uv sync
+source .venv/bin/activate
+\end{lstlisting}
+
+\section{Preprocessing}
+
+Place the vanilla Minecraft jar file and target resource pack archives (unmodified \texttt{.zip} or \texttt{.jar}) in \texttt{data/raw\_packs/}. Optionally create a manifest at \texttt{data/manifest.json} to specify pack roles:
+
+\begin{lstlisting}[caption={Example manifest.json.}]
+{
+    "packs": [
+        {
+            "id": "vanilla",
+            "archive": "server-1.21.jar",
+            "role": "base",
+            "style": "vanilla"
+        },
+        {
+            "id": "Ashen_16x",
+            "archive": "Ashen_16x.zip",
+            "role": "train",
+            "style": "stylized"
+        }
+    ]
+}
+\end{lstlisting}
+
+Run preprocessing:
+
+\begin{lstlisting}[language=bash]
+spritecraft preprocess
+\end{lstlisting}
+
+This extracts archives, filters full-cube block textures by resolving blockstate models, resizes images to $32\times32$, and writes per-pack datasets to \texttt{data/processed/packs/<pack\_id>/}. A summary report is written to \texttt{data/processed/pack\_report.json}.
+
+\section{Training}
+
+Train the RecolorNet first (recommended, 2,500 steps per pack):
+
+\begin{lstlisting}[language=bash]
+spritecraft train --checkpoint-dir checkpoints/run33 --steps 2500 --mode recolor_only
+\end{lstlisting}
+
+Then train the diffusion model (10,000 steps per pack):
+
+\begin{lstlisting}[language=bash]
+spritecraft train --checkpoint-dir checkpoints/run33 --steps 10000 --recolor-checkpoint-dir checkpoints/run33
+\end{lstlisting}
+
+The \texttt{recolor\_first} mode trains RecolorNet then StyleAwareUNet sequentially for all packs. Monitor training with TensorBoard:
+
+\begin{lstlisting}[language=bash]
+tensorboard --logdir checkpoints/run33/tensorboard
+\end{lstlisting}
+
+\section{Generation}
+
+Generate textures for a target pack:
+
+\begin{lstlisting}[language=bash]
+spritecraft generate --pack Ashen_16x --textures stone dirt oak_planks --run run33
+\end{lstlisting}
+
+Or sample randomly:
+
+\begin{lstlisting}[language=bash]
+spritecraft generate --pack Ashen_16x --random 8 --run run33
+\end{lstlisting}
+
+Outputs are written to \texttt{output/<pack\_id>/<bundle>/} containing the generated texture (\texttt{produced\_tex.png}), vanilla original (\texttt{original\_tex.png}), style references (\texttt{support.png}), comparison image (\texttt{comparison.png}), metrics (\texttt{metrics.json}), and metadata (\texttt{metadata.json}). If the target pack contains the queried texture, a source-of-truth image and MAE/pixel-accuracy metrics are included.
 
 \section{Repository Layout}
 
-\begin{lstlisting}[caption={Important project paths.}]
-src/spritecraft/        Python package
-data/processed/         Preprocessed paired datasets
-checkpoints/<run>/      Training checkpoints and validation previews
-output/<pack_id>/       Generated texture bundles and comparisons
-report/                 Thesis/report source
+\begin{lstlisting}[caption={Key project paths.}]
+src/spritecraft/           Python package source
+src/spritecraft/models/    Model definitions (unet, recolor, diffusion)
+src/spritecraft/training/  Training loops and loss functions
+src/spritecraft/inference/ Sampling and generation pipeline
+src/spritecraft/data/      Preprocessing, dataset, support ranking
+src/spritecraft/debug/     Runtime status and live inspection
+data/raw_packs/            Input resource pack archives
+data/processed/            Preprocessed per-pack datasets
+checkpoints/<run>/         Training checkpoints and validation previews
+output/<pack_id>/          Generated texture bundles
+report/                    LaTeX report source
 \end{lstlisting}
 
 \section{Build Notes}
@@ -22,3 +103,22 @@ make -C report
 \end{lstlisting}
 
 Generated files are written to \texttt{report/build/} and ignored by Git.
+
+\section{Key Configuration Constants}
+
+\begin{table}[htbp]
+    \centering
+    \caption{Key configuration constants in \texttt{src/spritecraft/config.py}.}
+    \begin{tabular}{@{}ll@{}}
+        \toprule
+        Constant & Value \\
+        \midrule
+        IMAGE\_SIZE & 32 \\
+        NUM\_TIMESTEPS & 40 \\
+        MIN\_SUPPORT\_EXEMPLARS & 3 \\
+        MAX\_SUPPORT\_EXEMPLARS & 3 \\
+        VALIDATION\_FILENAMES & 20 fixed filenames \\
+        MIN\_SHARED\_PACKS & 5 \\
+        \bottomrule
+    \end{tabular}
+\end{table}

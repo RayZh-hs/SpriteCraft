@@ -1,13 +1,35 @@
 \chapter{Conclusion}
 \label{chap:conclusion}
 
-This chapter should restate the problem, summarize the final architecture, and describe the strongest empirical finding.
-For SpriteCraft, the central claim will likely concern the benefit of combining stochastic diffusion candidates with deterministic structure-preserving recoloring.
+This work presented SpriteCraft, a dual-model system for texture style transfer between vanilla Minecraft block textures and target resource-pack variants. The system combines a style-conditioned denoising diffusion probabilistic model (StyleAwareUNet) with a lightweight structure-preserving recoloring network (RecolorNet), trained per target pack on vanilla-anchored texture pairs.
 
-The report should also be direct about limitations.
-Current known gaps include RGB-only modeling despite alpha-channel preprocessing, heuristic rather than learned support ranking, and weak performance on transparent or complex tiling textures.
+\section{Summary of Findings}
+
+The central empirical finding is that combining stochastic diffusion-based generation with deterministic structure-preserving recoloring yields a robust pipeline where neither component alone suffices. Diffusion models excel at producing visually rich, style-consistent outputs for structurally simple textures, but they struggle with precise pixel-level placement for complex patterns (TNT lettering, leaf clusters). The RecolorNet provides structurally perfect results at the cost of color expressiveness. By evaluating the \emph{actual output quality} of both models through a post-hoc structural evaluator and selecting based on measured traits, the tiered ensemble achieves the best of both worlds: diffusion is used when its outputs are structurally sound, and RecolorNet takes over when diffusion fails.
+
+Key design choices that proved effective:
+\begin{itemize}
+    \item \textbf{Source-relative loss}: Computing structural deltas from the vanilla content rather than absolute target values focuses the model on learning what changes, accelerating convergence and improving fidelity.
+    \item \textbf{Target-gated losses}: Spatially gating contrast and hue penalties by the target's local energy prevents the model from hallucinating detail in flat regions while concentrating supervision on high-detail areas.
+    \item \textbf{SNR-weighted x0 losses}: Weighting auxiliary reconstruction losses by the signal-to-noise ratio at each diffusion timestep eliminates a hyperparameter trade-off between content loss weight and convergence speed.
+    \item \textbf{Post-hoc quality evaluation}: Replacing hardcoded routing rules with output-driven model selection correctly identifies failure cases in real time, routing complex textures to the appropriate model without per-texture hand-tuning.
+    \item \textbf{Multi-reference attention with token preservation}: Encoding each style reference as a separate token rather than mean-pooling preserves distinctive per-reference motifs that averaging would destroy.
+\end{itemize}
+
+\section{Limitations}
+
+The current system has several known limitations. Alpha-channel information is preprocessed and stored but not used by the model, making transparent textures (glass, ice) inherently difficult. Style reference ranking relies on heuristic descriptors and filename parsing rather than learned embeddings, limiting adaptability to packs with nonstandard naming conventions. Training is per-pack, so each new target pack requires a full training cycle---acceptable for the project's stated goal of providing a \emph{framework for rapid per-pack training} but not suitable for zero-shot generalization. The fixed $32\times32$ resolution ceiling limits detail fidelity for complex tiling textures, and the support ranking system would benefit from learned attention over candidate textures rather than heuristic cosine-similarity ranking.
 
 \section{Future Work}
 
-Promising next steps include alpha-aware training, learned support selection, pack-specific resize policies, and evaluation tools that explicitly check tiling artifacts.
-If the report is used as a thesis, this section should distinguish engineering improvements from research questions.
+Several directions appear promising for extending this work:
+
+\textbf{Alpha-aware training.} Incorporating the preprocessed alpha channel into both the model input and the loss function would directly address the glass/transparency failure mode, either through an auxiliary alpha prediction head or through alpha-weighted loss masking.
+
+\textbf{Learned support selection.} Replacing the heuristic ranking with a learned embedding and attention mechanism could improve support quality, particularly for packs with unconventional material families. A contrastive learning approach that maps textures to a shared embedding space would enable cross-pack support retrieval.
+
+\textbf{Multi-resolution training.} Training at multiple resolutions ($32\times32$ and $64\times64$) or with a super-resolution refinement stage could address the detail fidelity ceiling for complex textures like leaves and bookshelves.
+
+\textbf{Automatic routing in the ensembler.} The current tiered selection logic uses fixed thresholds (0.60, 0.80 structural quality) with a clear margin of 0.10. These thresholds could be learned per-pack or per-texture-family from validation data, or replaced with a lightweight classifier trained on human preference judgments.
+
+\textbf{Tileability enforcement.} Adding a wrap-around consistency loss that penalizes discontinuities at texture boundaries would improve the visual quality of generated textures as repeating tiles in a block-based world.
