@@ -44,7 +44,7 @@ The MYTHIC training branch was started in \texttt{run20}, but no validation prev
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=\linewidth]{run20-multi-pack-stone.png}
-    \caption{Cross-pack diffusion-only previews from \texttt{run20} at step 500. Each mini-panel is arranged as vanilla content, diffusion prediction, and ground-truth target texture.}
+    \caption{Cross-pack diffusion-only previews from \texttt{run20} at step 500.}
     \label{fig:run20-multipack}
 \end{figure}
 
@@ -79,6 +79,173 @@ Both models were trained on a single NVIDIA GPU with bfloat16 autocast. The diff
     \end{tabular}
 \end{table}
 
+\section{Training Dynamics}
+
+\subsection{Overall Loss Curves}
+
+Figure~\ref{fig:loss-curves} shows the smoothed training loss trajectories for all four \texttt{run33} packs. Bare Bones converges fastest and to the lowest final loss, consistent with its minimalist style. Ashen and Cartoon follow similar trajectories with a wider initial spread. Chibli, with its smallest training set (87 pairs), converges more slowly and shows higher variance throughout training.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.92\linewidth,
+            height=6.5cm,
+            xlabel={Training step},
+            ylabel={Total loss (smoothed)},
+            xmin=0, xmax=10000,
+            ymin=0.02, ymax=2.5,
+            ymode=log,
+            log ticks with fixed point,
+            grid=major,
+            grid style={thin, color=black!15},
+            legend pos=north east,
+            legend cell align=left,
+            legend style={font=\footnotesize, fill=white, fill opacity=0.85,
+                          text opacity=1},
+            cycle list={
+                {mark=none, blue, thick},
+                {mark=none, red, thick},
+                {mark=none, green!50!black, thick},
+                {mark=none, orange, thick},
+            },
+        ]
+        \addplot table [x=step, y=total, col sep=space] {data/Ashen_16x_loss_smooth.dat};
+        \addlegendentry{Ashen 16x}
+        \addplot table [x=step, y=total, col sep=space] {data/Bare_Bones_1_21_11_loss_smooth.dat};
+        \addlegendentry{Bare Bones}
+        \addplot table [x=step, y=total, col sep=space] {data/Cartoon_Texture_Pack_loss_smooth.dat};
+        \addlegendentry{Cartoon}
+        \addplot table [x=step, y=total, col sep=space] {data/Chibli_64x_Freepack_loss_smooth.dat};
+        \addlegendentry{Chibli 64x}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Smoothed total training loss for all four \texttt{run33} packs (log scale).}
+    \label{fig:loss-curves}
+\end{figure}
+
+\subsection{Loss Breakdown}
+
+Figure~\ref{fig:loss-breakdown} decomposes the Ashen 16x training loss into its constituent terms. The noise prediction loss dominates early training but declines rapidly. Content-aware losses (structure, contrast, hue, color moment) decay more gradually and account for much of the remaining loss at convergence. The gradient loss persists modestly, reflecting the inherent difficulty of edge placement in stylized packs.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.92\linewidth,
+            height=6.5cm,
+            xlabel={Training step},
+            ylabel={Loss component value},
+            xmin=0, xmax=10000,
+            ymin=0.001, ymax=2.0,
+            ymode=log,
+            log ticks with fixed point,
+            grid=major,
+            grid style={thin, color=black!15},
+            legend pos=north east,
+            legend cell align=left,
+            legend style={font=\footnotesize, fill=white, fill opacity=0.85,
+                          text opacity=1},
+            cycle list={
+                {mark=none, blue, thick},
+                {mark=none, red, thick},
+                {mark=none, green!50!black, thick},
+                {mark=none, orange, thick},
+                {mark=none, purple, thick},
+                {mark=none, cyan, thick},
+                {mark=none, magenta, thick},
+            },
+        ]
+        \addplot table [x=step, y=noise, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Noise MSE}
+        \addplot table [x=step, y=recon, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Recon L1}
+        \addplot table [x=step, y=gradient, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Gradient}
+        \addplot table [x=step, y=content_structure, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Structure}
+        \addplot table [x=step, y=content_contrast, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Contrast}
+        \addplot table [x=step, y=content_hue, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Hue}
+        \addplot table [x=step, y=content_color_moment, col sep=space] {data/loss_breakdown.dat};
+        \addlegendentry{Color Moment}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Loss breakdown for Ashen 16x training (log scale).}
+    \label{fig:loss-breakdown}
+\end{figure}
+
+\subsection{Checkpointed Diffusion Loss}
+
+Figure~\ref{fig:checkpoint-loss} plots the diffusion model's raw training loss sampled every 500 steps, matching the checkpoint cadence used throughout \texttt{run33}. This avoids a reporting artifact in the routed validation summaries: on hard packs, selected-output validation can flatten once recolor fallback dominates, even when the diffusion branch is still struggling. Bare Bones drops fastest and remains lowest throughout. Chibli stays highest for most of training, while Ashen and Cartoon show a slower but still steady decline with occasional spikes that reflect the harder stylized targets.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.92\linewidth,
+            height=6cm,
+            xlabel={Training step},
+            ylabel={diffusion training loss},
+            xmin=0, xmax=10000,
+            ymin=0.03, ymax=0.40,
+            grid=major,
+            grid style={thin, color=black!15},
+            legend pos=north east,
+            legend cell align=left,
+            legend style={font=\footnotesize, fill=white, fill opacity=0.85,
+                          text opacity=1},
+            cycle list={
+                {mark=*, mark size=1.5, mark options={solid}, blue, thick},
+                {mark=*, mark size=1.5, mark options={solid}, red, thick},
+                {mark=*, mark size=1.5, mark options={solid}, green!50!black, thick},
+                {mark=*, mark size=1.5, mark options={solid}, orange, thick},
+            },
+        ]
+        \addplot table [x=step, y=train_loss, col sep=space] {data/Ashen_16x_training_snapshot.dat};
+        \addlegendentry{Ashen 16x}
+        \addplot table [x=step, y=train_loss, col sep=space] {data/Bare_Bones_1_21_11_training_snapshot.dat};
+        \addlegendentry{Bare Bones}
+        \addplot table [x=step, y=train_loss, col sep=space] {data/Cartoon_Texture_Pack_training_snapshot.dat};
+        \addlegendentry{Cartoon}
+        \addplot table [x=step, y=train_loss, col sep=space] {data/Chibli_64x_Freepack_training_snapshot.dat};
+        \addlegendentry{Chibli 64x}
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Diffusion training loss sampled every 500 steps from \texttt{training\_metrics.csv} for all four packs.}
+    \label{fig:checkpoint-loss}
+\end{figure}
+
+\subsection{Learning Rate Schedule}
+
+Figure~\ref{fig:lr-schedule} confirms the warmup + cosine annealing schedule. The first 500 steps warm up linearly from $3\times10^{-5}$ to the peak of $3\times10^{-4}$, after which cosine annealing smoothly decays the rate to the floor of $10^{-6}$ at step 10,000.
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}
+        \begin{axis}[
+            width=0.92\linewidth,
+            height=5cm,
+            xlabel={Training step},
+            ylabel={Learning rate},
+            xmin=0, xmax=10000,
+            ymin=0, ymax=0.00035,
+            yticklabel style={
+                /pgf/number format/fixed,
+                /pgf/number format/precision=4,
+            },
+            scaled y ticks=false,
+            grid=major,
+            grid style={thin, color=black!15},
+        ]
+        \addplot[thick, color=blue, mark=none] table [x=step, y=lr, col sep=space] {data/lr_schedule.dat};
+        \end{axis}
+    \end{tikzpicture}
+    \caption{Learning rate schedule.}
+    \label{fig:lr-schedule}
+\end{figure}
+
 \section{Evolution of Training Runs}
 
 \subsection{Diffusion Baseline}
@@ -92,6 +259,10 @@ The next iteration introduced RecolorNet as a structural fallback together with 
 \subsection{Post-Hoc Quality Evaluation}
 
 The next iteration replaced the fixed routing logic with the structural-style evaluator described in Section~\ref{sec:inference}. This evaluator scores the actual diffusion output against the content image and its support set, then decides whether to keep diffusion, apply detail injection, or fall back to recolor. In practice, this was the first configuration that made multi-pack comparison intellectually honest: the same selection policy can now be inspected on Bare Bones, Ashen, Cartoon, and Chibli rather than only on a hand-picked pack. Training improvements included EMA (decay 0.995), linear learning-rate warmup over 5\% of steps, and an adaptive content-loss ramp over the early phase of training.
+
+\subsection{High-Pattern Content Gating}
+
+The post-hoc evaluator was further refined to detect and tightly screen \emph{high-pattern content}---textures with strong line art, symbolic glyphs, or repeated narrow bands such as \texttt{tnt\_side.png} and \texttt{bookshelf.png}. When the content texture exceeds thresholds on edge energy, detail energy, and complexity, the evaluator applies a multiplicative gate (0.55 + 0.45 $\times$ gate\_score) to the quality score and raises the acceptance threshold to 0.68. The gate score combines tighter edge ratio fidelity (window $[0.78, 1.18]$), detail energy ratio fidelity (window $[0.80, 1.16]$), and a positive detail coherence gate. This prevents the selector from accepting diffusion outputs that pass the general quality threshold but are structurally unsuitable for precision-dependent textures. The source-relative change agreement score was also added at this stage, blending the support descriptor comparison with a term that rewards candidates whose change-from-vanilla magnitude matches the support pack's typical change level.
 
 \subsection{SNR-Weighted Losses and Final Configuration}
 
@@ -151,7 +322,7 @@ The selector is also more conservative than a pure target-aware MAE oracle. On A
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=0.82\linewidth]{run33-multi-pack-oak-planks.png}
-    \caption{Selected \texttt{run33} outputs for \texttt{oak\_planks.png} across four target packs. Each mini-panel is vanilla content, selected output, and ground-truth target texture. The figure makes the pack-style spread explicit: a single training recipe must cover dark fantasy planks (Ashen), flattened minimalist planks (Bare Bones), saturated cartoon planks, and downscaled 64$\times$ stylization.}
+    \caption{Selected \texttt{run33} outputs for \texttt{oak\_planks.png} across four target packs.}
     \label{fig:run33-oak-planks}
 \end{figure}
 
@@ -176,7 +347,7 @@ The selector is also more conservative than a pure target-aware MAE oracle. On A
 \begin{figure}[htbp]
     \centering
     \includegraphics[width=0.82\linewidth]{run33-ashen-routing.png}
-    \caption{Ashen\_16x routing examples from \texttt{run33}. Each mini-panel is vanilla content, candidate output, and ground-truth target texture. The bookshelf example shows why blend-assisted or recolor-guided selection remains useful for repeated narrow structures, while the TNT example shows the value of deterministic structure preservation on glyph-like textures.}
+    \caption{Ashen\_16x routing examples from \texttt{run33}.}
     \label{fig:run33-routing}
 \end{figure}
 
@@ -189,6 +360,8 @@ The cross-pack comparison reveals a useful tension: the selector is not optimizi
 \subsection{Detail Injection Usage}
 
 The saved selected panels show that detail injection is not a rare corner case. In \texttt{run33}, 16 of 18 Bare Bones selections and 6 of 19 Cartoon selections differ from both the raw diffusion and raw recolor panels, indicating blended candidates. On Ashen and Chibli, by contrast, the selector usually settles on the pure recolor output. This suggests the blend path is most valuable when the pack remains close enough to vanilla for diffusion detail to be trusted locally.
+
+The non-destructive detail injection (Section~\ref{sec:inference}) was critical for this result. Earlier variants that rebuilt the output from a blurred diffusion base caused global softening on already-good diffusion samples. The current approach adds only missing high-frequency residuals where local layout agreement and detail alignment gates permit, preserving diffusion detail that is already plausible.
 
 \subsection{Pack-Dependent Loss Interaction}
 
