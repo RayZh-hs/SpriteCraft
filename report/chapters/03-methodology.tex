@@ -5,7 +5,14 @@
 
 The preprocessing pipeline extracts block textures from base (vanilla) and target resource packs, resolves Minecraft blockstate models to identify full-cube block textures, resizes images to a canonical $32 \times 32$ resolution, and writes per-pack paired datasets. The pipeline operates on \texttt{.zip} or \texttt{.jar} archives placed in a raw packs directory.
 
-\placeholderfigure{SpriteCraft pipeline overview}{Generate and place \texttt{figures/spritecraft-pipeline-overview.png}. The diagram should show raw packs, full-cube filtering, resolution normalization, per-pack dataset construction, per-pack training, validation preview export, and ensemble inference.}
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{spritecraft-pipeline-overview.png}
+    \caption{SpriteCraft pipeline overview.}
+    \label{fig:pipeline-overview}
+\end{figure}
+
+The diagram shows raw packs, full-cube filtering, resolution normalization, per-pack dataset construction, per-pack training, validation preview export, and ensemble inference.
 
 \subsection{Full-Cube Texture Filtering}
 
@@ -32,7 +39,14 @@ The final per-pack dataset is stored as a compressed NumPy archive (\texttt{data
 
 SpriteCraft employs a dual-model architecture: a style-conditioned diffusion model for stochastic generation and a lightweight recoloring network for deterministic structure-preserving color transfer.
 
-\placeholderfigure{Dual-model architecture}{Generate and place \texttt{figures/spritecraft-dual-model-architecture.png}. The diagram should show the vanilla content texture and ranked style references feeding both StyleAwareUNet and RecolorNet, then the selector / detail-injection stage that chooses the final output.}
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{spritecraft-dual-model-architecture.png}
+    \caption{Dual-model architecture.}
+    \label{fig:dual-model-arch}
+\end{figure}
+
+The diagram shows the vanilla content texture and ranked style references feeding both StyleAwareUNet and RecolorNet, then the selector / detail-injection stage that chooses the final output.
 
 \subsection{StyleAwareUNet}
 
@@ -138,7 +152,14 @@ Both models use AdamW with learning rate $3 \times 10^{-4}$ and weight decay 0.0
 
 Inference follows a tiered procedure that generates multiple candidates and selects the best based on measured output quality rather than hardcoded routing:
 
-\placeholderfigure{Ensemble routing flow}{Generate and place \texttt{figures/spritecraft-ensemble-routing-flow.png}. The flowchart should cover diffusion sampling, structural-style scoring, detail injection, recolor fallback, and final candidate selection.}
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.92\linewidth]{spritecraft-ensemble-routing-flow.png}
+    \caption{Ensemble routing flow.}
+    \label{fig:ensemble-routing}
+\end{figure}
+
+The flowchart covers diffusion sampling, structural-style scoring, detail injection, recolor fallback, and final candidate selection.
 
 \subsection{Diffusion Sampling}
 
@@ -156,14 +177,18 @@ Generation produces $N=2$ stochastic diffusion candidates plus optional RecolorN
 
 \begin{itemize}
     \item \textbf{Structural quality}: a post-hoc evaluator computes gradient alignment, edge fidelity (penalizing both loss and explosion), detail coherence (cosine similarity of high-pass residuals), detail energy fidelity (symmetric: penalizing blur below $0.3\times$ and noise above $1.3\times$ content energy), and entropy stability. The weighted composite score (0--1, with 0.03 baseline) is compared against a content-complexity-adaptive threshold.
-    \item \textbf{Style quality}: the candidate's descriptor is compared via cosine similarity to the mean descriptor of active support references, with a sharpness penalty for candidates that are noticeably softer than the support set (0.2$\times$ edge shortfall + 0.1$\times$ high-pass shortfall).
+    \item \textbf{Style quality}: combined from a descriptor-based support similarity score and a source-relative change agreement score. The support descriptor score compares the candidate's descriptor via cosine similarity to the mean descriptor of active support references, with a sharpness penalty. The change agreement score evaluates how closely the candidate's \emph{change from vanilla} matches the support pack's typical change magnitude, penalizing recolor outputs that stay too close to vanilla on stylized packs. The two scores are blended 0.65 / 0.35.
 \end{itemize}
+
+\paragraph{High-pattern content gate.} Textures with strong line art, glyphs, or repeated narrow bands (e.g.\ \texttt{tnt\_side.png}, \texttt{bookshelf.png}) require stricter structural screening. When the content texture exceeds thresholds on edge energy ($\geq 0.09$), detail energy ($\geq 0.05$), and complexity ($\geq 0.50$), the evaluator applies a multiplicative gate to the quality score that enforces tighter edge/detail energy ratios (windows $[0.78,1.18]$ and $[0.80,1.16]$) and requires positive detail coherence. The acceptance threshold is also raised to 0.68 for these textures.
+
+\paragraph{Detail injection (non-destructive).} When a deterministic recolor is available, it is blended with the diffusion prediction at two amounts (0.35 and 0.65). Unlike earlier approaches that rebuilt the output from a blurred diffusion base plus source detail (causing global softening), the current injection starts from the original diffusion prediction and only adds missing high-frequency residuals from the recolor where: (1) the source has stronger local detail than the diffusion, (2) the low-frequency layouts agree, and (3) the detail vectors are aligned. This local-gated fusion preserves diffusion detail that is already good.
 
 The selection logic proceeds in three tiers:
 
 \paragraph{Tier 1: Diffusion viability.} If the best diffusion candidate has structural quality $\geq 0.80$, it is confidently preferred. If quality is $\geq 0.60$ (viable), a clear margin of 0.10 in style score must favor the alternative to override.
 
-\paragraph{Tier 2: Detail injection.} When a deterministic recolor is available, it is blended with the diffusion prediction at two amounts (0.35 and 0.65). The injection preserves the diffusion's color palette while borrowing high-frequency structure from the recolor. A blended candidate replaces the diffusion prediction only if it improves structural quality without degrading style by more than 5\%.
+\paragraph{Tier 2: Detail-injected candidates.} Blended candidates replace the raw diffusion prediction only if they surpass it on the combined structural + style score with a 0.01 margin \emph{and} preserve at least 97\% of the diffusion's edge and high-pass energy (preventing over-softening from the injection).
 
 \paragraph{Tier 3: Recolor fallback.} When structural quality is below 0.60, the diffusion output is rejected and the RecolorNet output is used. The deterministic recolor serves as a final fallback when RecolorNet is unavailable.
 

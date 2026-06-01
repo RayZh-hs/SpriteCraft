@@ -11,6 +11,8 @@
 \usepackage{microtype}
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage{subcaption}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
 \usepackage{xcolor}
 
 \KOMAoptions{
@@ -57,18 +59,5 @@
 \lstset{style=spritecraft}
 \graphicspath{{figures/}}
 
-\newcommand{\placeholderfigure}[2]{%
-  \begin{figure}[htbp]
-    \centering
-    \fbox{%
-      \begin{minipage}[c][0.26\textheight][c]{0.78\textwidth}
-        \centering
-        \textbf{#1}\\[0.75em]
-        #2
-      \end{minipage}
-    }
-    \caption{#1}
-  \end{figure}
-}
 
 \newcommand{\todo}[1]{\textcolor{red!70!black}{\textbf{TODO:} #1}}
