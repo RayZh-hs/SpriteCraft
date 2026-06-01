@@ -5,6 +5,8 @@
 
 The preprocessing pipeline extracts block textures from base (vanilla) and target resource packs, resolves Minecraft blockstate models to identify full-cube block textures, resizes images to a canonical $32 \times 32$ resolution, and writes per-pack paired datasets. The pipeline operates on \texttt{.zip} or \texttt{.jar} archives placed in a raw packs directory.
 
+\placeholderfigure{SpriteCraft pipeline overview}{Generate and place \texttt{figures/spritecraft-pipeline-overview.png}. The diagram should show raw packs, full-cube filtering, resolution normalization, per-pack dataset construction, per-pack training, validation preview export, and ensemble inference.}
+
 \subsection{Full-Cube Texture Filtering}
 
 Not all block textures in a Minecraft resource pack are suitable for training. Many blocks use non-cube models (fences, stairs, slabs, torches), animated textures, or overlay composites. To filter to valid full-cube block textures, the pipeline reads each block's \texttt{blockstate.json} file, resolves model references through parent inheritance chains, and checks whether the resolved model contains a $16 \times 16 \times 16$ cuboid element with all six faces textured. Only textures referenced by such full-cube models are retained. This filtering step is critical: including non-cube textures would introduce structural mismatches between content and target pairs, undermining the learned mapping.
@@ -29,6 +31,8 @@ The final per-pack dataset is stored as a compressed NumPy archive (\texttt{data
 \section{Model Architecture}
 
 SpriteCraft employs a dual-model architecture: a style-conditioned diffusion model for stochastic generation and a lightweight recoloring network for deterministic structure-preserving color transfer.
+
+\placeholderfigure{Dual-model architecture}{Generate and place \texttt{figures/spritecraft-dual-model-architecture.png}. The diagram should show the vanilla content texture and ranked style references feeding both StyleAwareUNet and RecolorNet, then the selector / detail-injection stage that chooses the final output.}
 
 \subsection{StyleAwareUNet}
 
@@ -133,6 +137,8 @@ Both models use AdamW with learning rate $3 \times 10^{-4}$ and weight decay 0.0
 \label{sec:inference}
 
 Inference follows a tiered procedure that generates multiple candidates and selects the best based on measured output quality rather than hardcoded routing:
+
+\placeholderfigure{Ensemble routing flow}{Generate and place \texttt{figures/spritecraft-ensemble-routing-flow.png}. The flowchart should cover diffusion sampling, structural-style scoring, detail injection, recolor fallback, and final candidate selection.}
 
 \subsection{Diffusion Sampling}
 
