@@ -1,0 +1,73 @@
+\usepackage[utf8]{inputenc}
+\usepackage[english]{babel}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{listings}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{subcaption}
+\usepackage{xcolor}
+
+\KOMAoptions{
+  parskip=half,
+  listof=totoc,
+  bibliography=totoc
+}
+
+\hypersetup{
+  pdftitle={\reporttitle},
+  pdfauthor={\reportauthor},
+  pdfsubject={\reportsubtitle},
+  pdfkeywords={\reportkeywords}
+}
+
+\setlist[itemize]{leftmargin=*,topsep=0.35\baselineskip,itemsep=0.15\baselineskip}
+\setlist[enumerate]{leftmargin=*,topsep=0.35\baselineskip,itemsep=0.15\baselineskip}
+
+\captionsetup{
+  font=small,
+  labelfont=bf
+}
+
+\definecolor{spritecraftblue}{HTML}{1E5A7A}
+\definecolor{spritecraftgray}{HTML}{4B5563}
+\definecolor{codebackground}{HTML}{F5F7FA}
+
+\addtokomafont{chapter}{\color{spritecraftblue}}
+\addtokomafont{section}{\color{spritecraftblue}}
+\addtokomafont{subsection}{\color{spritecraftgray}}
+
+\lstdefinestyle{spritecraft}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebackground},
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  framerule=0.2pt,
+  keepspaces=true,
+  rulecolor=\color{spritecraftgray},
+  showstringspaces=false,
+  tabsize=2
+}
+\lstset{style=spritecraft}
+
+\newcommand{\placeholderfigure}[2]{%
+  \begin{figure}[htbp]
+    \centering
+    \fbox{%
+      \begin{minipage}[c][0.26\textheight][c]{0.78\textwidth}
+        \centering
+        \textbf{#1}\\[0.75em]
+        #2
+      \end{minipage}
+    }
+    \caption{#1}
+  \end{figure}
+}
+
+\newcommand{\todo}[1]{\textcolor{red!70!black}{\textbf{TODO:} #1}}

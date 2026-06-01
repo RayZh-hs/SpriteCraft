@@ -1,0 +1,24 @@
+\chapter{Reproducibility Notes}
+
+Use this appendix for command logs, configuration tables, selected generated examples, and links to checkpoints.
+Keep large artifacts such as checkpoints and generated bundles outside the report directory; reference their paths instead.
+
+\section{Repository Layout}
+
+\begin{lstlisting}[caption={Important project paths.}]
+src/spritecraft/        Python package
+data/processed/         Preprocessed paired datasets
+checkpoints/<run>/      Training checkpoints and validation previews
+output/<pack_id>/       Generated texture bundles and comparisons
+report/                 Thesis/report source
+\end{lstlisting}
+
+\section{Build Notes}
+
+The report is configured to build with:
+
+\begin{lstlisting}[language=bash]
+make -C report
+\end{lstlisting}
+
+Generated files are written to \texttt{report/build/} and ignored by Git.

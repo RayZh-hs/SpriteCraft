@@ -1,0 +1,55 @@
+\documentclass[
+  11pt,
+  paper=letter,
+  oneside,
+  numbers=noenddot,
+  DIV=12
+]{scrreprt}
+
+\input{metadata}
+\input{preamble}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{2.2cm}
+  {\Large \reportdegree\par}
+  \vspace{1.5cm}
+  {\huge\bfseries\color{spritecraftblue}\reporttitle\par}
+  \vspace{0.75cm}
+  {\Large \reportsubtitle\par}
+  \vfill
+  {\large \reportauthor\par}
+  \vspace{0.5cm}
+  {\large \reportdepartment\par}
+  {\large \reportinstitution\par}
+  \vspace{1.2cm}
+  {\large Supervisor: \reportsupervisor\par}
+  \vspace{1.2cm}
+  {\large \reportdate\par}
+\end{titlepage}
+
+\pagenumbering{roman}
+\input{frontmatter/abstract}
+\input{frontmatter/acknowledgements}
+\tableofcontents
+\listoffigures
+\listoftables
+\clearpage
+
+\pagenumbering{arabic}
+\input{chapters/01-introduction}
+\input{chapters/02-background}
+\input{chapters/03-method}
+\input{chapters/04-experiments}
+\input{chapters/05-conclusion}
+
+\appendix
+\input{chapters/appendix}
+
+\clearpage
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

@@ -1,0 +1,23 @@
+# LaTeX build directory used by latexmkrc and Makefile.
+/build/
+
+# Common root-level LaTeX outputs if someone builds without the configured outdir.
+/*.pdf
+/*.synctex.gz
+/*.aux
+/*.bbl
+/*.bcf
+/*.blg
+/*.fdb_latexmk
+/*.fls
+/*.lof
+/*.log
+/*.lot
+/*.out
+/*.run.xml
+/*.toc
+
+# Editor and temporary files.
+*.bak
+*.tmp
+*~

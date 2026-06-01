@@ -1,0 +1,26 @@
+\chapter{Background}
+\label{chap:background}
+
+\section{Texture Translation}
+
+Neural style transfer popularized the separation of image content and style using learned visual representations \citep{gatys2016image}.
+SpriteCraft differs from general photographic style transfer because its outputs are small game textures rather than natural images.
+The desired result must be visually plausible both as a single icon and as a repeating tile in the game world.
+
+\section{Diffusion Models}
+
+Denoising diffusion probabilistic models learn to reverse a gradual noising process \citep{ho2020denoising}.
+SpriteCraft uses a compact diffusion model that predicts noise at each timestep and recovers a clean texture estimate during sampling.
+The small \(32 \times 32\) resolution keeps training and inference tractable, but it makes detail placement and contrast preservation especially important.
+
+\section{Encoder-Decoder Networks}
+
+U-Net style encoder-decoder networks are a standard choice for dense prediction because they combine coarse contextual features with high-resolution skip connections \citep{ronneberger2015unet}.
+SpriteCraft uses this pattern in both the diffusion model and the recoloring fallback.
+The diffusion model conditions on content, timestep, and ranked style references; the recoloring model emphasizes deterministic structure preservation.
+
+\section{Optimization}
+
+The training loops use AdamW, which decouples weight decay from adaptive gradient updates \citep{loshchilov2019decoupled}.
+The current diffusion objective combines noise prediction with reconstruction, gradient, and content-aware losses.
+This gives the report a natural structure for separating optimization behavior from perceptual output quality.

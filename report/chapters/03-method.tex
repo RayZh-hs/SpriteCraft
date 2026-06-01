@@ -1,0 +1,47 @@
+\chapter{Method}
+\label{chap:method}
+
+\section{Data Pipeline}
+
+Preprocessing extracts block textures from base and target resource packs, filters to full-cube block textures, resizes images to \(32 \times 32\), and writes per-pack datasets.
+Each training sample pairs one vanilla texture with the matching texture from one target pack.
+The pipeline also records metadata for style-reference sampling and validation.
+
+\section{Model Overview}
+
+The current system uses two complementary models:
+
+\begin{itemize}
+  \item \textbf{StyleAwareUNet}: a diffusion model that fuses noisy target state with vanilla content, encodes multiple target-pack style references, and applies cross-attention at the bottleneck.
+  \item \textbf{RecolorNet}: a lightweight U-Net that predicts a residual over the vanilla content texture and acts as a fallback when diffusion candidates are structurally weak.
+\end{itemize}
+
+\placeholderfigure{SpriteCraft generation overview}{Replace this placeholder with a pipeline diagram showing vanilla content input, style references, diffusion candidates, recolor fallback, and final candidate selection.}
+
+\section{Conditioning}
+
+The diffusion model receives the current noisy target image, the vanilla content image, three ranked style references from the same target pack, a validity mask for padded references, and the diffusion timestep.
+Reference ranking uses content descriptors and filename-family priors so that visually relevant materials are more likely to guide generation.
+
+\section{Training Objective}
+
+The diffusion loss combines noise prediction with auxiliary reconstruction and content-aware penalties:
+
+\begin{equation}
+  \mathcal{L}_{total}
+  =
+  \mathcal{L}_{noise}
+  + 0.70\mathcal{L}_{recon}
+  + 0.30\mathcal{L}_{gradient}
+  + 0.30\mathcal{L}_{content}.
+\end{equation}
+
+The content term includes structure, contrast, hue, and color-moment components.
+The important design choice is that structure comparisons are source-relative, while contrast and hue penalties are target-gated.
+This focuses the model on changes that matter for the target style without forcing flat or low-chroma regions to carry unnecessary detail.
+
+\section{Inference}
+
+Sampling starts from Gaussian noise and applies 40 reverse diffusion steps.
+The system samples multiple diffusion candidates, scores them against style support descriptors, optionally compares against a learned recolor candidate, and falls back to deterministic recoloring when necessary.
+The report should include qualitative examples whenever discussing this selection logic because scalar scores can miss tileability and material identity failures.

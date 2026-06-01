@@ -1,0 +1,28 @@
+\chapter{Introduction}
+
+Texture style transfer asks a model to preserve the semantic content and spatial structure of an input image while adopting the visual language of a target style.
+In SpriteCraft, the input domain is constrained but demanding: block textures are small, tileable, and highly sensitive to local detail.
+An error of only a few pixels can change material identity, break tiling, or make a generated resource pack visually inconsistent.
+
+The project maps vanilla Minecraft block textures to target resource-pack versions.
+This framing provides paired supervision because each target pack can be aligned to the same canonical vanilla texture names.
+It also creates a useful test bed for studying low-resolution image translation, style conditioning, structure preservation, and qualitative model evaluation.
+
+\section{Problem Statement}
+
+Given a vanilla content texture \(x_c \in [0,1]^{3 \times 32 \times 32}\), a target pack \(p\), and a small set of style reference textures \(S_p\), the system should generate a target-like texture \(y\) that preserves the block identity of \(x_c\) while matching the color, contrast, and material style of \(p\).
+
+\section{Contributions}
+
+\begin{itemize}
+  \item A reportable data pipeline for extracting, resizing, and pairing full-cube block textures across resource packs.
+  \item A dual-model generation system combining a style-conditioned diffusion model with a structure-preserving recoloring network.
+  \item A qualitative evaluation workflow centered on validation matrices and generated texture comparisons.
+\end{itemize}
+
+\section{Document Structure}
+
+Chapter~\ref{chap:background} introduces related work and project assumptions.
+Chapter~\ref{chap:method} describes the SpriteCraft architecture and training objective.
+Chapter~\ref{chap:experiments} provides a template for reporting datasets, metrics, qualitative results, and ablations.
+Chapter~\ref{chap:conclusion} summarizes the expected claims and remaining limitations.

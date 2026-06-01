@@ -1,0 +1,48 @@
+\chapter{Experiments}
+\label{chap:experiments}
+
+\section{Datasets}
+
+Describe each evaluated target pack, the number of paired textures, the validation texture names, and any preprocessing differences such as original resolution.
+Keep this section reproducible by recording the exact command used to create \texttt{data/processed/}.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Dataset summary template.}
+  \begin{tabular}{lrrl}
+    \toprule
+    Target pack & Train pairs & Validation pairs & Notes \\
+    \midrule
+    \todo{pack-id} & \todo{n} & \todo{n} & \todo{resolution or filtering notes} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\section{Training Configuration}
+
+Report the model versions, optimizer settings, number of steps, learning-rate schedule, random seed policy, and hardware.
+For generated results, also report the checkpoint path and inference command.
+
+\begin{lstlisting}[language=bash,caption={Example commands to replace with the final experimental run.}]
+uv run spritecraft preprocess
+uv run spritecraft train --run report-baseline
+uv run spritecraft train-recolor --run report-baseline
+uv run spritecraft generate --run report-baseline
+\end{lstlisting}
+
+\section{Quantitative Metrics}
+
+Use metrics to identify broad trends, not as the only evidence of quality.
+For this project, candidate scores, reconstruction losses, color statistics, and sharpness penalties are useful diagnostics, but the final report should pair them with validation matrices and side-by-side texture comparisons.
+
+\section{Qualitative Evaluation}
+
+\placeholderfigure{Validation matrix placeholder}{Replace this placeholder with a grid from the checkpoint validation directory or an output comparison image.}
+
+When reviewing images, comment on material identity, palette match, edge sharpness, contrast, and tiling behavior.
+Record failure cases explicitly, especially for transparent textures, line-art textures, leaves, glass, and high-frequency blocks.
+
+\section{Ablations}
+
+Suggested ablations include removing the recolor fallback, changing the number of diffusion candidates, disabling detail injection, and varying the weights of content-aware losses.
+Each ablation should include representative images as well as metric summaries.
