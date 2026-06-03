@@ -33,14 +33,10 @@
 \newcommand{\smallbody}{\fontsize{19}{24}\selectfont}
 \newcommand{\captionfont}{\fontsize{16}{20}\selectfont\itshape\color{textMuted}}
 \newcommand{\posterfig}[3]{%
-  \centering\includegraphics[width=#1\linewidth]{#2}\\[1mm]
-  {\captionfont #3}\vspace{2mm}
-}
-\newcommand{\metric}[2]{%
-  \begin{minipage}[t]{0.23\linewidth}\centering
-  {\fontsize{31}{36}\selectfont\bfseries\color{sjtuPurple}#1}\\[-1pt]
-  {\smallbody #2}
-  \end{minipage}
+  \begin{center}
+  \includegraphics[width=#1\linewidth]{#2}\\[1mm]
+  {\captionfont #3}
+  \end{center}\vspace{2mm}
 }
 
 \tcbset{
@@ -88,7 +84,7 @@
   \end{minipage}
 }
 
-\posterbox[postersection]{name=background, column=1, between=row3 and row9}{
+\posterbox[postersection]{name=background, column=1, between=row3 and row7}{
   \sectiontitle{Background}
   \bodyfont
   \subhead{Minecraft resource-pack transfer}
@@ -102,19 +98,14 @@
   Given vanilla content texture \(x_c\), target pack \(p\), and style references \(S_p\), generate \(y\) that preserves material identity, adopts the target palette, and remains tileable.
 }
 
-\posterbox[postersection]{name=task, column=1, between=row9 and row14}{
+\posterbox[postersection]{name=task, column=1, between=row7 and row13}{
   \sectiontitle{Task}
-  \posterfig{0.72}{figures/spritecraft-pipeline-overview.png}{Vanilla packs and target packs are filtered to valid full-cube textures, normalized, paired by filename, and exported as per-pack datasets.}
+  \posterfig{0.80}{figures/spritecraft-pipeline-overview.png}{Vanilla packs and target packs are filtered to valid full-cube textures, normalized, paired by filename, and exported as per-pack datasets.}
   \bodyfont
-  \begin{center}
-    \metric{32$\times$32}{canonical RGB grid}\hfill
-    \metric{3}{ranked style references}\hfill
-    \metric{20}{validation textures}\hfill
-    \metric{4}{fully trained run33 packs}
-  \end{center}
+  \textbf{Scale:} 32$\times$32 RGB textures; three ranked style references; 20 validation textures; four fully trained \texttt{run33} target packs.
 }
 
-\posterbox[postersection]{name=method, column=1, between=row14 and row22}{
+\posterbox[postersection]{name=method, column=1, between=row13 and row22}{
   \sectiontitle{Model}
   \bodyfont
   \subhead{Dual-model architecture}
@@ -124,7 +115,7 @@
     \item Shared reference ranking uses texture descriptors plus filename priors.
   \end{itemize}
   \vspace{2pt}
-  \posterfig{0.74}{figures/spritecraft-dual-model-architecture.png}{Diffusion provides expressive candidates; RecolorNet supplies a safer structural fallback.}
+  \posterfig{0.82}{figures/spritecraft-dual-model-architecture.png}{Diffusion provides expressive candidates; RecolorNet supplies a safer structural fallback.}
 }
 
 \posterbox[postersection]{name=training, column=1, between=row22 and row29}{
@@ -145,7 +136,7 @@
   \end{itemize}
 }
 
-\posterbox[postersection]{name=approach, column=2, between=row3 and row10}{
+\posterbox[postersection]{name=approach, column=2, between=row3 and row11}{
   \sectiontitle{Our Approach}
   \bodyfont
   \subhead{Output-driven routing}
@@ -157,10 +148,10 @@
     \item High-pattern textures such as \texttt{bookshelf} and \texttt{tnt\_side} use stricter gates.
   \end{itemize}
   \vspace{2pt}
-  \posterfig{0.55}{figures/spritecraft-ensemble-routing-flow.png}{The selector favors plausible tile structure over target-aware MAE alone.}
+  \posterfig{0.70}{figures/spritecraft-ensemble-routing-flow.png}{The selector favors plausible tile structure over target-aware MAE alone.}
 }
 
-\posterbox[postersection]{name=experiments, column=2, between=row10 and row18}{
+\posterbox[postersection]{name=experiments, column=2, between=row11 and row17}{
   \sectiontitle{Experiments}
   \bodyfont
   \subhead{Setup}
@@ -183,9 +174,9 @@
   {\captionfont Cells report MAE / pixel accuracy. Bold marks the target-aware best value, not necessarily the selected branch.}
 }
 
-\posterbox[postersection]{name=results, column=2, between=row18 and row24}{
+\posterbox[postersection]{name=results, column=2, between=row17 and row24}{
   \sectiontitle{Results}
-  \posterfig{0.66}{figures/run33-multi-pack-oak-planks.png}{Selected \texttt{oak\_planks.png} outputs show pack-specific palette and contrast transfer while preserving the plank identity.}
+  \posterfig{0.74}{figures/run33-multi-pack-oak-planks.png}{Selected \texttt{oak\_planks.png} outputs show pack-specific palette and contrast transfer while preserving the plank identity.}
   \bodyfont
   \begin{itemize}
     \item Bare Bones is easiest because it stays close to vanilla structure.
@@ -231,4 +222,3 @@
 
 \end{tcbposter}
 \end{document}
-
