@@ -1,195 +1,232 @@
+\RequirePackage{fix-cm}
 \documentclass{article}
 \usepackage[paperwidth=841mm,paperheight=1189mm,margin=0mm]{geometry}
 \usepackage{tcolorbox}
 \tcbuselibrary{poster,skins}
 \usepackage{graphicx}
 \usepackage{amsmath,amssymb}
-\usepackage{enumitem}
-\usepackage[table]{xcolor}
-\usepackage{lmodern}
-\usepackage[T1]{fontenc}
 \usepackage{array}
+\usepackage[table]{xcolor}
+\usepackage{enumitem}
+\usepackage{anyfontsize}
 \pagestyle{empty}
 
-\definecolor{primary}{HTML}{12231C}
-\definecolor{secondary}{HTML}{C67B3B}
-\definecolor{accent}{HTML}{31A688}
-\definecolor{amber}{HTML}{E3B24E}
-\definecolor{bgposter}{HTML}{EDE3D0}
-\definecolor{greencard}{HTML}{EEF7EF}
-\definecolor{stonecard}{HTML}{F3F1EA}
-\definecolor{sandcard}{HTML}{FFF2DA}
-\definecolor{darkcardbg}{HTML}{E3EDDF}
-\definecolor{greentitlebg}{HTML}{DBEEE1}
-\definecolor{stonetitlebg}{HTML}{E7E3D8}
-\definecolor{sandtitlebg}{HTML}{F5DFB5}
-\definecolor{textdark}{HTML}{101820}
-\definecolor{textmuted}{HTML}{4B5A52}
+\definecolor{sjtuPurple}{HTML}{652D89}
+\definecolor{sjtuDark}{HTML}{2F1644}
+\definecolor{textDark}{HTML}{111111}
+\definecolor{textMuted}{HTML}{454545}
+\definecolor{ruleGray}{HTML}{9A8AA7}
+\definecolor{accentTeal}{HTML}{199C9A}
 
-\pagecolor{bgposter}
-\color{textdark}
-
+\pagecolor{white}
+\color{textDark}
 \setlength{\parindent}{0pt}
-\setlist[itemize]{leftmargin=26pt, itemsep=7pt, parsep=1pt, topsep=2pt,
-  label={\color{accent}$\blacktriangleright$}}
+\setlist[itemize]{leftmargin=18pt, itemsep=4pt, parsep=0pt, topsep=2pt,
+  label={\fontsize{18}{20}\selectfont\color{sjtuPurple}$\bullet$}}
 
-\newcommand{\bodyfont}{\fontsize{31}{39}\selectfont}
-\newcommand{\smallbody}{\fontsize{26}{33}\selectfont}
-\newcommand{\captionfont}{\fontsize{23}{29}\selectfont}
-\newcommand{\statnumber}[1]{{\fontsize{62}{74}\selectfont\bfseries\color{primary}#1}}
-\newcommand{\statlabel}[1]{{\fontsize{24}{30}\selectfont\color{textdark}#1}}
-\newcommand{\posterfig}[3]{%
-  \centering\includegraphics[width=#1\linewidth]{#2}\\[2mm]
-  {\captionfont\color{textmuted}\textit{#3}}\vspace{1mm}%
+\newcommand{\sectiontitle}[1]{%
+  {\fontsize{40}{47}\selectfont\bfseries\color{sjtuPurple}#1}\\[-3pt]
+  {\color{ruleGray}\rule{\linewidth}{1.1pt}}\vspace{4pt}
 }
-\newcommand{\callout}[2]{%
-  \colorbox{#1!22}{\parbox{0.955\linewidth}{\smallbody #2}}%
+\newcommand{\subhead}[1]{{\fontsize{25}{30}\selectfont\bfseries #1}\vspace{2pt}}
+\newcommand{\bodyfont}{\fontsize{22}{29}\selectfont}
+\newcommand{\smallbody}{\fontsize{19}{24}\selectfont}
+\newcommand{\captionfont}{\fontsize{16}{20}\selectfont\itshape\color{textMuted}}
+\newcommand{\posterfig}[3]{%
+  \centering\includegraphics[width=#1\linewidth]{#2}\\[1mm]
+  {\captionfont #3}\vspace{2mm}
+}
+\newcommand{\metric}[2]{%
+  \begin{minipage}[t]{0.23\linewidth}\centering
+  {\fontsize{31}{36}\selectfont\bfseries\color{sjtuPurple}#1}\\[-1pt]
+  {\smallbody #2}
+  \end{minipage}
 }
 
 \tcbset{
-  basecard/.style={
-    enhanced, arc=0pt, boxrule=0pt,
-    left=18pt, right=18pt, top=6pt, bottom=6pt,
-    fonttitle=\fontsize{37}{45}\selectfont\bfseries,
-    toptitle=6pt, bottomtitle=6pt,
-    titlerule=2pt,
+  postersection/.style={
+    enhanced,
+    colback=white,
+    colframe=white,
+    boxrule=0pt,
+    arc=0pt,
+    left=18pt,
+    right=18pt,
+    top=6pt,
+    bottom=4pt,
     valign=top,
-    drop shadow={opacity=0.16},
-  },
-  greencard/.style={
-    basecard, colback=greencard,
-    borderline west={6pt}{0pt}{accent},
-    coltitle=primary, colbacktitle=greentitlebg,
-    titlerule style={accent!55},
-  },
-  stonecard/.style={
-    basecard, colback=stonecard,
-    borderline west={6pt}{0pt}{primary},
-    coltitle=primary, colbacktitle=stonetitlebg,
-    titlerule style={primary!45},
-  },
-  sandcard/.style={
-    basecard, colback=sandcard,
-    borderline west={6pt}{0pt}{secondary},
-    coltitle=secondary, colbacktitle=sandtitlebg,
-    titlerule style={secondary!55},
-  },
-  highlightcard/.style={
-    basecard, colback=darkcardbg,
-    borderline west={7pt}{0pt}{primary},
-    coltitle=white, colbacktitle=primary,
   }
 }
 
 \begin{document}
 \begin{tcbposter}[
   coverage={spread},
-  poster={columns=2, rows=24, spacing=0mm},
+  poster={columns=2, rows=30, spacing=0mm},
 ]
 
 \posterbox[
-  enhanced, colback=primary, colframe=primary, colupper=white,
-  arc=0pt, boxrule=0pt,
-  left=36pt, right=36pt, top=10pt, bottom=8pt,
-  halign=center, valign=center,
-  drop shadow={opacity=0.24}
-]{name=title, column=1, span=2, between=top and row3}{
-  {\fontsize{70}{84}\selectfont\bfseries SpriteCraft: Texture Style Transfer for Minecraft Resource Packs}\\[10pt]
-  {\fontsize{33}{41}\selectfont Diffusion generation + structure-preserving recolor fallback for 32$\times$32 block textures}\\[6pt]
-  {\fontsize{27}{34}\selectfont Ray Zhang \quad Shanghai Jiao Tong University}
-}
-
-\posterbox[
-  enhanced, colback=primary!12!white, boxrule=0pt, arc=0pt,
-  left=10pt, right=10pt, top=6pt, bottom=6pt,
-  valign=center, borderline south={3pt}{0pt}{primary!35}
-]{name=stats, column=1, span=2, between=row3 and row5}{
-  \centering
-  \begin{minipage}[c]{0.235\linewidth}\centering
-    \statnumber{32$\times$32}\\[-1pt]\statlabel{canonical RGB texture grid}
+  enhanced,
+  colback=sjtuPurple,
+  colframe=sjtuPurple,
+  colupper=white,
+  boxrule=0pt,
+  arc=0pt,
+  left=30pt,
+  right=30pt,
+  top=8pt,
+  bottom=8pt,
+  valign=center,
+]{name=header, column=1, span=2, between=top and row3}{
+  \begin{minipage}[c]{0.74\linewidth}
+    {\fontsize{56}{64}\selectfont\bfseries SpriteCraft: Texture Style Transfer\\[-2pt] for Minecraft Resource Packs}\\[8pt]
+    {\fontsize{25}{31}\selectfont Ray Zhang, Shanghai Jiao Tong University}\\[3pt]
+    {\fontsize{21}{27}\selectfont Diffusion generation with structure-preserving recolor fallback for 32$\times$32 block textures}
   \end{minipage}\hfill
-  \begin{minipage}[c]{0.235\linewidth}\centering
-    \statnumber{7.7M+1.0M}\\[-1pt]\statlabel{diffusion + recolor parameters}
-  \end{minipage}\hfill
-  \begin{minipage}[c]{0.235\linewidth}\centering
-    \statnumber{40}\\[-1pt]\statlabel{cosine DDPM sampling steps}
-  \end{minipage}\hfill
-  \begin{minipage}[c]{0.235\linewidth}\centering
-    \statnumber{4}\\[-1pt]\statlabel{\texttt{run33} fully trained packs}
+  \begin{minipage}[c]{0.23\linewidth}
+    \raggedleft
+    \includegraphics[width=0.96\linewidth]{figures/sjtu-logo-white.png}
   \end{minipage}
 }
 
-\posterbox[greencard, title={Problem: Small Tiles Amplify Every Error}
-]{name=problem, column=1, between=row5 and row9}{
+\posterbox[postersection]{name=background, column=1, between=row3 and row9}{
+  \sectiontitle{Background}
   \bodyfont
+  \subhead{Minecraft resource-pack transfer}
   \begin{itemize}
-    \item Resource packs require hundreds of hand-made blocks.
-    \item Low resolution magnifies hue and edge mistakes.
-    \item Vanilla filenames give paired pack supervision.
+    \item Resource packs contain hundreds of small tileable block faces.
+    \item Manual pack creation is repetitive artistic work.
+    \item Pixel-scale hue and edge errors are immediately visible.
   \end{itemize}
-  \vspace{2mm}
-  \callout{accent}{\textbf{Task:} preserve material identity, adopt pack palette, and remain plausible as a repeating Minecraft tile.}
+  \vspace{3pt}
+  \subhead{Problem formulation}
+  Given vanilla content texture \(x_c\), target pack \(p\), and style references \(S_p\), generate \(y\) that preserves material identity, adopts the target palette, and remains tileable.
 }
 
-\posterbox[stonecard, title={Pipeline: Vanilla-Anchored Per-Pack Training}
-]{name=pipeline, column=1, between=row9 and row14}{
-  \posterfig{0.965}{figures/spritecraft-pipeline-overview.png}{Raw packs are filtered to valid full-cube block textures, normalized to 32$\times$32, paired by filename, and exported as per-pack datasets.}
-}
-
-\posterbox[sandcard, title={Method: Expressive Diffusion + Safe Recolor}
-]{name=architecture, column=1, between=row14 and row20}{
-  \posterfig{0.965}{figures/spritecraft-dual-model-architecture.png}{StyleAwareUNet samples expressive candidates; RecolorNet supplies structure-preserving residual color transfer; the selector chooses the final output.}
-}
-
-\posterbox[highlightcard, title={Training and Routing Rules}
-]{name=methodrules, column=1, between=row20 and bottom}{
+\posterbox[postersection]{name=task, column=1, between=row9 and row14}{
+  \sectiontitle{Task}
+  \posterfig{0.72}{figures/spritecraft-pipeline-overview.png}{Vanilla packs and target packs are filtered to valid full-cube textures, normalized, paired by filename, and exported as per-pack datasets.}
   \bodyfont
+  \begin{center}
+    \metric{32$\times$32}{canonical RGB grid}\hfill
+    \metric{3}{ranked style references}\hfill
+    \metric{20}{validation textures}\hfill
+    \metric{4}{fully trained run33 packs}
+  \end{center}
+}
+
+\posterbox[postersection]{name=method, column=1, between=row14 and row22}{
+  \sectiontitle{Model}
+  \bodyfont
+  \subhead{Dual-model architecture}
   \begin{itemize}
-    \item SNR-weighted $\hat{x}_0$ reconstruction and content losses.
-    \item Source-relative structure, contrast, hue, color moments.
-    \item Candidate score = structural quality + style quality.
-    \item Recolor fallback for low-quality diffusion outputs.
+    \item \textbf{StyleAwareUNet} (\(\sim\)7.7M parameters): denoising diffusion model conditioned on content, references, and timestep.
+    \item \textbf{RecolorNet} (\(\sim\)1.0M parameters): deterministic residual U-Net for structure-preserving color transfer.
+    \item Shared reference ranking uses texture descriptors plus filename priors.
+  \end{itemize}
+  \vspace{2pt}
+  \posterfig{0.74}{figures/spritecraft-dual-model-architecture.png}{Diffusion provides expressive candidates; RecolorNet supplies a safer structural fallback.}
+}
+
+\posterbox[postersection]{name=training, column=1, between=row22 and row29}{
+  \sectiontitle{Training Objective}
+  \bodyfont
+  \subhead{SNR-weighted diffusion supervision}
+  \[
+    \mathcal{L}_{total}=\mathcal{L}_{noise}
+    + \bar{\alpha}_t(0.70\mathcal{L}_{recon}
+    +0.30\mathcal{L}_{gradient}
+    +0.20\mathcal{L}_{content})
+  \]
+  \subhead{Content-aware terms}
+  \begin{itemize}
+    \item Source-relative structure deltas preserve block identity.
+    \item Target-gated contrast and hue focus on detailed regions.
+    \item Color moments provide stable global palette gradients.
   \end{itemize}
 }
 
-\posterbox[sandcard, title={Pack-Level Results at \texttt{run33} Step 10k}
-]{name=results, column=2, between=row5 and row10}{
+\posterbox[postersection]{name=approach, column=2, between=row3 and row10}{
+  \sectiontitle{Our Approach}
+  \bodyfont
+  \subhead{Output-driven routing}
+  Instead of always trusting the generative branch, SpriteCraft scores the actual candidates and selects among diffusion, non-destructive detail injection, RecolorNet, and deterministic recolor fallback.
+  \vspace{4pt}
+  \begin{itemize}
+    \item Structural quality checks edge fidelity, detail coherence, and entropy stability.
+    \item Style quality compares the candidate with active support references.
+    \item High-pattern textures such as \texttt{bookshelf} and \texttt{tnt\_side} use stricter gates.
+  \end{itemize}
+  \vspace{2pt}
+  \posterfig{0.55}{figures/spritecraft-ensemble-routing-flow.png}{The selector favors plausible tile structure over target-aware MAE alone.}
+}
+
+\posterbox[postersection]{name=experiments, column=2, between=row10 and row18}{
+  \sectiontitle{Experiments}
+  \bodyfont
+  \subhead{Setup}
+  Vanilla Minecraft 1.21 provides content textures. Target packs cover minimalist, cartoon, stylized, vanilla-adjacent, and high-resolution styles. Final diffusion runs use 10,000 steps, 40 DDPM timesteps, AdamW, EMA validation, and bfloat16 mixed precision.
+  \vspace{5pt}
+  \subhead{run33 pack-level results at step 10k}
   \smallbody
-  \renewcommand{\arraystretch}{1.35}
-  \setlength{\tabcolsep}{7pt}
-  \centering
-  \begin{tabular}{>{\raggedright\arraybackslash}p{0.28\linewidth}ccc}
-    \rowcolor{secondary!20}
-    Pack & Diff. & Recolor & Selected \\
+  \renewcommand{\arraystretch}{1.24}
+  \setlength{\tabcolsep}{8pt}
+  \begin{center}
+  \begin{tabular}{lccc}
+    \rowcolor{sjtuPurple!12}
+    Pack & Diffusion & Recolor & Selected \\
     Ashen 16x & .107 / .315 & .110 / .383 & \textbf{.110 / .389} \\
     Bare Bones & \textbf{.059 / .560} & .068 / .559 & .062 / .526 \\
     Cartoon & \textbf{.136 / .309} & .160 / .264 & .151 / .225 \\
     Chibli 64x & \textbf{.126 / .302} & .188 / .189 & .188 / .189 \\
-  \end{tabular}\\[3mm]
-  {\captionfont\color{textmuted}Cells show MAE / pixel accuracy. The selector is conservative: it optimizes plausible tile structure, not target-aware MAE alone.}
+  \end{tabular}
+  \end{center}
+  {\captionfont Cells report MAE / pixel accuracy. Bold marks the target-aware best value, not necessarily the selected branch.}
 }
 
-\posterbox[greencard, title={Qualitative Result: One Texture, Four Pack Styles}
-]{name=oak, column=2, between=row10 and row15}{
-  \posterfig{0.93}{figures/run33-multi-pack-oak-planks.png}{Selected \texttt{oak\_planks.png} outputs preserve plank layout while moving palette and contrast toward each pack.}
-}
-
-\posterbox[stonecard, title={Routing Stress Test: Fine Structure Wins}
-]{name=routing, column=2, between=row15 and row20}{
-  \posterfig{0.93}{figures/run33-ashen-routing.png}{Bookshelf and TNT expose diffusion's structural risk. Recolor fallback keeps symbols and narrow repeated structure more legible.}
-}
-
-\posterbox[highlightcard, title={Takeaways and Next Steps}
-]{name=takeaways, column=2, between=row20 and bottom}{
+\posterbox[postersection]{name=results, column=2, between=row18 and row24}{
+  \sectiontitle{Results}
+  \posterfig{0.66}{figures/run33-multi-pack-oak-planks.png}{Selected \texttt{oak\_planks.png} outputs show pack-specific palette and contrast transfer while preserving the plank identity.}
   \bodyfont
   \begin{itemize}
-    \item Dual models are safer than diffusion alone.
-    \item Easy packs accept more diffusion detail.
-    \item Hard packs need conservative structure gates.
-    \item Future: alpha channels, learned support ranking, multi-resolution refinement, learned routing thresholds.
+    \item Bare Bones is easiest because it stays close to vanilla structure.
+    \item Ashen improves clearly from the diffusion-only sweep to run33.
+    \item Chibli remains hard: only 87 train pairs and 64x artwork compressed to 32x.
   \end{itemize}
-  \vspace{2mm}
-  \callout{amber}{\textbf{Best current fit:} vanilla-adjacent, minimalist, and medium-complexity stylized Minecraft resource packs.}
+}
+
+\posterbox[postersection]{name=challenges, column=2, between=row24 and row29}{
+  \sectiontitle{Challenges}
+  \begin{minipage}[t]{0.49\linewidth}
+    \bodyfont
+    \subhead{Known failure modes}
+    \begin{itemize}
+      \item Transparent materials: alpha is not modeled.
+      \item Fine symbols: TNT text and bookshelves need exact structure.
+      \item High-resolution packs lose microtexture at 32x.
+    \end{itemize}
+    \subhead{Next steps}
+    Alpha-aware training, learned support selection, multi-resolution refinement, and learned routing thresholds.
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.48\linewidth}
+    \posterfig{0.95}{figures/run33-ashen-routing.png}{Recolor fallback protects fine structure when diffusion damages symbols or repeated narrow patterns.}
+  \end{minipage}
+}
+
+\posterbox[
+  enhanced,
+  colback=sjtuPurple,
+  colframe=sjtuPurple,
+  colupper=white,
+  boxrule=0pt,
+  arc=0pt,
+  left=30pt,
+  right=30pt,
+  top=3pt,
+  bottom=3pt,
+  valign=center,
+]{name=footer, column=1, span=2, between=row29 and bottom}{
+  {\fontsize{25}{31}\selectfont Apex Data \& Knowledge Management Lab}\hfill
+  {\fontsize{25}{31}\selectfont SpriteCraft \(\cdot\) texture synthesis, style transfer, diffusion models, Minecraft resource packs}
 }
 
 \end{tcbposter}
