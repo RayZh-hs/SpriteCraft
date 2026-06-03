@@ -61,6 +61,7 @@ VAL_SCALAR_NAMES = (
     "content_contrast_loss",
     "content_hue_loss",
     "content_color_moment_loss",
+    "content_loss_scale",
 )
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
