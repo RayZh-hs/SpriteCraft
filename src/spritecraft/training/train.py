@@ -23,6 +23,7 @@ from spritecraft.config import (
     pack_checkpoint_dir,
 )
 from spritecraft.data.dataset import PackStyleDataset, get_available_pack_ids
+from spritecraft.data.support_index import infer_texture_family
 from spritecraft.debug.utility import (
     runtime_status_path,
     utcnow_iso,
@@ -46,6 +47,7 @@ LOSS_COMPONENT_NAMES = (
     "content_contrast_loss",
     "content_hue_loss",
     "content_color_moment_loss",
+    "content_loss_scale",
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 VAL_SCALAR_NAMES = (
@@ -67,6 +69,12 @@ TENSORBOARD_DIRNAME = "tensorboard"
 WARMUP_FRACTION = 0.05
 # Content loss weight (constant; x0-dependent losses are SNR-weighted)
 CONTENT_LOSS_WEIGHT = 0.20
+# Relax content-aware losses when the target pack deliberately redraws or
+# simplifies the vanilla texture. This keeps diffusion from over-preserving
+# vanilla wood grain/noise while retaining the base noise/reconstruction signal.
+MIN_CONTENT_LOSS_SCALE = 0.15
+WOOD_CONTENT_LOSS_CAP = 0.35
+SIMPLIFIED_DETAIL_RATIO = 0.85
 # EMA decay rate
 EMA_DECAY = 0.995
 
@@ -187,6 +195,7 @@ def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord
                 "content_contrast_loss": float(row.get("content_contrast_loss", 0.0)),
                 "content_hue_loss": float(row.get("content_hue_loss", 0.0)),
                 "content_color_moment_loss": float(row.get("content_color_moment_loss", 0.0)),
+                "content_loss_scale": float(row.get("content_loss_scale", 1.0)),
             }
             previous_step = step
 
@@ -285,6 +294,81 @@ def _rgb_channel_gradient_loss(pred_rgb: torch.Tensor, target_rgb: torch.Tensor)
     return total / 3.0
 
 
+def _high_pass_luminance(rgb: torch.Tensor) -> torch.Tensor:
+    gray = (
+        0.299 * rgb[:, 0:1]
+        + 0.587 * rgb[:, 1:2]
+        + 0.114 * rgb[:, 2:3]
+    )
+    blurred = F.avg_pool2d(gray, kernel_size=3, stride=1, padding=1)
+    return gray - blurred
+
+
+def _gradient_magnitude(rgb: torch.Tensor) -> torch.Tensor:
+    gray = (
+        0.299 * rgb[:, 0:1]
+        + 0.587 * rgb[:, 1:2]
+        + 0.114 * rgb[:, 2:3]
+    )
+    grad_x = gray[:, :, :, 1:] - gray[:, :, :, :-1]
+    grad_y = gray[:, :, 1:, :] - gray[:, :, :-1, :]
+    grad_x = F.pad(grad_x, (0, 1, 0, 0))
+    grad_y = F.pad(grad_y, (0, 0, 0, 1))
+    return torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
+
+
+def _cosine_per_sample(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    a_flat = a.flatten(start_dim=1)
+    b_flat = b.flatten(start_dim=1)
+    numerator = (a_flat * b_flat).sum(dim=1)
+    denominator = a_flat.norm(dim=1).clamp_min(1e-6) * b_flat.norm(dim=1).clamp_min(1e-6)
+    return numerator / denominator
+
+
+def _content_loss_scale(
+    content_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    filenames: list[str] | tuple[str, ...] | None = None,
+) -> torch.Tensor:
+    """Return per-sample multipliers for x0 content-aware losses.
+
+    Structure/content losses are useful when a pack preserves the vanilla
+    layout, but they can fight packs that simplify texture detail or redraw
+    wood/plank bands. The gate is intentionally smooth and data-derived:
+    low target/content detail agreement or target detail simplification lowers
+    the content term while keeping the base diffusion, reconstruction, and
+    target-gradient losses active.
+    """
+    content_grad = _gradient_magnitude(content_rgb)
+    target_grad = _gradient_magnitude(target_rgb)
+    content_detail = _high_pass_luminance(content_rgb)
+    target_detail = _high_pass_luminance(target_rgb)
+
+    grad_alignment = _cosine_per_sample(content_grad, target_grad).clamp(0.0, 1.0)
+    detail_alignment = _cosine_per_sample(content_detail, target_detail).clamp(0.0, 1.0)
+    structure_alignment = 0.5 * (grad_alignment + detail_alignment)
+    alignment_scale = ((structure_alignment - 0.20) / 0.55).clamp(MIN_CONTENT_LOSS_SCALE, 1.0)
+
+    content_detail_energy = content_detail.abs().mean(dim=(1, 2, 3)).clamp_min(1e-6)
+    target_detail_energy = target_detail.abs().mean(dim=(1, 2, 3))
+    detail_ratio = (target_detail_energy / content_detail_energy).clamp(0.0, 2.0)
+    simplification_scale = torch.where(
+        detail_ratio < SIMPLIFIED_DETAIL_RATIO,
+        (0.20 + 0.80 * detail_ratio / SIMPLIFIED_DETAIL_RATIO).clamp(MIN_CONTENT_LOSS_SCALE, 1.0),
+        torch.ones_like(detail_ratio),
+    )
+    scale = torch.minimum(alignment_scale, simplification_scale)
+
+    if filenames is not None:
+        caps = torch.ones_like(scale)
+        for index, filename in enumerate(filenames):
+            if infer_texture_family(filename) == "wood":
+                caps[index] = min(caps[index].item(), WOOD_CONTENT_LOSS_CAP)
+        scale = torch.minimum(scale, caps)
+
+    return scale.clamp(MIN_CONTENT_LOSS_SCALE, 1.0)
+
+
 def _update_ema(
     ema_state_dict: dict[str, torch.Tensor],
     model: StyleAwareUNet,
@@ -319,6 +403,7 @@ def _compute_loss(
     target_rgb: torch.Tensor,
     content_loss_weight: float = 0.20,
     x0_weight: torch.Tensor | None = None,
+    filenames: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Balance diffusion correctness with explicit edge and color preservation.
 
@@ -333,17 +418,41 @@ def _compute_loss(
     luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
     channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
     gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-    components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
+    content_scale = _content_loss_scale(content_rgb, target_rgb, filenames=filenames)
+    if pred_x0.shape[0] == 1:
+        components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
+        scaled_content_loss = components["content_loss"] * content_scale.mean()
+    else:
+        per_sample_components = [
+            rgb_content_loss_components(
+                pred_x0[index:index + 1],
+                content_rgb[index:index + 1],
+                target_rgb[index:index + 1],
+            )
+            for index in range(pred_x0.shape[0])
+        ]
+        component_names = per_sample_components[0].keys()
+        components = {
+            name: torch.stack([sample_components[name] for sample_components in per_sample_components]).mean()
+            for name in component_names
+        }
+        scaled_content_loss = torch.stack(
+            [
+                sample_components["content_loss"] * content_scale[index]
+                for index, sample_components in enumerate(per_sample_components)
+            ]
+        ).mean()
     if x0_weight is not None:
         w = x0_weight.detach().mean()
     else:
         w = 1.0
-    total_loss = noise_loss + w * (0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * components["content_loss"])
+    total_loss = noise_loss + w * (0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * scaled_content_loss)
     return {
         "loss": total_loss,
         "noise_loss": noise_loss,
         "recon_loss": recon_loss,
         "gradient_loss": gradient_loss,
+        "content_loss_scale": content_scale.mean(),
         **components,
     }
 
@@ -531,6 +640,7 @@ def train_pack(
             target_rgb = batch["target_rgb"].to(device)  # [B, 3, 32, 32]
             style_refs = batch["style_refs"].to(device)  # [B, N, 3, 32, 32]
             style_ref_mask = batch["style_ref_mask"].to(device)  # [B, N]
+            filenames = list(batch["filename"])
 
             # Sample timesteps
             t = torch.randint(1, NUM_TIMESTEPS + 1, (target_rgb.shape[0],), device=device)
@@ -551,6 +661,7 @@ def train_pack(
                     pred_noise, true_noise, pred_x0, content_rgb, target_rgb,
                     content_loss_weight=CONTENT_LOSS_WEIGHT,
                     x0_weight=x0_weight,
+                    filenames=filenames,
                 )
                 loss = loss_components["loss"] / grad_accum_steps
 
@@ -752,7 +863,8 @@ def _run_validation(
         luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
         channel_gradient_loss = _rgb_channel_gradient_loss(pred_rgb, target_rgb)
         gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-        loss = recon_loss + 0.30 * gradient_loss + 0.30 * content_components["content_loss"]
+        content_scale = _content_loss_scale(content_rgb, target_rgb, filenames=[filename]).mean()
+        loss = recon_loss + 0.30 * gradient_loss + CONTENT_LOSS_WEIGHT * content_scale * content_components["content_loss"]
         sample_scalars = {
             "loss": float(loss.item()),
             "recon_loss": float(recon_loss.item()),
@@ -764,6 +876,7 @@ def _run_validation(
             "content_contrast_loss": float(content_components["content_contrast_loss"].item()),
             "content_hue_loss": float(content_components["content_hue_loss"].item()),
             "content_color_moment_loss": float(content_components["content_color_moment_loss"].item()),
+            "content_loss_scale": float(content_scale.item()),
         }
         for name in VAL_SCALAR_NAMES:
             scalar_totals[name] += sample_scalars[name]
