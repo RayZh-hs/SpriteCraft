@@ -94,10 +94,10 @@
 \begin{document}
 \begin{tcbposter}[
   coverage={spread},
-  poster={columns=3, rows=20, spacing=0mm},
+  poster={columns=3, rows=24, spacing=0mm},
 ]
 
-\posterbox[darkbox]{name=header, column=1, span=3, between=top and row3}{
+\posterbox[darkbox]{name=header, column=1, span=3, between=top and row2}{
   \begin{minipage}[c]{0.76\linewidth}
     {\fontsize{56}{62}\selectfont\bfseries SpriteCraft: Style Transfer for\\[-2pt] Minecraft Resource Packs}\\[8pt]
     {\fontsize{24}{29}\selectfont A dual-model system that decides when to imagine texture and when to preserve structure}\\[5pt]
@@ -120,7 +120,7 @@
   top=6pt,
   bottom=4pt,
   valign=center,
-]{name=stats, column=1, span=3, between=row3 and row5}{
+]{name=stats, column=1, span=3, between=row2 and row3}{
   \metric{32$\times$32}{canonical RGB block face}
   \hfill
   \metric{7.7M + 1.0M}{diffusion and recolor parameters}
@@ -130,7 +130,7 @@
   \metric{run39}{latest full multi-pack run}
 }
 
-\posterbox[greenbox]{name=problem, column=1, between=row5 and row8}{
+\posterbox[greenbox]{name=problem, column=1, between=row3 and row6}{
   {\sectionfont Why This Is Hard}\\[3pt]
   \bodyfont
   Minecraft resource packs are tiny repeated surfaces. A wrong edge, hue, or symbol is not hidden by scale; it tiles across the world.
@@ -142,14 +142,14 @@
   \end{itemize}
 }
 
-\posterbox[lilacbox]{name=pipeline, column=1, between=row8 and row13}{
+\posterbox[lilacbox]{name=pipeline, column=1, between=row6 and row11}{
   {\sectionfont Data Story}\\[2pt]
   \posterfig{0.96}{figures/spritecraft-pipeline-overview.png}{Vanilla and target packs are filtered to full-cube textures, normalized to 32$\times$32, paired by filename, and trained per target pack.}
   \smallbody
   The report evaluates minimalist, vanilla-adjacent, cartoon, stylized, and high-resolution packs with a fixed 20-texture validation set.
 }
 
-\posterbox[amberbox]{name=training, column=1, between=row13 and row17}{
+\posterbox[amberbox]{name=training, column=1, between=row11 and row15}{
   {\sectionfont Training Signal}\\[3pt]
   \bodyfont
   \[
@@ -165,26 +165,28 @@
   \end{itemize}
 }
 
-\posterbox[greenbox]{name=fit, column=1, between=row17 and bottom}{
-  {\sectionfont Current Fit}\\[3pt]
+\posterbox[greenbox]{name=fit, column=1, between=row15 and bottom}{
+  {\sectionfont Baseline Lesson}\\[2pt]
+  \posterfig{0.95}{figures/diffusion-baseline-stone.png}{The diffusion-only sweep showed broad style transfer, but stylized and high-detail packs still drifted toward vanilla structure.}
   \bodyfont
-  Best suited for vanilla-adjacent, minimalist, wood-family, and medium-complexity stylized materials.
+  run39 keeps diffusion for expressive texture and adds fallback routes when structure matters more.
   \vspace{3pt}
   \begin{itemize}
+    \item Best current fit: vanilla-adjacent, minimalist, wood-family, and medium-complexity stylized materials.
     \item Glass is limited because alpha is not modeled.
     \item Fine glyphs and repeated narrow bands need conservative routing.
     \item 64$\times$ art compressed to 32$\times$32 loses microtexture.
   \end{itemize}
 }
 
-\posterbox[bluebox]{name=model, column=2, between=row5 and row11}{
+\posterbox[bluebox]{name=model, column=2, between=row3 and row10}{
   {\sectionfont Two Models, Two Instincts}\\[2pt]
   \posterfig{0.93}{figures/spritecraft-dual-model-architecture.png}{StyleAwareUNet samples expressive candidates; RecolorNet predicts a residual that keeps vanilla structure legible.}
   \smallbody
   The useful split is behavioral: diffusion can invent style-specific texture, while recolor is the safety branch for symbols, line art, and hard structure.
 }
 
-\posterbox[lilacbox]{name=routing, column=2, between=row11 and row16}{
+\posterbox[lilacbox]{name=routing, column=2, between=row10 and row17}{
   {\sectionfont Selection Is the Model's Guardrail}\\[2pt]
   \posterfig{0.91}{figures/spritecraft-ensemble-routing-flow.png}{Candidate selection scores actual outputs rather than trusting a fixed branch.}
   \bodyfont
@@ -195,7 +197,7 @@
   \end{itemize}
 }
 
-\posterbox[amberbox]{name=rules, column=2, between=row16 and bottom}{
+\posterbox[amberbox]{name=rules, column=2, between=row17 and bottom}{
   {\sectionfont What Changed in run39}\\[3pt]
   \bodyfont
   \begin{itemize}
@@ -206,7 +208,7 @@
   \end{itemize}
 }
 
-\posterbox[amberbox]{name=results, column=3, between=row5 and row8}{
+\posterbox[amberbox]{name=results, column=3, between=row3 and row6}{
   {\sectionfont run39 Results}\\[3pt]
   \smallbody
   \begin{center}
@@ -222,21 +224,21 @@
   {\captionfont Cells report MAE / pixel accuracy from final validation previews. The selector optimizes plausible tile structure, not target-aware oracle MAE alone.}
 }
 
-\posterbox[greenbox]{name=oak, column=3, between=row8 and row13}{
+\posterbox[greenbox]{name=oak, column=3, between=row6 and row13}{
   {\sectionfont One Block, Four Styles}\\[2pt]
   \posterfig{0.82}{figures/multi-pack-oak-planks.png}{Latest run39 selected \texttt{oak\_planks.png} outputs show the same vanilla content pushed toward four pack palettes and plank conventions.}
   \smallbody
   Wood illustrates the central tradeoff: style must change, but long plank boundaries must stay readable.
 }
 
-\posterbox[bluebox]{name=stress, column=3, between=row13 and row18}{
+\posterbox[bluebox]{name=stress, column=3, between=row13 and row21}{
   {\sectionfont Stress Test: Fine Structure}\\[2pt]
   \posterfig{0.93}{figures/ashen-routing-examples.png}{Ashen examples compare content, diffusion, recolor, selected output, and target at run39 step 10k.}
   \smallbody
   Diffusion transfers style on ordinary materials, but bookshelf and TNT expose the cost of structural drift. The selector often prefers recolor when symbols or narrow bands matter more than texture invention.
 }
 
-\posterbox[darkbox]{name=takeaways, column=3, between=row18 and bottom}{
+\posterbox[darkbox]{name=takeaways, column=3, between=row21 and bottom}{
   {\sectionfont Takeaways}\\[4pt]
   \bodyfont
   \begin{itemize}
