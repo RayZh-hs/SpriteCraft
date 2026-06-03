@@ -94,7 +94,7 @@
 \begin{document}
 \begin{tcbposter}[
   coverage={spread},
-  poster={columns=3, rows=24, spacing=0mm},
+  poster={columns=3, rows=30, spacing=0mm},
 ]
 
 \posterbox[darkbox]{name=header, column=1, span=3, between=top and row2}{
@@ -142,14 +142,14 @@
   \end{itemize}
 }
 
-\posterbox[lilacbox]{name=pipeline, column=1, between=row6 and row11}{
+\posterbox[lilacbox]{name=pipeline, column=1, between=row6 and row13}{
   {\sectionfont Data Story}\\[2pt]
   \posterfig{0.96}{figures/spritecraft-pipeline-overview.png}{Vanilla and target packs are filtered to full-cube textures, normalized to 32$\times$32, paired by filename, and trained per target pack.}
   \smallbody
   The report evaluates minimalist, vanilla-adjacent, cartoon, stylized, and high-resolution packs with a fixed 20-texture validation set.
 }
 
-\posterbox[amberbox]{name=training, column=1, between=row11 and row15}{
+\posterbox[amberbox]{name=training, column=1, between=row13 and row17}{
   {\sectionfont Training Signal}\\[3pt]
   \bodyfont
   \[
@@ -165,28 +165,33 @@
   \end{itemize}
 }
 
-\posterbox[greenbox]{name=fit, column=1, between=row15 and bottom}{
+\posterbox[greenbox]{name=baseline, column=1, between=row17 and row23}{
   {\sectionfont Baseline Lesson}\\[2pt]
   \posterfig{0.95}{figures/diffusion-baseline-stone.png}{The diffusion-only sweep showed broad style transfer, but stylized and high-detail packs still drifted toward vanilla structure.}
   \bodyfont
   run39 keeps diffusion for expressive texture and adds fallback routes when structure matters more.
+}
+
+\posterbox[lilacbox]{name=fit, column=1, between=row23 and bottom}{
+  {\sectionfont Current Fit}\\[3pt]
+  \bodyfont
   \vspace{3pt}
   \begin{itemize}
-    \item Best current fit: vanilla-adjacent, minimalist, wood-family, and medium-complexity stylized materials.
+    \item Strongest on vanilla-adjacent, minimalist, wood-family, and medium-complexity stylized materials.
     \item Glass is limited because alpha is not modeled.
     \item Fine glyphs and repeated narrow bands need conservative routing.
     \item 64$\times$ art compressed to 32$\times$32 loses microtexture.
   \end{itemize}
 }
 
-\posterbox[bluebox]{name=model, column=2, between=row3 and row10}{
+\posterbox[bluebox]{name=model, column=2, between=row3 and row11}{
   {\sectionfont Two Models, Two Instincts}\\[2pt]
   \posterfig{0.93}{figures/spritecraft-dual-model-architecture.png}{StyleAwareUNet samples expressive candidates; RecolorNet predicts a residual that keeps vanilla structure legible.}
   \smallbody
   The useful split is behavioral: diffusion can invent style-specific texture, while recolor is the safety branch for symbols, line art, and hard structure.
 }
 
-\posterbox[lilacbox]{name=routing, column=2, between=row10 and row17}{
+\posterbox[lilacbox]{name=routing, column=2, between=row11 and row20}{
   {\sectionfont Selection Is the Model's Guardrail}\\[2pt]
   \posterfig{0.91}{figures/spritecraft-ensemble-routing-flow.png}{Candidate selection scores actual outputs rather than trusting a fixed branch.}
   \bodyfont
@@ -197,7 +202,7 @@
   \end{itemize}
 }
 
-\posterbox[amberbox]{name=rules, column=2, between=row17 and bottom}{
+\posterbox[amberbox]{name=rules, column=2, between=row20 and row25}{
   {\sectionfont What Changed in run39}\\[3pt]
   \bodyfont
   \begin{itemize}
@@ -205,6 +210,17 @@
     \item High-pattern content raises the acceptance bar for diffusion outputs.
     \item Wood-family routing skips detail injection to preserve plank-line continuity.
     \item Bare Bones routes many samples through source-close training; stylized packs mostly keep the full content-aware objective.
+  \end{itemize}
+}
+
+\posterbox[bluebox]{name=policy, column=2, between=row25 and bottom}{
+  {\sectionfont Policy Insight}\\[3pt]
+  \bodyfont
+  The selector is intentionally not a target-aware MAE oracle. It prefers a plausible repeating block face over a numerically closer output that breaks symbols, plank lines, or narrow repeated patterns.
+  \vspace{3pt}
+  \begin{itemize}
+    \item Easy packs can accept more diffusion detail.
+    \item Hard packs need stronger structure gates.
   \end{itemize}
 }
 
@@ -224,27 +240,27 @@
   {\captionfont Cells report MAE / pixel accuracy from final validation previews. The selector optimizes plausible tile structure, not target-aware oracle MAE alone.}
 }
 
-\posterbox[greenbox]{name=oak, column=3, between=row6 and row13}{
+\posterbox[greenbox]{name=oak, column=3, between=row6 and row15}{
   {\sectionfont One Block, Four Styles}\\[2pt]
   \posterfig{0.82}{figures/multi-pack-oak-planks.png}{Latest run39 selected \texttt{oak\_planks.png} outputs show the same vanilla content pushed toward four pack palettes and plank conventions.}
   \smallbody
   Wood illustrates the central tradeoff: style must change, but long plank boundaries must stay readable.
 }
 
-\posterbox[bluebox]{name=stress, column=3, between=row13 and row21}{
+\posterbox[bluebox]{name=stress, column=3, between=row15 and row25}{
   {\sectionfont Stress Test: Fine Structure}\\[2pt]
   \posterfig{0.93}{figures/ashen-routing-examples.png}{Ashen examples compare content, diffusion, recolor, selected output, and target at run39 step 10k.}
   \smallbody
   Diffusion transfers style on ordinary materials, but bookshelf and TNT expose the cost of structural drift. The selector often prefers recolor when symbols or narrow bands matter more than texture invention.
 }
 
-\posterbox[darkbox]{name=takeaways, column=3, between=row21 and bottom}{
+\posterbox[darkbox]{name=takeaways, column=3, between=row25 and bottom}{
   {\sectionfont Takeaways}\\[4pt]
   \bodyfont
   \begin{itemize}
     \item The strongest system is a routed ensemble, not a single generator.
     \item Easy packs need direct reconstruction; stylized packs need source-relative guidance.
-    \item Better alpha handling, learned support ranking, and multi-resolution refinement are the next practical gains.
+    \item Alpha handling, learned support ranking, and multi-resolution refinement are the next practical gains.
   \end{itemize}
 }
 
