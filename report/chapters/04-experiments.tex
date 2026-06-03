@@ -3,7 +3,14 @@
 
 \section{Datasets}
 
-Experiments were conducted using the vanilla Minecraft 1.21 jar as the base (content) pack, but the evaluation corpus spans multiple target packs rather than a single Ashen-only case study. Two checkpoint families are relevant in this report. \texttt{run20} is the diffusion-only sweep, which emitted validation previews for seven target packs. \texttt{run33} is the later dual-model configuration, which completed 10,000-step diffusion validation for four packs and 2,000-step recolor-only validation for Clarity. The target packs cover minimalist, vanilla-adjacent, cartoon, fantasy, and higher-resolution stylized packs, so the report can describe both general trends and pack-specific failure modes.
+Experiments were conducted using the vanilla Minecraft 1.21 jar as the base
+(content) pack. The evaluation corpus spans multiple target packs rather than
+a single Ashen-only case study. This report compares a historical
+diffusion-only sweep with the current dual-model ensemble, which combines
+StyleAwareUNet, RecolorNet, deterministic recoloring, support-aware candidate
+selection, and source-close loss routing. The target packs cover minimalist,
+vanilla-adjacent, cartoon, fantasy, and higher-resolution stylized packs, so
+the report can describe both general trends and pack-specific failure modes.
 
 \begin{table}[htbp]
     \centering
@@ -26,31 +33,42 @@ Experiments were conducted using the vanilla Minecraft 1.21 jar as the base (con
     \label{tab:dataset-summary}
     \begin{tabular}{@{}llrrll@{}}
         \toprule
-        Pack & Style & Train & Val & \texttt{run20} & \texttt{run33} \\
+        Pack & Style & Train & Val & Baseline sweep & Current ensemble \\
         \midrule
-        Ashen\_16x & stylized & 509 & 19 & diff.\ to 10.0k & diff.\ 10.0k + recolor 2.5k \\
-        Bare Bones & minimalist & 499 & 18 & diff.\ to 10.0k & diff.\ 10.0k + recolor 2.5k \\
-        Cartoon & cartoon & 404 & 19 & diff.\ to 5.5k & diff.\ 10.0k + recolor 2.5k \\
-        Chibli 64x & stylized & 87 & 17 & diff.\ to 0.5k & diff.\ 10.0k + recolor 2.5k \\
-        Clarity & traditional & 493 & 19 & diff.\ to 0.5k & recolor only to 2.0k \\
-        Faithful 32x & vanilla & 519 & 19 & diff.\ to 0.5k & -- \\
-        Lithos & traditional & 497 & 19 & diff.\ to 0.5k & -- \\
+        Ashen\_16x & stylized & 509 & 19 & diffusion to 10.0k & diffusion 10.0k + recolor 2.5k \\
+        Bare Bones & minimalist & 499 & 18 & diffusion to 10.0k & diffusion 10.0k \\
+        Cartoon & cartoon & 404 & 19 & diffusion to 5.5k & diffusion 10.0k + recolor 2.5k \\
+        Chibli 64x & stylized & 87 & 17 & diffusion to 0.5k & diffusion 10.0k + recolor 2.5k \\
+        Clarity & traditional & 493 & 19 & diffusion to 0.5k & recolor only to 2.5k \\
+        Faithful 32x & vanilla & 519 & 19 & diffusion to 0.5k & -- \\
+        Lithos & traditional & 497 & 19 & diffusion to 0.5k & -- \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-The MYTHIC training branch was started in \texttt{run20}, but no validation preview panels were written before the run stopped, so it is excluded from the quantitative comparison. Figure~\ref{fig:run20-multipack} shows the breadth of the diffusion-only sweep at a single shared validation texture: even at step 500, the model is already copying broad stone-material contrast into several packs, but it remains noticeably closer to vanilla on the more stylized and high-detail targets.
+The MYTHIC training branch was started during the broad diffusion-only sweep,
+but no validation preview panels were written before the run stopped, so it is
+excluded from the quantitative comparison. Figure~\ref{fig:baseline-multipack}
+shows the breadth of that sweep at a single shared validation texture: even at
+an early preview step, the model is already copying broad stone-material
+contrast into several packs, but it remains noticeably closer to vanilla on
+the more stylized and high-detail targets.
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=\linewidth]{run20-multi-pack-stone.png}
-    \caption{Cross-pack diffusion-only previews from \texttt{run20} at step 500.}
-    \label{fig:run20-multipack}
+    \includegraphics[width=\linewidth]{diffusion-baseline-stone.png}
+    \caption{Cross-pack diffusion-only previews from the baseline sweep.}
+    \label{fig:baseline-multipack}
 \end{figure}
 
 \section{Training Configuration}
 
-Both models were trained on a single NVIDIA GPU with bfloat16 autocast. The diffusion model (StyleAwareUNet, 7.7M parameters) was trained for 10,000 steps with gradient accumulation of 4 (effective batch size 16), while RecolorNet (1.0M parameters) was trained for 2,500--5,000 steps with batch size 8. Full configuration details are summarized in Table~\ref{tab:training-config}.
+Both models were trained on a single NVIDIA GPU with bfloat16 autocast. The
+diffusion model (StyleAwareUNet, 7.7M parameters) was trained for 10,000 steps
+with gradient accumulation of 4 (effective batch size 16), while RecolorNet
+(1.0M parameters) was trained for 2,500 steps where a recolor branch was
+available. Full configuration details are summarized in
+Table~\ref{tab:training-config}.
 
 \begin{table}[htbp]
     \centering
@@ -83,7 +101,13 @@ Both models were trained on a single NVIDIA GPU with bfloat16 autocast. The diff
 
 \subsection{Overall Loss Curves}
 
-Figure~\ref{fig:loss-curves} shows the smoothed training loss trajectories for all four \texttt{run33} packs. Bare Bones converges fastest and to the lowest final loss, consistent with its minimalist style. Ashen and Cartoon follow similar trajectories with a wider initial spread. Chibli, with its smallest training set (87 pairs), converges more slowly and shows higher variance throughout training.
+Figure~\ref{fig:loss-curves} shows the smoothed training loss trajectories for
+the four packs with fully trained diffusion branches. Bare Bones converges
+fastest and to the lowest final loss, consistent with its minimalist style and
+the fact that more than half of its minibatch samples route through the
+source-close legacy objective. Ashen and Cartoon follow similar trajectories
+with a wider initial spread. Chibli, with its smallest training set (87 pairs),
+converges more slowly and shows higher variance throughout training.
 
 \begin{figure}[htbp]
     \centering
@@ -120,13 +144,18 @@ Figure~\ref{fig:loss-curves} shows the smoothed training loss trajectories for a
         \addlegendentry{Chibli 64x}
         \end{axis}
     \end{tikzpicture}
-    \caption{Smoothed total training loss for all four \texttt{run33} packs (log scale).}
+    \caption{Smoothed total training loss for the four fully trained diffusion packs (log scale).}
     \label{fig:loss-curves}
 \end{figure}
 
 \subsection{Loss Breakdown}
 
-Figure~\ref{fig:loss-breakdown} decomposes the Ashen 16x training loss into its constituent terms. The noise prediction loss dominates early training but declines rapidly. Content-aware losses (structure, contrast, hue, color moment) decay more gradually and account for much of the remaining loss at convergence. The gradient loss persists modestly, reflecting the inherent difficulty of edge placement in stylized packs.
+Figure~\ref{fig:loss-breakdown} decomposes the Ashen 16x training loss into
+its constituent terms. The noise prediction loss dominates early training but
+declines rapidly. Content-aware losses (structure, contrast, hue, color
+moment) decay more gradually and account for much of the remaining loss at
+convergence. The gradient loss persists modestly, reflecting the inherent
+difficulty of edge placement in stylized packs.
 
 \begin{figure}[htbp]
     \centering
@@ -178,7 +207,15 @@ Figure~\ref{fig:loss-breakdown} decomposes the Ashen 16x training loss into its 
 
 \subsection{Checkpointed Diffusion Loss}
 
-Figure~\ref{fig:checkpoint-loss} plots the diffusion model's raw training loss sampled every 500 steps, matching the checkpoint cadence used throughout \texttt{run33}. This avoids a reporting artifact in the routed validation summaries: on hard packs, selected-output validation can flatten once recolor fallback dominates, even when the diffusion branch is still struggling. Bare Bones drops fastest and remains lowest throughout. Chibli stays highest for most of training, while Ashen and Cartoon show a slower but still steady decline with occasional spikes that reflect the harder stylized targets.
+Figure~\ref{fig:checkpoint-loss} plots the diffusion model's raw training loss
+sampled every 500 steps, matching the checkpoint cadence used in the final
+training configuration. This avoids a reporting artifact in the routed
+validation summaries: on hard packs, selected-output validation can flatten
+once recolor fallback dominates, even when the diffusion branch is still
+struggling. Bare Bones drops fastest and remains lowest throughout. Chibli
+stays highest for most of training, while Ashen and Cartoon show a slower but
+still steady decline with occasional spikes that reflect the harder stylized
+targets.
 
 \begin{figure}[htbp]
     \centering
@@ -219,7 +256,10 @@ Figure~\ref{fig:checkpoint-loss} plots the diffusion model's raw training loss s
 
 \subsection{Learning Rate Schedule}
 
-Figure~\ref{fig:lr-schedule} confirms the warmup + cosine annealing schedule. The first 500 steps warm up linearly from $3\times10^{-5}$ to the peak of $3\times10^{-4}$, after which cosine annealing smoothly decays the rate to the floor of $10^{-6}$ at step 10,000.
+Figure~\ref{fig:lr-schedule} confirms the warmup + cosine annealing schedule.
+The first 500 steps warm up linearly from $3\times10^{-5}$ to the peak of
+$3\times10^{-4}$, after which cosine annealing smoothly decays the rate to the
+floor of $10^{-6}$ at step 10,000.
 
 \begin{figure}[htbp]
     \centering
@@ -250,40 +290,102 @@ Figure~\ref{fig:lr-schedule} confirms the warmup + cosine annealing schedule. Th
 
 \subsection{Diffusion Baseline}
 
-The initial wide sweep used a diffusion-only model with a linear noise schedule and base channel count 128. No post-hoc selector or recolor fallback was available. The main value of \texttt{run20} is not a single headline number, but the fact that the same model family was exposed to seven distinct pack styles. Minimalist and vanilla-adjacent targets converged quickly: Bare Bones and Faithful already looked coherent at their latest preview steps, while stylized packs with stronger palette shifts such as Ashen, Cartoon, and Chibli showed more visible drift, especially on noisy materials and fine outlines. This broad run established that \emph{pack difficulty is not uniform}; the training recipe that is comfortable for Bare Bones is not automatically adequate for a 64$\times$ stylized pack compressed to $32\times32$.
+The initial wide sweep used a diffusion-only model with a linear noise schedule
+and base channel count 128. No post-hoc selector or recolor fallback was
+available. The main value of this baseline is not a single headline number,
+but the fact that the same model family was exposed to seven distinct pack
+styles. Minimalist and vanilla-adjacent targets converged quickly: Bare Bones
+and Faithful already looked coherent at their latest preview steps, while
+stylized packs with stronger palette shifts such as Ashen, Cartoon, and
+Chibli showed more visible drift, especially on noisy materials and fine
+outlines. This broad run established that \emph{pack difficulty is not
+uniform}; the training recipe that is comfortable for Bare Bones is not
+automatically adequate for a 64$\times$ stylized pack compressed to
+$32\times32$.
 
 \subsection{Dual-Model Architecture}
 
-The next iteration introduced RecolorNet as a structural fallback together with the content-aware loss suite (structure, contrast, hue, color moment). This reduced hue instability and helped the diffusion branch preserve stronger edge structure, but it also made clear that a fixed routing threshold was too crude across multiple packs. Hard textures such as \texttt{bookshelf.png} and \texttt{tnt\_side.png} benefit from deterministic structure preservation, whereas easy textures in minimalist packs can be handled by diffusion alone. A pack-blind selector therefore risks being either too permissive on difficult packs or too conservative on easy ones.
+The next iteration introduced RecolorNet as a structural fallback together
+with the content-aware loss suite (structure, contrast, hue, color moment).
+This reduced hue instability and helped the diffusion branch preserve stronger
+edge structure, but it also made clear that a fixed routing threshold was too
+crude across multiple packs. Hard textures such as \texttt{bookshelf.png} and
+\texttt{tnt\_side.png} benefit from deterministic structure preservation,
+whereas easy textures in minimalist packs can be handled by diffusion alone.
+A pack-blind selector therefore risks being either too permissive on difficult
+packs or too conservative on easy ones.
 
 \subsection{Post-Hoc Quality Evaluation}
 
-The next iteration replaced the fixed routing logic with the structural-style evaluator described in Section~\ref{sec:inference}. This evaluator scores the actual diffusion output against the content image and its support set, then decides whether to keep diffusion, apply detail injection, or fall back to recolor. In practice, this was the first configuration that made multi-pack comparison intellectually honest: the same selection policy can now be inspected on Bare Bones, Ashen, Cartoon, and Chibli rather than only on a hand-picked pack. Training improvements included EMA (decay 0.995), linear learning-rate warmup over 5\% of steps, and an adaptive content-loss ramp over the early phase of training.
+The next iteration replaced the fixed routing logic with the structural-style
+evaluator described in Section~\ref{sec:inference}. This evaluator scores the
+actual diffusion output against the content image and its support set, then
+decides whether to keep diffusion, apply detail injection, or fall back to
+recolor. Training improvements included EMA (decay 0.995), linear
+learning-rate warmup over 5\% of steps, and an adaptive content-loss ramp over
+the early phase of training.
 
 \subsection{High-Pattern Content Gating}
 
-The post-hoc evaluator was further refined to detect and tightly screen \emph{high-pattern content}---textures with strong line art, symbolic glyphs, or repeated narrow bands such as \texttt{tnt\_side.png} and \texttt{bookshelf.png}. When the content texture exceeds thresholds on edge energy, detail energy, and complexity, the evaluator applies a multiplicative gate (0.55 + 0.45 $\times$ gate\_score) to the quality score and raises the acceptance threshold to 0.68. The gate score combines tighter edge ratio fidelity (window $[0.78, 1.18]$), detail energy ratio fidelity (window $[0.80, 1.16]$), and a positive detail coherence gate. This prevents the selector from accepting diffusion outputs that pass the general quality threshold but are structurally unsuitable for precision-dependent textures. The source-relative change agreement score was also added at this stage, blending the support descriptor comparison with a term that rewards candidates whose change-from-vanilla magnitude matches the support pack's typical change level.
+The post-hoc evaluator was further refined to detect and tightly screen
+\emph{high-pattern content}---textures with strong line art, symbolic glyphs,
+or repeated narrow bands such as \texttt{tnt\_side.png} and
+\texttt{bookshelf.png}. When the content texture exceeds thresholds on edge
+energy, detail energy, and complexity, the evaluator applies a multiplicative
+gate (0.55 + 0.45 $\times$ gate\_score) to the quality score and raises the
+acceptance threshold to 0.68. The gate score combines tighter edge ratio
+fidelity (window $[0.78, 1.18]$), detail energy ratio fidelity (window
+$[0.80, 1.16]$), and a positive detail coherence gate. This prevents the
+selector from accepting diffusion outputs that pass the general quality
+threshold but are structurally unsuitable for precision-dependent textures.
+The source-relative change agreement score was also added at this stage,
+blending the support descriptor comparison with a term that rewards candidates
+whose change-from-vanilla magnitude matches the support pack's typical change
+level.
 
-\subsection{SNR-Weighted Losses and Final Configuration}
+\subsection{Source-Close Loss Routing and Final Configuration}
 
-The final configuration used in \texttt{run33} introduced SNR-weighted $x_0$ auxiliary losses, meaning reconstruction and content losses are scaled by $\bar{\alpha}_t$, the signal-to-noise ratio at the current diffusion timestep. This prevents the model from over-committing to unreliable $x_0$ estimates at high noise levels. The content loss weight was reduced from 0.40 to 0.20 and the content-loss components were rebalanced to weights 1.0 / 2.5 / 3.0 / 1.5 for structure / contrast / hue / color-moment.
+The final configuration introduced SNR-weighted $x_0$ auxiliary losses, meaning
+reconstruction and content losses are scaled by $\bar{\alpha}_t$, the
+signal-to-noise ratio at the current diffusion timestep. This prevents the
+model from over-committing to unreliable $x_0$ estimates at high noise levels.
+The content loss weight was reduced to 0.20 and the content-loss components
+were rebalanced to weights 1.0 / 2.5 / 3.0 / 1.5 for structure / contrast /
+hue / color-moment.
+
+The most important later correction was to route source-close targets back to a
+legacy direct objective. A training sample is considered source-close when the
+target/content RGB MAE is at most 0.045. Those samples use noise prediction
+plus reconstruction and luminance-gradient terms only, dropping the content,
+color, and per-channel gradient auxiliaries. This isolates packs and textures
+that are already close to vanilla. In the current training logs, Bare Bones
+routes approximately 53\% of minibatch samples through this path, while Ashen,
+Cartoon, and Chibli route only about 2--5\%. The heuristic therefore captures
+the easy-pack case without hard-coding a specific pack name.
 
 Additional refinements included:
 \begin{itemize}
-    \item Symmetric detail energy fidelity in the post-hoc evaluator (penalizing both blur and noise, rather than only blur).
-    \item Combined candidate selection using the sum of structural and style quality scores.
-    \item A softer contrast gate with $\gamma=1.5$ (reduced from 2.0) and gate floor 0.05.
-    \item Increased detail emphasis scale to 2.0.
+    \item Symmetric detail energy fidelity in the post-hoc evaluator.
+    \item Combined candidate selection using structural and style quality scores.
+    \item Wood-family routing that ranks diffusion candidates primarily by support-style agreement.
+    \item Disabled detail injection for wood textures, where the injection path had introduced plank-line artifacts.
+    \item Conservative RecolorNet fallback for wood, used only when diffusion is structurally broken or clearly worse.
 \end{itemize}
 
 \section{Quantitative Results}
 
-The checkpoint folders do not store one uniform metric export for every validated pack, but they do store preview panels with the prediction and target tiles side by side. For the pack-level comparison below, MAE and pixel accuracy were recomputed directly from those panels by cropping the prediction and ground-truth target tiles. Pixel accuracy is reported as the proportion of RGB channel values within 5\% of target intensity. This is sufficient for comparing packs and runs even when one branch did not export standalone JSON metrics.
+The checkpoint folders do not store one uniform metric export for every
+validated pack, but they do store preview panels with the prediction and target
+tiles side by side. For the pack-level comparison below, MAE and pixel accuracy
+were recomputed directly from those panels by cropping the prediction and
+ground-truth target tiles. For selected-output panels, the colored selection
+border was removed before computing metrics. Pixel accuracy is reported as the
+proportion of RGB channel values within 5\% of target intensity.
 
 \begin{table}[htbp]
     \centering
-    \caption{\texttt{run20} diffusion-only pack sweep, measured from the latest saved validation preview for each pack.}
-    \label{tab:run20-results}
+    \caption{Diffusion-only baseline sweep, measured from the latest saved validation preview for each pack.}
+    \label{tab:baseline-results}
     \begin{tabular}{@{}lccc@{}}
         \toprule
         Pack & Latest preview & MAE & Pixel accuracy \\
@@ -301,80 +403,162 @@ The checkpoint folders do not store one uniform metric export for every validate
 
 \begin{table}[htbp]
     \centering
-    \caption{\texttt{run33} pack-level comparison at diffusion step 10,000. Cells report MAE / pixel accuracy.}
-    \label{tab:run33-results}
+    \caption{Current ensemble comparison at the final diffusion checkpoint. Cells report MAE / pixel accuracy.}
+    \label{tab:current-results}
     \begin{tabular}{@{}lccc@{}}
         \toprule
         Pack & Diffusion & Recolor & Selected \\
         \midrule
-        Ashen\_16x & 0.107 / 0.315 & 0.110 / 0.383 & 0.110 / 0.389 \\
-        Bare Bones & 0.059 / 0.560 & 0.068 / 0.559 & 0.062 / 0.526 \\
-        Cartoon & 0.136 / 0.309 & 0.160 / 0.264 & 0.151 / 0.225 \\
-        Chibli 64x & 0.126 / 0.302 & 0.188 / 0.189 & 0.188 / 0.189 \\
+        Ashen\_16x & 0.110 / 0.321 & 0.108 / 0.385 & 0.108 / 0.389 \\
+        Bare Bones & 0.055 / 0.601 & -- & 0.057 / 0.561 \\
+        Cartoon & 0.161 / 0.234 & 0.173 / 0.234 & 0.141 / 0.273 \\
+        Chibli 64x & 0.125 / 0.338 & 0.170 / 0.218 & 0.164 / 0.242 \\
         \bottomrule
     \end{tabular}
 \end{table}
 
-Several conclusions follow immediately from Tables~\ref{tab:run20-results} and~\ref{tab:run33-results}. Bare Bones is by far the easiest target family: it already performs best in the diffusion-only run, and it remains the cleanest pack in \texttt{run33}. Ashen benefits meaningfully from the later configuration, improving from 0.138 / 0.222 in \texttt{run20} to 0.110 / 0.389 in the selected \texttt{run33} output. Cartoon improves only modestly, and Chibli remains the hardest pack because it combines the smallest dataset (87 train pairs) with the most aggressive $64\times \rightarrow 32\times32$ downscaling. Clarity's recolor-only branch reached 0.127 MAE and 0.335 pixel accuracy at step 2,000, which is promising but not directly comparable to the four fully trained \texttt{run33} diffusion runs.
+Several conclusions follow immediately from Tables~\ref{tab:baseline-results}
+and~\ref{tab:current-results}. Bare Bones is by far the easiest target family:
+it already performs best in the diffusion-only baseline, and the current
+source-close route preserves that strength without requiring pack-specific
+loss constants. Ashen benefits meaningfully from the later configuration,
+improving from 0.138 / 0.222 in the baseline to 0.108 / 0.389 in the selected
+current output. Cartoon improves through ensemble selection even though its raw
+diffusion branch is not numerically better than the baseline. Chibli remains
+the hardest pack because it combines the smallest dataset (87 train pairs)
+with the most aggressive $64\times \rightarrow 32\times32$ downscaling.
+Clarity's recolor-only branch reaches 0.125 MAE and 0.330 pixel accuracy at
+the latest saved recolor preview, which is promising but not directly
+comparable to the four fully trained diffusion runs.
 
-The selector is also more conservative than a pure target-aware MAE oracle. On Ashen, 17 of the 19 saved selected outputs exactly match the recolor candidate after removing the one-pixel selection border, and the remaining two are blended candidates. On Cartoon and Chibli the same pattern holds, with most selected outputs being either the raw recolor prediction or a recolor-guided blend. Bare Bones is the outlier: 16 of 18 selected outputs are blended candidates, which matches the intuition that a simple pack can accept more diffusion detail without losing structure.
+The selector is also more conservative than a pure target-aware MAE oracle. At
+the final checkpoint, Ashen uses recolor for 15 of 19 selected previews and
+blend candidates for the remaining 4. Cartoon uses blends for 15 of 19
+textures, which explains why its selected score improves over both individual
+branches. Chibli still falls back mostly to recolor, while Bare Bones has no
+saved learned-recolor panels at the final checkpoint and all selected previews
+are diffusion-derived blends.
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.82\linewidth]{run33-multi-pack-oak-planks.png}
-    \caption{Selected \texttt{run33} outputs for \texttt{oak\_planks.png} across four target packs.}
-    \label{fig:run33-oak-planks}
+    \includegraphics[width=0.82\linewidth]{multi-pack-oak-planks.png}
+    \caption{Selected outputs for \texttt{oak\_planks.png} across four target packs.}
+    \label{fig:oak-planks}
 \end{figure}
 
 \section{Qualitative Analysis}
 
 \subsection{What This Model is Suited For}
 
-\textbf{Vanilla-adjacent and minimalist packs.} Bare Bones, Faithful, and parts of Lithos are structurally close enough to vanilla that the system can focus on palette and contrast remapping rather than inventing new geometry. This is why Bare Bones dominates both \texttt{run20} and \texttt{run33}, and why Faithful already looks solid after only a 500-step diffusion snapshot in \texttt{run20}.
+\textbf{Vanilla-adjacent and minimalist packs.} Bare Bones, Faithful, and parts
+of Lithos are structurally close enough to vanilla that the system can focus
+on palette and contrast remapping rather than inventing new geometry. This is
+why Bare Bones dominates the diffusion-only baseline and remains clean under
+the current source-close routing.
 
-\textbf{Medium-complexity stylized materials.} Ashen and Cartoon benefit from the added content-aware losses because they require both strong palette movement and controlled edge placement. Wood, stone, and ore textures usually preserve the correct large-scale structure while moving into the correct pack-specific value range.
+\textbf{Medium-complexity stylized materials.} Ashen and Cartoon benefit from
+the content-aware loss suite because they require both strong palette movement
+and controlled edge placement. Wood, stone, and ore textures usually preserve
+the correct large-scale structure while moving into the correct pack-specific
+value range.
 
-\textbf{Deterministic or blend-assisted routing.} The later selector is effective when diffusion color is useful but raw diffusion structure is risky. The saved \texttt{run33} outputs for Bare Bones show that this often manifests as blended candidates rather than a hard switch to pure recolor, which is the desired regime for easy packs.
+\textbf{Wood-family textures.} Wood and plank textures are a special case:
+their quality depends on long, regular grain and plank-line continuity. The
+current selector treats them as source-close style-transfer cases, skips detail
+injection, and allows the best diffusion candidate to win unless it is clearly
+broken. This restores the sharper diffusion-like plank structure while keeping
+the recolor fallback available for genuinely failed samples.
 
 \subsection{What This Model Struggles With}
 
-\textbf{High-resolution packs compressed to $32\times32$.} Chibli is the clearest example. The pack has only 87 training pairs after preprocessing and starts from 64$\times$ artwork. Even when the diffusion candidate has respectable overall style, the downscaled microtexture and line work remain difficult to preserve.
+\textbf{High-resolution packs compressed to $32\times32$.} Chibli is the
+clearest example. The pack has only 87 training pairs after preprocessing and
+starts from 64$\times$ artwork. Even when the diffusion candidate has
+respectable overall style, the downscaled microtexture and line work remain
+difficult to preserve.
 
-\textbf{Transparent or pseudo-transparent materials.} Glass remains a fundamental problem because alpha is discarded before modeling. The network must hallucinate a fully opaque RGB realization of a texture whose appearance in the target pack is often driven more by transparency treatment than by raw color.
+\textbf{Transparent or pseudo-transparent materials.} Glass remains a
+fundamental problem because alpha is discarded before modeling. The network
+must hallucinate a fully opaque RGB realization of a texture whose appearance
+in the target pack is often driven more by transparency treatment than by raw
+color.
 
-\textbf{Fine symbolic detail.} \texttt{tnt\_side.png} and \texttt{bookshelf.png} remain good stress tests because they require preserving legible letters or narrow repeated book spines. In those cases, the selector usually prefers recolor or blend candidates over raw diffusion.
+\textbf{Fine symbolic detail.} \texttt{tnt\_side.png} and
+\texttt{bookshelf.png} remain good stress tests because they require preserving
+legible letters or narrow repeated book spines. In those cases, the selector
+usually prefers recolor or blend candidates over raw diffusion.
 
 \begin{figure}[htbp]
     \centering
-    \includegraphics[width=0.82\linewidth]{run33-ashen-routing.png}
-    \caption{Ashen\_16x routing examples from \texttt{run33}.}
-    \label{fig:run33-routing}
+    \includegraphics[width=0.82\linewidth]{ashen-routing-examples.png}
+    \caption{Ashen\_16x routing examples from the current ensemble.}
+    \label{fig:routing}
 \end{figure}
 
 \section{Ablation Studies}
 
 \subsection{Selection Policy Versus Oracle Error}
 
-The cross-pack comparison reveals a useful tension: the selector is not optimizing target-aware MAE directly. Bare Bones and Chibli both show lower average MAE for the raw diffusion branch than for the selected output, but the selected outputs are structurally safer and more regular. This is not necessarily a bug; it reflects the design goal of preferring plausible, tileable textures over target-aware oracle error. It does mean, however, that future work should calibrate the selector separately for easy packs and hard packs rather than using one conservative policy everywhere.
+The cross-pack comparison reveals a useful tension: the selector is not
+optimizing target-aware MAE directly. Bare Bones and Chibli both show lower
+average MAE for the raw diffusion branch than for the selected output, but the
+selected outputs are structurally safer and more regular. This is not
+necessarily a bug; it reflects the design goal of preferring plausible,
+tileable textures over target-aware oracle error. It does mean, however, that
+future work should calibrate the selector separately for easy packs and hard
+packs rather than using one conservative policy everywhere.
 
 \subsection{Detail Injection Usage}
 
-The saved selected panels show that detail injection is not a rare corner case. In \texttt{run33}, 16 of 18 Bare Bones selections and 6 of 19 Cartoon selections differ from both the raw diffusion and raw recolor panels, indicating blended candidates. On Ashen and Chibli, by contrast, the selector usually settles on the pure recolor output. This suggests the blend path is most valuable when the pack remains close enough to vanilla for diffusion detail to be trusted locally.
+The saved selected panels show that detail injection and blend selection are
+not rare corner cases. In the current checkpoint, all 18 Bare Bones selections
+and 15 of 19 Cartoon selections differ from the raw diffusion preview,
+indicating diffusion-derived blend candidates. On Ashen and Chibli, by
+contrast, the selector often settles on the pure recolor output. This suggests
+the blend path is most valuable when the pack remains close enough to vanilla
+for diffusion detail to be trusted locally.
 
-The non-destructive detail injection (Section~\ref{sec:inference}) was critical for this result. Earlier variants that rebuilt the output from a blurred diffusion base caused global softening on already-good diffusion samples. The current approach adds only missing high-frequency residuals where local layout agreement and detail alignment gates permit, preserving diffusion detail that is already plausible.
+The non-destructive detail injection (Section~\ref{sec:inference}) was
+critical for this result on non-wood textures. Earlier variants that rebuilt
+the output from a blurred diffusion base caused global softening on already
+good diffusion samples. The current approach adds only missing high-frequency
+residuals where local layout agreement and detail alignment gates permit,
+preserving diffusion detail that is already plausible.
 
 \subsection{Pack-Dependent Loss Interaction}
 
-The multi-pack comparison supports the concern raised during development that extra structural penalties can backfire on very easy packs. Bare Bones is already strong in \texttt{run20}; the later configuration improves robustness but does not produce a dramatic numeric gain. Ashen is the opposite case: it benefits clearly from the added structure and hue guidance. This is strong evidence that future training should scale or schedule content losses based on pack complexity rather than applying one fixed recipe to all packs.
+The multi-pack comparison supports the concern raised during development that
+extra structural penalties can backfire on very easy packs. Bare Bones is
+already strong in the diffusion-only baseline; a flat content-loss recipe
+therefore makes it optimize auxiliary targets that are less useful than direct
+reconstruction. The source-close target/content MAE heuristic addresses this
+without hard-coding Bare Bones: packs and textures close to vanilla use the
+direct objective, while stylized packs still receive the full content-aware
+loss. Ashen is the opposite case, and benefits clearly from the added structure
+and hue guidance.
 
 \section{Limitations of Current Approach}
 
-\textbf{No alpha-channel modeling.} Despite preprocessing and storing alpha channels in the dataset, the model operates on RGB only. Transparent textures (glass, ice, nether portal) are inherently ill-posed in RGB space.
+\textbf{No alpha-channel modeling.} Despite preprocessing and storing alpha
+channels in the dataset, the model operates on RGB only. Transparent textures
+(glass, ice, nether portal) are inherently ill-posed in RGB space.
 
-\textbf{Heuristic support ranking.} The descriptor-based ranking with filename priors is effective but brittle. Packs using nonstandard naming conventions or novel material families may receive suboptimal support assignments. A learned ranking model could improve generalization.
+\textbf{Heuristic support ranking.} The descriptor-based ranking with filename
+priors is effective but brittle. Packs using nonstandard naming conventions or
+novel material families may receive suboptimal support assignments. A learned
+ranking model could improve generalization.
 
-\textbf{Pack-specific training.} Each target pack requires a separate training run. While this enables pack-specific specialization (which is the project's stated goal), it precludes zero-shot generalization to unseen packs.
+\textbf{Pack-specific training.} Each target pack requires a separate training
+run. While this enables pack-specific specialization (which is the project's
+stated goal), it precludes zero-shot generalization to unseen packs.
 
-\textbf{Resolution ceiling.} The fixed $32\times32$ resolution limits detail fidelity for packs with complex microtexture (leaves, bookshelves). A multi-resolution training scheme could address this but would increase computational cost proportionally.
+\textbf{Resolution ceiling.} The fixed $32\times32$ resolution limits detail
+fidelity for packs with complex microtexture (leaves, bookshelves). A
+multi-resolution training scheme could address this but would increase
+computational cost proportionally.
 
-\textbf{Evaluation artifacts are preview-first.} Several runs store validation as composite preview panels rather than as standalone metric JSON files for every pack and every candidate. That is adequate for human inspection and for the post-hoc analysis performed here, but a future report-oriented pipeline should export raw per-pack metrics directly to avoid reconstruction work.
+\textbf{Evaluation artifacts are preview-first.} Several runs store validation
+as composite preview panels rather than as standalone metric JSON files for
+every pack and every candidate. That is adequate for human inspection and for
+the post-hoc analysis performed here, but a future report-oriented pipeline
+should export raw per-pack metrics directly to avoid reconstruction work.

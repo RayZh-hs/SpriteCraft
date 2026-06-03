@@ -30,6 +30,6 @@ Several directions appear promising for extending this work:
 
 \textbf{Multi-resolution training.} Training at multiple resolutions ($32\times32$ and $64\times64$) or with a super-resolution refinement stage could address the detail fidelity ceiling for complex textures like leaves and bookshelves.
 
-\textbf{Automatic routing in the ensembler.} The current tiered selection logic uses fixed thresholds (0.60, 0.80 structural quality) with a clear margin of 0.10. These thresholds could be learned per-pack or per-texture-family from validation data, or replaced with a lightweight classifier trained on human preference judgments.
+\textbf{Automatic routing in the ensemble.} The current tiered selection logic uses fixed thresholds (0.60, 0.80 structural quality) with a clear margin of 0.10. These thresholds could be learned per-pack or per-texture-family from validation data, or replaced with a lightweight classifier trained on human preference judgments.
 
 \textbf{Tileability enforcement.} Adding a wrap-around consistency loss that penalizes discontinuities at texture boundaries would improve the visual quality of generated textures as repeating tiles in a block-based world.

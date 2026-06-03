@@ -44,22 +44,25 @@ This extracts archives, filters full-cube block textures by resolving blockstate
 
 \section{Training}
 
-Train the RecolorNet first (recommended, 2,500 steps per pack):
+Train the full ensemble sequence for all packs:
 
 \begin{lstlisting}[language=bash]
-spritecraft train --checkpoint-dir checkpoints/run33 --steps 2500 --mode recolor_only
+spritecraft train --checkpoint-dir checkpoints/final --steps 10000 --mode recolor_first
 \end{lstlisting}
 
-Then train the diffusion model (10,000 steps per pack):
+To train a single stage explicitly, use:
 
 \begin{lstlisting}[language=bash]
-spritecraft train --checkpoint-dir checkpoints/run33 --steps 10000 --recolor-checkpoint-dir checkpoints/run33
+spritecraft train --checkpoint-dir checkpoints/final --steps 2500 --mode recolor_only
+spritecraft train --checkpoint-dir checkpoints/final --steps 10000 --mode std_only
 \end{lstlisting}
 
-The \texttt{recolor\_first} mode trains RecolorNet then StyleAwareUNet sequentially for all packs. Monitor training with TensorBoard:
+The \texttt{recolor\_first} mode trains RecolorNet then StyleAwareUNet
+sequentially for all packs and passes the recolor checkpoint directory to
+diffusion validation automatically. Monitor training with TensorBoard:
 
 \begin{lstlisting}[language=bash]
-tensorboard --logdir checkpoints/run33/tensorboard
+tensorboard --logdir checkpoints/final/tensorboard
 \end{lstlisting}
 
 \section{Generation}
@@ -67,13 +70,13 @@ tensorboard --logdir checkpoints/run33/tensorboard
 Generate textures for a target pack:
 
 \begin{lstlisting}[language=bash]
-spritecraft generate --pack Ashen_16x --textures stone dirt oak_planks --run run33
+spritecraft generate --pack Ashen_16x --checkpoint checkpoints/final --textures stone dirt oak_planks
 \end{lstlisting}
 
 Or sample randomly:
 
 \begin{lstlisting}[language=bash]
-spritecraft generate --pack Ashen_16x --random 8 --run run33
+spritecraft generate --pack Ashen_16x --checkpoint checkpoints/final --random 8
 \end{lstlisting}
 
 Outputs are written to \texttt{output/<pack\_id>/<bundle>/} containing the generated texture (\texttt{produced\_tex.png}), vanilla original (\texttt{original\_tex.png}), style references (\texttt{support.png}), comparison image (\texttt{comparison.png}), metrics (\texttt{metrics.json}), and metadata (\texttt{metadata.json}). If the target pack contains the queried texture, a source-of-truth image and MAE/pixel-accuracy metrics are included.
