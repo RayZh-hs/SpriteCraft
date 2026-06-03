@@ -357,6 +357,12 @@ def _source_close_support_mask(
     return support_mae <= SOURCE_CLOSE_SUPPORT_MAE
 
 
+def _source_close_target_mask(content_rgb: torch.Tensor, target_rgb: torch.Tensor) -> torch.Tensor:
+    """Identify samples whose target texture stays close to its source texture."""
+    sample_mae = (target_rgb - content_rgb).abs().mean(dim=(1, 2, 3))
+    return sample_mae <= SOURCE_CLOSE_SUPPORT_MAE
+
+
 def _legacy_direct_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
@@ -424,12 +430,13 @@ def _compute_loss(
 ) -> dict[str, torch.Tensor]:
     """Balance diffusion correctness with target fidelity.
 
-    Samples whose support references are nearly unchanged from their vanilla
-    sources use the legacy direct target objective. Other samples keep the
-    run33 objective with SNR-weighted x0-dependent losses.
+    Samples whose targets are nearly unchanged from their vanilla sources use
+    the legacy direct target objective. Other samples keep the run33 objective
+    with SNR-weighted x0-dependent losses.
     """
-    source_close_mask = _source_close_support_mask(style_refs, style_ref_mask, support_content_refs)
-    if source_close_mask is None or not source_close_mask.any():
+    del style_refs, style_ref_mask, support_content_refs
+    source_close_mask = _source_close_target_mask(content_rgb, target_rgb)
+    if not source_close_mask.any():
         return _run33_loss(
             pred_noise,
             true_noise,
@@ -879,12 +886,8 @@ def _run_validation(
         luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
         channel_gradient_loss = _rgb_channel_gradient_loss(pred_rgb, target_rgb)
         gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-        source_close_mask = _source_close_support_mask(style_refs, style_ref_mask, support_content_refs)
-        source_close_fraction = (
-            source_close_mask.to(dtype=pred_rgb.dtype).mean()
-            if source_close_mask is not None
-            else torch.zeros((), device=device, dtype=pred_rgb.dtype)
-        )
+        source_close_mask = _source_close_target_mask(content_rgb, target_rgb)
+        source_close_fraction = source_close_mask.to(dtype=pred_rgb.dtype).mean()
         loss = recon_loss + 0.30 * gradient_loss + CONTENT_LOSS_WEIGHT * content_components["content_loss"]
         sample_scalars = {
             "loss": float(loss.item()),
