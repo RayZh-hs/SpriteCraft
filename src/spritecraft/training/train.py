@@ -23,7 +23,6 @@ from spritecraft.config import (
     pack_checkpoint_dir,
 )
 from spritecraft.data.dataset import PackStyleDataset, get_available_pack_ids
-from spritecraft.data.support_index import infer_texture_family
 from spritecraft.debug.utility import (
     runtime_status_path,
     utcnow_iso,
@@ -47,7 +46,7 @@ LOSS_COMPONENT_NAMES = (
     "content_contrast_loss",
     "content_hue_loss",
     "content_color_moment_loss",
-    "content_loss_scale",
+    "source_close_legacy_fraction",
 )
 TRAIN_SCALAR_NAMES = ("loss", "lr") + LOSS_COMPONENT_NAMES
 VAL_SCALAR_NAMES = (
@@ -61,7 +60,7 @@ VAL_SCALAR_NAMES = (
     "content_contrast_loss",
     "content_hue_loss",
     "content_color_moment_loss",
-    "content_loss_scale",
+    "source_close_legacy_fraction",
 )
 METRIC_FIELDNAMES = ("step",) + TRAIN_SCALAR_NAMES
 TENSORBOARD_DIRNAME = "tensorboard"
@@ -70,12 +69,11 @@ TENSORBOARD_DIRNAME = "tensorboard"
 WARMUP_FRACTION = 0.05
 # Content loss weight (constant; x0-dependent losses are SNR-weighted)
 CONTENT_LOSS_WEIGHT = 0.20
-# Relax content-aware losses when the target pack deliberately redraws or
-# simplifies the vanilla texture. This keeps diffusion from over-preserving
-# vanilla wood grain/noise while retaining the base noise/reconstruction signal.
-MIN_CONTENT_LOSS_SCALE = 0.15
-WOOD_CONTENT_LOSS_CAP = 0.35
-SIMPLIFIED_DETAIL_RATIO = 0.85
+# If the support examples barely move from vanilla to target, the pack is
+# close to source for this local texture family. In that regime the newer
+# source-relative content stack can over-preserve vanilla microtexture; use the
+# run20 direct target objective for those samples instead.
+SOURCE_CLOSE_SUPPORT_MAE = 0.045
 # EMA decay rate
 EMA_DECAY = 0.995
 
@@ -196,7 +194,9 @@ def _load_metric_history(metrics_path: Path, max_step: int) -> list[MetricRecord
                 "content_contrast_loss": float(row.get("content_contrast_loss", 0.0)),
                 "content_hue_loss": float(row.get("content_hue_loss", 0.0)),
                 "content_color_moment_loss": float(row.get("content_color_moment_loss", 0.0)),
-                "content_loss_scale": float(row.get("content_loss_scale", 1.0)),
+                "source_close_legacy_fraction": float(
+                    row.get("source_close_legacy_fraction", row.get("content_loss_scale", 0.0)),
+                ),
             }
             previous_step = step
 
@@ -295,81 +295,6 @@ def _rgb_channel_gradient_loss(pred_rgb: torch.Tensor, target_rgb: torch.Tensor)
     return total / 3.0
 
 
-def _high_pass_luminance(rgb: torch.Tensor) -> torch.Tensor:
-    gray = (
-        0.299 * rgb[:, 0:1]
-        + 0.587 * rgb[:, 1:2]
-        + 0.114 * rgb[:, 2:3]
-    )
-    blurred = F.avg_pool2d(gray, kernel_size=3, stride=1, padding=1)
-    return gray - blurred
-
-
-def _gradient_magnitude(rgb: torch.Tensor) -> torch.Tensor:
-    gray = (
-        0.299 * rgb[:, 0:1]
-        + 0.587 * rgb[:, 1:2]
-        + 0.114 * rgb[:, 2:3]
-    )
-    grad_x = gray[:, :, :, 1:] - gray[:, :, :, :-1]
-    grad_y = gray[:, :, 1:, :] - gray[:, :, :-1, :]
-    grad_x = F.pad(grad_x, (0, 1, 0, 0))
-    grad_y = F.pad(grad_y, (0, 0, 0, 1))
-    return torch.sqrt(grad_x.square() + grad_y.square() + 1e-6)
-
-
-def _cosine_per_sample(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    a_flat = a.flatten(start_dim=1)
-    b_flat = b.flatten(start_dim=1)
-    numerator = (a_flat * b_flat).sum(dim=1)
-    denominator = a_flat.norm(dim=1).clamp_min(1e-6) * b_flat.norm(dim=1).clamp_min(1e-6)
-    return numerator / denominator
-
-
-def _content_loss_scale(
-    content_rgb: torch.Tensor,
-    target_rgb: torch.Tensor,
-    filenames: list[str] | tuple[str, ...] | None = None,
-) -> torch.Tensor:
-    """Return per-sample multipliers for x0 content-aware losses.
-
-    Structure/content losses are useful when a pack preserves the vanilla
-    layout, but they can fight packs that simplify texture detail or redraw
-    wood/plank bands. The gate is intentionally smooth and data-derived:
-    low target/content detail agreement or target detail simplification lowers
-    the content term while keeping the base diffusion, reconstruction, and
-    target-gradient losses active.
-    """
-    content_grad = _gradient_magnitude(content_rgb)
-    target_grad = _gradient_magnitude(target_rgb)
-    content_detail = _high_pass_luminance(content_rgb)
-    target_detail = _high_pass_luminance(target_rgb)
-
-    grad_alignment = _cosine_per_sample(content_grad, target_grad).clamp(0.0, 1.0)
-    detail_alignment = _cosine_per_sample(content_detail, target_detail).clamp(0.0, 1.0)
-    structure_alignment = 0.5 * (grad_alignment + detail_alignment)
-    alignment_scale = ((structure_alignment - 0.20) / 0.55).clamp(MIN_CONTENT_LOSS_SCALE, 1.0)
-
-    content_detail_energy = content_detail.abs().mean(dim=(1, 2, 3)).clamp_min(1e-6)
-    target_detail_energy = target_detail.abs().mean(dim=(1, 2, 3))
-    detail_ratio = (target_detail_energy / content_detail_energy).clamp(0.0, 2.0)
-    simplification_scale = torch.where(
-        detail_ratio < SIMPLIFIED_DETAIL_RATIO,
-        (0.20 + 0.80 * detail_ratio / SIMPLIFIED_DETAIL_RATIO).clamp(MIN_CONTENT_LOSS_SCALE, 1.0),
-        torch.ones_like(detail_ratio),
-    )
-    scale = torch.minimum(alignment_scale, simplification_scale)
-
-    if filenames is not None:
-        caps = torch.ones_like(scale)
-        for index, filename in enumerate(filenames):
-            if infer_texture_family(filename) == "wood":
-                caps[index] = min(caps[index].item(), WOOD_CONTENT_LOSS_CAP)
-        scale = torch.minimum(scale, caps)
-
-    return scale.clamp(MIN_CONTENT_LOSS_SCALE, 1.0)
-
-
 def _update_ema(
     ema_state_dict: dict[str, torch.Tensor],
     model: StyleAwareUNet,
@@ -396,6 +321,91 @@ def _restore_training_weights(model: StyleAwareUNet, training_state_dict: dict[s
     model.load_state_dict(training_state_dict)
 
 
+def _zero_content_components(device: torch.device, dtype: torch.dtype) -> dict[str, torch.Tensor]:
+    zero = torch.zeros((), device=device, dtype=dtype)
+    return {
+        "content_loss": zero,
+        "content_structure_loss": zero,
+        "content_gradient_delta_loss": zero,
+        "content_detail_delta_loss": zero,
+        "content_contrast_loss": zero,
+        "content_hue_loss": zero,
+        "content_color_moment_loss": zero,
+    }
+
+
+def _source_close_support_mask(
+    style_refs: torch.Tensor | None,
+    style_ref_mask: torch.Tensor | None,
+    support_content_refs: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Identify samples whose style references are close to their vanilla sources."""
+    if style_refs is None or style_ref_mask is None or support_content_refs is None:
+        return None
+
+    if style_refs.dim() != 5 or support_content_refs.dim() != 5:
+        return None
+
+    valid = style_ref_mask.to(device=style_refs.device, dtype=style_refs.dtype).view(style_refs.shape[0], -1, 1, 1, 1)
+    valid_count = valid.sum(dim=(1, 2, 3, 4)).clamp_min(1.0)
+    ref_delta = (style_refs - support_content_refs).abs() * valid
+    support_mae = ref_delta.sum(dim=(1, 2, 3, 4)) / (valid_count * style_refs.shape[2] * style_refs.shape[3] * style_refs.shape[4])
+    return support_mae <= SOURCE_CLOSE_SUPPORT_MAE
+
+
+def _legacy_direct_loss(
+    pred_noise: torch.Tensor,
+    true_noise: torch.Tensor,
+    pred_x0: torch.Tensor,
+    target_rgb: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Run20-style objective for source-close support families."""
+    noise_loss = F.mse_loss(pred_noise, true_noise)
+    recon_loss = F.l1_loss(pred_x0, target_rgb)
+    pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
+    target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
+    gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+    loss = noise_loss + 0.50 * recon_loss + 0.25 * gradient_loss
+    return {
+        "loss": loss,
+        "noise_loss": noise_loss,
+        "recon_loss": recon_loss,
+        "gradient_loss": gradient_loss,
+        "source_close_legacy_fraction": torch.ones((), device=pred_x0.device, dtype=pred_x0.dtype),
+        **_zero_content_components(pred_x0.device, pred_x0.dtype),
+    }
+
+
+def _run33_loss(
+    pred_noise: torch.Tensor,
+    true_noise: torch.Tensor,
+    pred_x0: torch.Tensor,
+    content_rgb: torch.Tensor,
+    target_rgb: torch.Tensor,
+    content_loss_weight: float,
+    x0_weight: torch.Tensor | None,
+) -> dict[str, torch.Tensor]:
+    """Current objective for samples whose references are not source-close."""
+    noise_loss = F.mse_loss(pred_noise, true_noise)
+    recon_loss = F.l1_loss(pred_x0, target_rgb)
+    pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
+    target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
+    luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
+    channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
+    gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
+    components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
+    w = x0_weight.detach().mean() if x0_weight is not None else 1.0
+    total_loss = noise_loss + w * (0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * components["content_loss"])
+    return {
+        "loss": total_loss,
+        "noise_loss": noise_loss,
+        "recon_loss": recon_loss,
+        "gradient_loss": gradient_loss,
+        "source_close_legacy_fraction": torch.zeros((), device=pred_x0.device, dtype=pred_x0.dtype),
+        **components,
+    }
+
+
 def _compute_loss(
     pred_noise: torch.Tensor,
     true_noise: torch.Tensor,
@@ -404,57 +414,56 @@ def _compute_loss(
     target_rgb: torch.Tensor,
     content_loss_weight: float = 0.20,
     x0_weight: torch.Tensor | None = None,
-    filenames: list[str] | tuple[str, ...] | None = None,
+    style_refs: torch.Tensor | None = None,
+    style_ref_mask: torch.Tensor | None = None,
+    support_content_refs: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Balance diffusion correctness with explicit edge and color preservation.
+    """Balance diffusion correctness with target fidelity.
 
-    x0-dependent losses are scaled by the SNR (alpha_cumprod[t]) so that at
-    high noise levels where x0 prediction is uncertain, the model focuses on
-    noise prediction rather than unreliable reconstruction targets.
+    Samples whose support references are nearly unchanged from their vanilla
+    sources use the legacy direct target objective. Other samples keep the
+    run33 objective with SNR-weighted x0-dependent losses.
     """
-    noise_loss = F.mse_loss(pred_noise, true_noise)
-    recon_loss = F.l1_loss(pred_x0, target_rgb)
-    pred_grad_x, pred_grad_y = _luminance_gradient_map(pred_x0)
-    target_grad_x, target_grad_y = _luminance_gradient_map(target_rgb)
-    luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
-    channel_gradient_loss = _rgb_channel_gradient_loss(pred_x0, target_rgb)
-    gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-    content_scale = _content_loss_scale(content_rgb, target_rgb, filenames=filenames)
-    if pred_x0.shape[0] == 1:
-        components = rgb_content_loss_components(pred_x0, content_rgb, target_rgb)
-        scaled_content_loss = components["content_loss"] * content_scale.mean()
-    else:
-        per_sample_components = [
-            rgb_content_loss_components(
-                pred_x0[index:index + 1],
-                content_rgb[index:index + 1],
-                target_rgb[index:index + 1],
+    source_close_mask = _source_close_support_mask(style_refs, style_ref_mask, support_content_refs)
+    if source_close_mask is None or not source_close_mask.any():
+        return _run33_loss(
+            pred_noise,
+            true_noise,
+            pred_x0,
+            content_rgb,
+            target_rgb,
+            content_loss_weight,
+            x0_weight,
+        )
+
+    per_sample_results: list[dict[str, torch.Tensor]] = []
+    for index in range(pred_x0.shape[0]):
+        sample_x0_weight = x0_weight[index:index + 1] if x0_weight is not None else None
+        if bool(source_close_mask[index].item()):
+            per_sample_results.append(
+                _legacy_direct_loss(
+                    pred_noise[index:index + 1],
+                    true_noise[index:index + 1],
+                    pred_x0[index:index + 1],
+                    target_rgb[index:index + 1],
+                )
             )
-            for index in range(pred_x0.shape[0])
-        ]
-        component_names = per_sample_components[0].keys()
-        components = {
-            name: torch.stack([sample_components[name] for sample_components in per_sample_components]).mean()
-            for name in component_names
-        }
-        scaled_content_loss = torch.stack(
-            [
-                sample_components["content_loss"] * content_scale[index]
-                for index, sample_components in enumerate(per_sample_components)
-            ]
-        ).mean()
-    if x0_weight is not None:
-        w = x0_weight.detach().mean()
-    else:
-        w = 1.0
-    total_loss = noise_loss + w * (0.70 * recon_loss + 0.30 * gradient_loss + content_loss_weight * scaled_content_loss)
+        else:
+            per_sample_results.append(
+                _run33_loss(
+                    pred_noise[index:index + 1],
+                    true_noise[index:index + 1],
+                    pred_x0[index:index + 1],
+                    content_rgb[index:index + 1],
+                    target_rgb[index:index + 1],
+                    content_loss_weight,
+                    sample_x0_weight,
+                )
+            )
+
     return {
-        "loss": total_loss,
-        "noise_loss": noise_loss,
-        "recon_loss": recon_loss,
-        "gradient_loss": gradient_loss,
-        "content_loss_scale": content_scale.mean(),
-        **components,
+        name: torch.stack([sample_result[name] for sample_result in per_sample_results]).mean()
+        for name in per_sample_results[0]
     }
 
 
@@ -641,7 +650,7 @@ def train_pack(
             target_rgb = batch["target_rgb"].to(device)  # [B, 3, 32, 32]
             style_refs = batch["style_refs"].to(device)  # [B, N, 3, 32, 32]
             style_ref_mask = batch["style_ref_mask"].to(device)  # [B, N]
-            filenames = list(batch["filename"])
+            support_content_refs = batch["support_content_refs"].to(device)  # [B, N, 3, 32, 32]
 
             # Sample timesteps
             t = torch.randint(1, NUM_TIMESTEPS + 1, (target_rgb.shape[0],), device=device)
@@ -662,7 +671,9 @@ def train_pack(
                     pred_noise, true_noise, pred_x0, content_rgb, target_rgb,
                     content_loss_weight=CONTENT_LOSS_WEIGHT,
                     x0_weight=x0_weight,
-                    filenames=filenames,
+                    style_refs=style_refs,
+                    style_ref_mask=style_ref_mask,
+                    support_content_refs=support_content_refs,
                 )
                 loss = loss_components["loss"] / grad_accum_steps
 
@@ -864,8 +875,13 @@ def _run_validation(
         luminance_gradient_loss = F.l1_loss(pred_grad_x, target_grad_x) + F.l1_loss(pred_grad_y, target_grad_y)
         channel_gradient_loss = _rgb_channel_gradient_loss(pred_rgb, target_rgb)
         gradient_loss = luminance_gradient_loss + 0.5 * channel_gradient_loss
-        content_scale = _content_loss_scale(content_rgb, target_rgb, filenames=[filename]).mean()
-        loss = recon_loss + 0.30 * gradient_loss + CONTENT_LOSS_WEIGHT * content_scale * content_components["content_loss"]
+        source_close_mask = _source_close_support_mask(style_refs, style_ref_mask, support_content_refs)
+        source_close_fraction = (
+            source_close_mask.to(dtype=pred_rgb.dtype).mean()
+            if source_close_mask is not None
+            else torch.zeros((), device=device, dtype=pred_rgb.dtype)
+        )
+        loss = recon_loss + 0.30 * gradient_loss + CONTENT_LOSS_WEIGHT * content_components["content_loss"]
         sample_scalars = {
             "loss": float(loss.item()),
             "recon_loss": float(recon_loss.item()),
@@ -877,7 +893,7 @@ def _run_validation(
             "content_contrast_loss": float(content_components["content_contrast_loss"].item()),
             "content_hue_loss": float(content_components["content_hue_loss"].item()),
             "content_color_moment_loss": float(content_components["content_color_moment_loss"].item()),
-            "content_loss_scale": float(content_scale.item()),
+            "source_close_legacy_fraction": float(source_close_fraction.item()),
         }
         for name in VAL_SCALAR_NAMES:
             scalar_totals[name] += sample_scalars[name]
