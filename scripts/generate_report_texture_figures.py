@@ -39,7 +39,7 @@ FONT_CANDIDATES = (
     Path("/usr/share/fonts/TTF/DejaVuSans.ttf"),
     Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
 )
-BACKGROUND = (250, 250, 248)
+BACKGROUND = (255, 255, 255)
 TEXT = (24, 24, 24)
 BORDER = (205, 205, 198)
 
@@ -135,7 +135,7 @@ def generate_figures(
             trim,
         ),
         output_path=output_dir / "multi-pack-oak-planks.png",
-        label_width=74,
+        label_width=86,
         scale=scale,
         gap=gap,
         trim=trim,
@@ -200,7 +200,7 @@ def main() -> None:
         help="Pack used for routing examples.",
     )
     parser.add_argument("--scale", type=int, default=3, help="Nearest-neighbor scale for cropped tiles.")
-    parser.add_argument("--trim", type=int, default=3, help="Pixels trimmed from each side of every tile.")
+    parser.add_argument("--trim", type=int, default=0, help="Pixels trimmed from each side of every tile.")
     parser.add_argument("--gap", type=int, default=8, help="Pixel gap between grid cells.")
     args = parser.parse_args()
 
