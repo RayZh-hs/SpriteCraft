@@ -10,7 +10,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from spritecraft.config import IMAGE_SIZE, MAX_SUPPORT_EXEMPLARS, NUM_TIMESTEPS, pack_checkpoint_dir
-from spritecraft.data.support_index import compute_texture_descriptor
+from spritecraft.data.support_index import compute_texture_descriptor, infer_texture_family
 from spritecraft.data.texture_classifier import evaluate_diffusion_output
 from spritecraft.models.diffusion import ddpm_sample_step, get_alpha_schedule, get_beta_schedule
 from spritecraft.models.recolor import RecolorNet
@@ -22,6 +22,9 @@ DETAIL_INJECTION_AMOUNTS = (0.35, 0.65)
 MIN_STRUCTURAL_QUALITY = 0.60
 # Structural quality above which diffusion is confidently preferred over recolor.
 GOOD_STRUCTURAL_QUALITY = 0.80
+WOOD_MIN_STRUCTURAL_QUALITY = 0.45
+WOOD_RECOLOR_STYLE_MARGIN = 0.08
+WOOD_BROKEN_STYLE_TOLERANCE = 0.05
 
 
 class PredictionBundleResult(TypedDict):
@@ -439,6 +442,7 @@ def sample_rgb(
     style_ref_mask: torch.Tensor | None = None,
     support_content_refs: torch.Tensor | None = None,
     recolor_model: RecolorNet | None = None,
+    texture_id: str | None = None,
     num_steps: int = NUM_TIMESTEPS,
     num_candidates: int = 1,
     return_source: bool = False,
@@ -454,6 +458,7 @@ def sample_rgb(
         style_refs: [N, 3, H, W] or [1, N, 3, H, W] style reference textures
         support_content_refs: optional vanilla-side matches for each support
         recolor_model: optional trained RecolorNet for fallback color transfer
+        texture_id: optional texture filename/id used for family-specific selection
         num_steps: number of denoising steps
         num_candidates: number of stochastic diffusion candidates
         return_source: if True, return (prediction, model_source, score)
@@ -477,6 +482,9 @@ def sample_rgb(
         style_ref_mask = style_ref_mask.to(device)
     if support_content_refs is not None:
         support_content_refs = support_content_refs.to(device)
+
+    texture_family = infer_texture_family(texture_id) if texture_id else "generic"
+    wood_family = texture_family == "wood"
 
     # Precompute deterministic recolor (cheap)
     recolor_candidate = _support_pair_recolor(
@@ -519,8 +527,14 @@ def sample_rgb(
         )
         struct = _structural_quality(prediction)
         style = _style_quality(prediction)
-        combined = struct + style
-        if best_diffusion_pred is None or combined > (best_diffusion_struct + best_diffusion_style):
+
+        if wood_family:
+            replaces_best = best_diffusion_pred is None or style > best_diffusion_style
+        else:
+            combined = struct + style
+            replaces_best = best_diffusion_pred is None or combined > (best_diffusion_struct + best_diffusion_style)
+
+        if replaces_best:
             best_diffusion_pred = prediction
             best_diffusion_style = style
             best_diffusion_struct = struct
@@ -534,7 +548,7 @@ def sample_rgb(
     best_source = "diffusion"
     diffusion_edge, diffusion_high_pass = _sharpness_stats(best_diffusion_pred)
 
-    if recolor_candidate is not None:
+    if recolor_candidate is not None and not wood_family:
         for amount in DETAIL_INJECTION_AMOUNTS:
             injected = _inject_detail(
                 best_diffusion_pred.to(device), recolor_candidate, amount
@@ -569,6 +583,25 @@ def sample_rgb(
         ).squeeze(0)
         recolor_pred = recolor_rgb.cpu()
         recolor_style = _style_quality(recolor_pred)
+
+    if wood_family and recolor_pred is not None:
+        diffusion_broken = best_struct < WOOD_MIN_STRUCTURAL_QUALITY
+        recolor_clearly_better = recolor_style > best_style + WOOD_RECOLOR_STYLE_MARGIN
+        recolor_rescues_broken_diffusion = (
+            diffusion_broken and recolor_style >= best_style - WOOD_BROKEN_STYLE_TOLERANCE
+        )
+        if recolor_clearly_better or recolor_rescues_broken_diffusion:
+            result = recolor_pred
+            chosen_source = "recolor_net"
+            chosen_score = recolor_style
+        else:
+            result = best_pred
+            chosen_source = best_source
+            chosen_score = best_style
+
+        if return_source:
+            return result, chosen_source, float(chosen_score)
+        return result
 
     # Decision: when diffusion has confident structure, prefer it unless
     # recolor is clearly better on style. When diffusion is borderline,

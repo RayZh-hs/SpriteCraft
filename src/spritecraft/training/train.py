@@ -736,6 +736,7 @@ def _run_validation(
             style_ref_mask=style_ref_mask,
             support_content_refs=support_content_refs,
             recolor_model=recolor_model,
+            texture_id=filename,
             num_steps=NUM_TIMESTEPS,
             num_candidates=2,
             return_source=True,

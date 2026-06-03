@@ -48,6 +48,7 @@ def _evaluate_sample(
     content_rgb: torch.Tensor,
     style_refs: torch.Tensor,
     style_ref_mask: torch.Tensor | None = None,
+    texture_id: str | None = None,
 ) -> torch.Tensor:
     """Generate a single sample."""
     return sample_rgb(
@@ -55,6 +56,7 @@ def _evaluate_sample(
         content_rgb.unsqueeze(0),
         style_refs,
         style_ref_mask=style_ref_mask,
+        texture_id=texture_id,
         num_candidates=4,
     )
 
@@ -110,7 +112,7 @@ def write_validation_matrix(
         style_refs = cast(torch.Tensor, sample["style_refs"])
         style_ref_mask = cast(torch.Tensor, sample["style_ref_mask"])
         
-        prediction = _evaluate_sample(model, content_rgb, style_refs, style_ref_mask=style_ref_mask)
+        prediction = _evaluate_sample(model, content_rgb, style_refs, style_ref_mask=style_ref_mask, texture_id=filename)
         valid_support_count = int(style_ref_mask.sum().item())
         valid_supports = [cast(torch.Tensor, style_refs[i]) for i in range(valid_support_count)]
 
