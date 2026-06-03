@@ -1,3 +1,3 @@
 This project aims at building a style transfer network that maps block textures from Minecraft to resource pack versions. You can find documentation about the project structure in `docs/structure.md` and data on model specifics in `docs/model.md`.
 
-Your task is to improve this system. Commit after you make major changes and before you do tests, and tag them according to which run it is. You are free to run tests on your own and are encouraged to do so to test theories and validate changes. When a test is running, always prefer to check images instead of relying solely on metrics.
+Your task is to improve this system. Commit after you make major changes and before you do tests. If tests are to be run, tag the commit according to which run it is. Use conventional commits. You are free to run tests on your own and are encouraged to do so to test theories and validate changes. When a test is running, always prefer to check images instead of relying solely on metrics.
