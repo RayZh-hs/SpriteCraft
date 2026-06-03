@@ -255,8 +255,12 @@ def _maybe_load_checkpoint(
         ) from exc
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     _move_optimizer_state(optimizer, device)
-    if checkpoint.get("target_steps") == target_steps:
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(scheduler_state)
+        except (KeyError, RuntimeError, ValueError) as exc:
+            print(f"Warning: could not restore scheduler state from {checkpoint_path}: {exc}")
     ema_state_dict = checkpoint.get("ema_state_dict", None)
     if ema_state_dict is not None:
         ema_state_dict = {k: v.to(device) for k, v in ema_state_dict.items()}
