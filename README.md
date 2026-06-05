@@ -1,84 +1,196 @@
-# SpriteCraft
+<div align="center">
+  <img src="images/spritecraft-icon.png" alt="SpriteCraft" width="120">
+  <h1>SpriteCraft</h1>
+</div>
 
-Texture Style Transfer for Minecraft Resource Packs.
+**Diffusion-based framework for synthesizing and stylizing block textures in Minecraft resource packs.**
 
-## Installation
+*Ray Zhang &mdash; Shanghai Jiao Tong University*
 
-Make sure you have [git](https://git-scm.com/) and [uv](https://pypi.org/project/uv/) installed.
+---
+
+## Overview
+
+SpriteCraft is a per-pack training framework that ensembles style-conditioned diffusion with a complementary RecolorNet to generate block textures matching the visual style of a target Minecraft resource pack. Given vanilla textures as content anchors and reference textures from the target pack as style guides, the system produces stylized textures that preserve structural fidelity while adapting palette and detail to the target domain.
+
+<div align="center">
+  <img src="images/spritecraft-pipeline-overview.png" alt="SpriteCraft pipeline overview" width="90%">
+</div>
+
+### Why This Matters
+
+Texture style transfer for pixel art is challenging: low resolution amplifies color errors, discrete palettes resist continuous-domain synthesis, and tileability imposes strong structural constraints. Diffusion models are powerful for natural images but are predominantly trained on photographic datasets. SpriteCraft bridges this gap with a lightweight dual-model architecture (~8.7M parameters total) that can be rapidly trained on general consumer GPU hardware.
+
+### Key Features
+
+- **Dual-model architecture.** A `StyleAwareUNet` (~7.7M params) performs 40-step DDPM diffusion conditioned on both vanilla content and multi-reference style textures, while `RecolorNet` (~1.0M params) provides a structure-preserving color-transfer fallback.
+- **Content-aware auxiliary losses.** Source-relative structure, contrast, hue, and color-moment losses guide the diffusion model toward perceptually faithful outputs, with automatic source-close sample routing when the target stays near vanilla.
+- **Ensemble routing at inference.** Multiple stochastic diffusion candidates are scored on structural quality and style agreement; RecolorNet is invoked when diffusion candidates fall below quality thresholds.
+- **Wood-family specialization.** Planks and other wood textures receive dedicated routing to preserve grain regularity, a common failure mode in texture synthesis.
+
+---
+
+## Results
+
+<div align="center">
+  <img src="images/multi-pack-oak-planks.png" alt="Multi-pack oak planks comparison" width="90%">
+  <br>
+  <em>Oak planks transferred to four target resource packs. Each column shows vanilla content, the SpriteCraft output (Selected), RecolorNet fallback, pure diffusion output, and ground-truth target.</em>
+</div>
+
+<br>
+
+<div align="center">
+  <img src="images/ashen-routing-examples.png" alt="Ashen routing examples" width="90%">
+  <br>
+  <em>Per-texture routing on the Ashen 16× pack, visualized across content, diffusion, RecolorNet, selected output, and target.</em>
+</div>
+
+For full experimental results, loss curves, and ablations, see the [project report](report/main.pdf).
+
+---
+
+## Model Architecture
+
+### StyleAwareUNet
+
+| Component | Description |
+|-----------|-------------|
+| Input | Noisy target RGB + vanilla content RGB, fused at entry |
+| Encoder | `ResBlock` + strided conv: 32×32 → 16×16 → 8×8 |
+| Style encoder | 3 reference textures → 8×8 style feature maps |
+| Cross-attention | Content queries attend to style keys/values at bottleneck |
+| Timestep embedding | Sinusoidal encoding + MLP, injected at bottleneck |
+| Decoder | Skip connections from encoder at 32×32 and 16×16 |
+| Output | Predicted diffusion noise ε (not clean RGB) |
+| Parameters | ~7.7M |
+
+### RecolorNet
+
+| Component | Description |
+|-----------|-------------|
+| Content encoder | Encodes vanilla content texture |
+| Style encoder | 3 reference textures, averaged with validity mask |
+| Conditioning | Style features injected at bottleneck |
+| Skip connection | Raw content RGB → decoder for structure preservation |
+| Output | Residual added to content, clamped to [0, 1] |
+| Parameters | ~1.0M |
+
+<div align="center">
+  <img src="images/spritecraft-dual-model-architecture.png" alt="Dual-model architecture diagram" width="90%">
+</div>
+
+See [`docs/model.md`](docs/model.md) for detailed training configuration, loss function formulations, inference routing logic, and current limitations.
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- [git](https://git-scm.com/) and [uv](https://pypi.org/project/uv/)
+- Python ≥ 3.10
+- A vanilla Minecraft JAR file and one or more resource pack ZIPs (16× or 32× for best results)
+
+### Installation
 
 ```bash
 git clone https://github.com/RayZh-hs/SpriteCraft
 cd SpriteCraft
 uv sync
+source .venv/bin/activate
 ```
 
-Place a vanilla Minecraft jar file and reference resource packs (do not unzip) in `data/raw_packs/`. All resource packs you use should either be 16x or 32x for best results.
+### Data Preparation
 
-After loading the data, you are encouraged to create a `manifest.json` file in `data/` to specify which resource packs to use and how to use them. Expected format:
+1. Place the vanilla Minecraft JAR and target resource packs in `data/raw_packs/` (do not unzip).
+2. Optionally create a `manifest.json` in `data/`:
 
 ```json
 {
     "packs": [
         {
-            "id": "example_pack_id",
-            "archive": "Example Pack.zip",
-            "role": "train",    // "train", "base" (jar file), "defer"
-            "style": "stylized" // "vanilla", "stylized", "realistic", etc.
+            "id": "my_pack",
+            "archive": "My Pack.zip",
+            "role": "train",
+            "style": "stylized"
         }
     ]
 }
 ```
 
-Remove comments before you continue. The `role` field specifies how the resource pack is used in training. Deferred packs are not used in the training loop. The `style` field is used only in visual evaluation and does not affect training, so you can use any string you like to categorize the style of the resource pack.
+3. Run preprocessing:
 
-## Training Loop
-
-Activate the virtual environment with:
-
-```
-source .venv/bin/activate
-```
-
-### Preprocessing
-
-This is as simple as running:
-
-```
+```bash
 spritecraft preprocess
 ```
 
-After this, review the preprocessed data in `data/preprocessed/`. Ensure that enough samples are generated. Somet resource packs overlap sparingly with vanilla block assets, and are not suitable for training.
+Preprocessed datasets are written to `data/processed/packs/<pack_id>/`.
 
 ### Training
 
-Start training with:
+```bash
+# Train both models (RecolorNet first, then StyleAwareUNet)
+spritecraft train --checkpoint-dir checkpoints/run_1 --steps 20000
 
-```
-spritecraft train --checkpoint-dir checkpoints/[RUN_X] --steps [STEPS]
-```
+# Train only StyleAwareUNet
+spritecraft train --checkpoint-dir checkpoints/run_1 --steps 20000 --mode std_only
 
-This will spin up a training loop. You can use tensorboard to monitor training metrics and visualize training samples. The tensorboard logs are written to `checkpoints/[RUN_X]/tensorboard/`.
-
-```
-tensorboard --logdir checkpoints/[RUN_X]/tensorboard
-```
-
-### Generation and Evaluation
-
-After a model has been trained, you can use it to generate textures from reference images. Only preprocessed packs can be used for generation, but it need not be part of the training data. You can always add new packs and reprocess without needing to retrain.
-
-Generate specific textures from a target resource pack:
-
-```
-spritecraft generate --pack [PACK_ID] --textures stone dirt oak_planks
+# Train only RecolorNet
+spritecraft train --checkpoint-dir checkpoints/run_1 --steps 20000 --mode recolor_only
 ```
 
-Or randomly sample a number of textures from the base pack and run them through a checkpoint:
+Monitor training with TensorBoard:
 
-```
-spritecraft generate --pack [PACK_ID] --random 8
+```bash
+tensorboard --logdir checkpoints/run_1/tensorboard
 ```
 
-Pass `--checkpoint` to point at a checkpoint directory or a specific `.pt` file. Outputs are written under
-`output/[PACK_ID]/`. If the target pack contains the queried texture, the output metrics include a
-cross-entropy value; otherwise it is omitted.
+### Generation
+
+```bash
+# Generate specific textures from a target pack
+spritecraft generate --pack my_pack --textures stone dirt oak_planks
+
+# Generate 8 random textures
+spritecraft generate --pack my_pack --random 8
+
+# Use a specific checkpoint
+spritecraft generate --pack my_pack --textures stone --checkpoint checkpoints/run_1/my_pack/step_020000.pt
+```
+
+Outputs are written to `output/<pack_id>/<bundle>/` including the original texture, generated texture, side-by-side comparison, and metrics JSON.
+
+---
+
+## Project Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| `src/spritecraft/` | Main Python package |
+| `src/spritecraft/data/` | Preprocessing, dataset, support indexing |
+| `src/spritecraft/models/` | StyleAwareUNet, RecolorNet, diffusion schedule |
+| `src/spritecraft/training/` | Training loops and loss functions |
+| `src/spritecraft/inference/` | Generation, sampling, ensemble routing, evaluation |
+| `src/spritecraft/debug/` | Runtime status and inspection utilities |
+| `data/raw_packs/` | Input JAR/ZIP files |
+| `data/processed/` | Preprocessed datasets |
+| `checkpoints/` | Model checkpoints and TensorBoard logs |
+| `output/` | Generated texture bundles |
+| `report/` | LaTeX report, figures, and data |
+| `poster/` | Conference poster |
+| `scripts/` | Batch evaluation and report figure generation |
+| `docs/` | Extended documentation |
+
+---
+
+## Citation
+
+```bibtex
+@misc{zhang2026spritecraft,
+  title   = {SpriteCraft: Texture Style Transfer for Minecraft Resource Packs},
+  author  = {Zhang, Ray},
+  year    = {2026},
+  url     = {https://github.com/RayZh-hs/SpriteCraft}
+}
+```
