@@ -1,6 +1,6 @@
 # SpriteCraft
 
-Style-guided Pixel-art Reference Image Transfer Engine for Minecraft
+Texture Style Transfer for Minecraft Resource Packs.
 
 ## Installation
 
