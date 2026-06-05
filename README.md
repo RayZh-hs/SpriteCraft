@@ -46,7 +46,7 @@ Texture style transfer for pixel art is challenging: low resolution amplifies co
 
 We are able to achieve high-quality style transfer across a variety of resource packs, with the diffusion model proven effective so long as there are reasonable style references of the same texture family, and for the rest, RecolorNet provides a strong fallback that preserves structure.
 
-For full experimental results, loss curves, and ablations, see the [project report](report/main.pdf).
+For full experimental results, loss curves, and ablations, see the [project report](report/spritecraft-report.pdf).
 
 ---
 

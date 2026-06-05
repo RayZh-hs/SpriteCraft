@@ -2,7 +2,8 @@
 /build/
 
 # Common root-level LaTeX outputs if someone builds without the configured outdir.
-/*.pdf
+*.pdf
+!/spritecraft-report.pdf
 /*.synctex.gz
 /*.aux
 /*.bbl
