@@ -11,11 +11,11 @@
 
 ## Overview
 
-SpriteCraft is a per-pack training framework that ensembles style-conditioned diffusion with a complementary RecolorNet to generate block textures matching the visual style of a target Minecraft resource pack. Given vanilla textures as content anchors and reference textures from the target pack as style guides, the system produces stylized textures that preserve structural fidelity while adapting palette and detail to the target domain.
-
 <div align="center">
   <img src="images/spritecraft-pipeline-overview.png" alt="SpriteCraft pipeline overview" width="90%">
 </div>
+
+SpriteCraft is a per-pack training framework that ensembles style-conditioned diffusion with a complementary RecolorNet to generate block textures matching the visual style of a target Minecraft resource pack. Given vanilla textures as content anchors and reference textures from the target pack as style guides, the system produces stylized textures that preserve structural fidelity while adapting palette and detail to the target domain.
 
 ### Why This Matters
 
@@ -26,31 +26,37 @@ Texture style transfer for pixel art is challenging: low resolution amplifies co
 - **Dual-model architecture.** A `StyleAwareUNet` (~7.7M params) performs 40-step DDPM diffusion conditioned on both vanilla content and multi-reference style textures, while `RecolorNet` (~1.0M params) provides a structure-preserving color-transfer fallback.
 - **Content-aware auxiliary losses.** Source-relative structure, contrast, hue, and color-moment losses guide the diffusion model toward perceptually faithful outputs, with automatic source-close sample routing when the target stays near vanilla.
 - **Ensemble routing at inference.** Multiple stochastic diffusion candidates are scored on structural quality and style agreement; RecolorNet is invoked when diffusion candidates fall below quality thresholds.
-- **Wood-family specialization.** Planks and other wood textures receive dedicated routing to preserve grain regularity, a common failure mode in texture synthesis.
 
 ---
 
 ## Results
 
 <div align="center">
-  <img src="images/multi-pack-oak-planks.png" alt="Multi-pack oak planks comparison" width="90%">
-  <br>
-  <em>Oak planks transferred to four target resource packs. Each column shows vanilla content, the SpriteCraft output (Selected), RecolorNet fallback, pure diffusion output, and ground-truth target.</em>
+  <table>
+    <tr>
+      <td width="50%" align="center"><img src="images/multi-pack-oak-planks.png" alt="Multi-pack oak planks comparison" height="320"></td>
+      <td width="50%" align="center"><img src="images/ashen-routing-examples.png" alt="Ashen routing examples" height="320"></td>
+    </tr>
+    <tr>
+      <td align="center" style="padding: 0 8%;"><em>Oak planks transferred to four target resource packs. Each column shows vanilla content, the SpriteCraft output (Selected), RecolorNet fallback, pure diffusion output, and ground-truth target.</em></td>
+      <td align="center" style="padding: 0 8%;"><em>Per-texture routing on the Ashen 16× pack, visualized across content, diffusion, RecolorNet, selected output, and target.</em></td>
+    </tr>
+  </table>
 </div>
 
-<br>
-
-<div align="center">
-  <img src="images/ashen-routing-examples.png" alt="Ashen routing examples" width="90%">
-  <br>
-  <em>Per-texture routing on the Ashen 16× pack, visualized across content, diffusion, RecolorNet, selected output, and target.</em>
-</div>
+We are able to achieve high-quality style transfer across a variety of resource packs, with the diffusion model proven effective so long as there are reasonable style references of the same texture family, and for the rest, RecolorNet provides a strong fallback that preserves structure.
 
 For full experimental results, loss curves, and ablations, see the [project report](report/main.pdf).
 
 ---
 
 ## Model Architecture
+
+<div align="center">
+  <img src="images/spritecraft-dual-model-architecture.png" alt="Dual-model architecture diagram" width="90%">
+</div>
+
+Here is a high-level summary of the two main models in the SpriteCraft framework. See [`docs/model.md`](docs/model.md) for detailed training configuration, loss function formulations, inference routing logic, and current limitations.
 
 ### StyleAwareUNet
 
@@ -75,12 +81,6 @@ For full experimental results, loss curves, and ablations, see the [project repo
 | Skip connection | Raw content RGB → decoder for structure preservation |
 | Output | Residual added to content, clamped to [0, 1] |
 | Parameters | ~1.0M |
-
-<div align="center">
-  <img src="images/spritecraft-dual-model-architecture.png" alt="Dual-model architecture diagram" width="90%">
-</div>
-
-See [`docs/model.md`](docs/model.md) for detailed training configuration, loss function formulations, inference routing logic, and current limitations.
 
 ---
 
